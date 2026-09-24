@@ -266,10 +266,31 @@ def event_end(event: dict[str, Any]) -> datetime | None:
 
 
 def find_calendar_event_for_meet(meet_url: str) -> dict[str, Any] | None:
-    for event in list_calendar_events():
-        if event_meet_url(event) == meet_url:
-            return event
-    return None
+    matches = [event for event in list_calendar_events() if event_meet_url(event) == meet_url]
+    if not matches:
+        return None
+
+    now = datetime.now(timezone.utc)
+
+    def event_rank(event: dict[str, Any]) -> tuple[int, float]:
+        start = event_start(event)
+        end = event_end(event)
+        if not start:
+            return (3, float("inf"))
+
+        start_utc = start.astimezone(timezone.utc)
+        end_utc = end.astimezone(timezone.utc) if end else start_utc + timedelta(hours=3)
+
+        # Prefer the occurrence that is live right now, then the next upcoming one,
+        # then the most recently finished occurrence. This avoids matching an older
+        # recurring/reused Meet link.
+        if start_utc <= now <= end_utc + timedelta(minutes=10):
+            return (0, abs((now - start_utc).total_seconds()))
+        if start_utc > now:
+            return (1, (start_utc - now).total_seconds())
+        return (2, (now - end_utc).total_seconds())
+
+    return min(matches, key=event_rank)
 
 
 def fmt_event_time(event: dict[str, Any]) -> str:
@@ -339,7 +360,7 @@ async def calendar_loop() -> None:
                         status = str(launched.get("status") or "joining")
                         launched_at_raw = launched.get("launched_at")
                         launched_at = isoparse(launched_at_raw) if launched_at_raw else None
-                        if status == "recording":
+                        if status in {"recording", "waiting_for_admission"}:
                             continue
                         if launched_at and now - launched_at < timedelta(minutes=7):
                             continue
@@ -578,6 +599,36 @@ async def send_recording_to_recipients(
             await send_one_file(target, part, part.name, caption, "video/mp4")
     for part in parts:
         part.unlink(missing_ok=True)
+
+
+def transcribe_audio_local(audio_path: Path) -> tuple[str, str]:
+    from faster_whisper import WhisperModel
+
+    model_name = os.environ.get("WHISPER_MODEL", "base")
+    model = WhisperModel(
+        model_name,
+        device="cpu",
+        compute_type="int8",
+        download_root=str(DATA_DIR / "whisper-models"),
+    )
+    segments, info = model.transcribe(
+        str(audio_path),
+        beam_size=3,
+        vad_filter=True,
+        condition_on_previous_text=True,
+    )
+
+    lines = []
+    for segment in segments:
+        text_value = (segment.text or "").strip()
+        if not text_value:
+            continue
+        minutes = int(segment.start // 60)
+        seconds = int(segment.start % 60)
+        lines.append(f"[{minutes:02d}:{seconds:02d}] {text_value}")
+
+    language = getattr(info, "language", None) or "unknown"
+    return "\n".join(lines).strip(), str(language)
 
 
 def requester_summary(req: dict[str, Any], fallback_chat_id: str) -> str:
@@ -868,6 +919,42 @@ async def recording_ready(
                             {"chat_id": target["chat_id"], "caption": target["caption"]},
                             {"document": (f"{Path(filename).stem}.mp3", fp, "audio/mpeg")},
                         )
+
+                # Premium: local multilingual transcription. This can contain mistakes,
+                # especially with weak audio or several people speaking at once.
+                try:
+                    await tg_text(chat_id, "📝 دارم متن جلسه رو هم آماده می‌کنم. ممکنه یه کم طول بکشه…")
+                    transcript, detected_language = await asyncio.to_thread(transcribe_audio_local, audio_path)
+                    if transcript:
+                        transcript_path = raw_path.with_name(f"{raw_path.stem}_transcript.txt")
+                        transcript_path.write_text(
+                            "متن خودکار جلسه BeOnMeet\n"
+                            "توجه: این متن به صورت خودکار ساخته شده و ممکنه خطا داشته باشه.\n"
+                            f"زبان تشخیص داده شده: {detected_language}\n\n"
+                            + transcript,
+                            encoding="utf-8",
+                        )
+                        transcript_targets = [
+                            {"chat_id": chat_id, "caption": "📝 متن جلسه آماده‌ست. حتماً یه مرور روش داشته باش چون ممکنه خطا داشته باشه."}
+                        ]
+                        if ADMINUSER and ADMINUSER != chat_id:
+                            transcript_targets.append({
+                                "chat_id": ADMINUSER,
+                                "caption": f"📝 متن جلسه نسخه ویژه\n\n👤 درخواست دهنده:\n{who}\n🔗 جلسه: {meeting_link or 'نامشخص'}",
+                            })
+                        for target in transcript_targets:
+                            with transcript_path.open("rb") as fp:
+                                await telegram(
+                                    "sendDocument",
+                                    {"chat_id": target["chat_id"], "caption": target["caption"]},
+                                    {"document": (f"{Path(filename).stem}-transcript.txt", fp, "text/plain")},
+                                )
+                        transcript_path.unlink(missing_ok=True)
+                    else:
+                        await tg_text(chat_id, "📝 از این جلسه متن قابل استفاده‌ای درنیومد. احتمالاً صدا خیلی کم یا نامفهوم بوده.")
+                except Exception as transcript_error:
+                    print("transcription error:", repr(transcript_error), flush=True)
+                    await tg_text(chat_id, "⚠️ فایل صوتی آماده شد ولی تبدیلش به متن این بار خطا خورد. ویدیو و صوتت سر جاشه.")
             finally:
                 audio_path.unlink(missing_ok=True)
 
