@@ -1,0 +1,92 @@
+services:
+  controller:
+    build: ./app
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - controller_state:/data
+      - /dev/shm/beonmeet:/recordings
+    expose:
+      - "8000"
+    depends_on:
+      meeting-bot:
+        condition: service_started
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    tmpfs:
+      - /data
+    expose:
+      - "6379"
+
+  meeting-bot:
+    platform: linux/amd64
+    build:
+      context: ./upstream
+      dockerfile: Dockerfile.production
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_CONSUMER_ENABLED: "false"
+      GOOGLE_CHROME_CDP_URL: http://chrome-cdp:9223
+      RECORDING_TMP_DIR: /recordings
+      CONTROLLER_UPLOAD_URL: http://controller:8000/internal/recording-ready
+      UPLOADER_FILE_EXTENSION: .webm
+      MAX_RECORDING_DURATION_MINUTES: "180"
+      MEETING_INACTIVITY_MINUTES: "1"
+      INACTIVITY_DETECTION_START_DELAY_MINUTES: "3"
+      JOIN_WAIT_TIME_MINUTES: "5"
+    volumes:
+      - /dev/shm/beonmeet:/recordings
+    depends_on:
+      redis:
+        condition: service_started
+      chrome-cdp:
+        condition: service_healthy
+    expose:
+      - "3000"
+
+  chrome-cdp:
+    platform: linux/amd64
+    build:
+      context: ./upstream
+      dockerfile: Dockerfile.chrome-cdp
+    restart: unless-stopped
+    shm_size: "1gb"
+    environment:
+      CHROME_USER_DATA_DIR: /chrome-profile
+    volumes:
+      - chrome_profile:/chrome-profile
+    expose:
+      - "9223"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9223/json/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      controller:
+        condition: service_started
+
+volumes:
+  controller_state:
+  chrome_profile:
+  caddy_data:
+  caddy_config:
