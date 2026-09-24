@@ -22,9 +22,12 @@ from googleapiclient.discovery import build
 from admin_panel import (
     PLANS,
     activate_subscription,
+    create_payment_intent,
+    get_payment_intent,
     init_db,
     is_premium,
     make_admin_login_url,
+    mark_payment_paid,
     record_recording,
     record_request,
     router as admin_router,
@@ -53,6 +56,10 @@ INTERNAL_SECRET = os.environ["INTERNAL_SECRET"]
 RECORDING_ROOT = Path(os.environ.get("RECORDING_TMP_DIR", "/recordings")).resolve()
 BOT_DISPLAY_NAME = os.environ.get("BOT_DISPLAY_NAME", "BeOnMeet Recorder")
 CALENDAR_POLL_SECONDS = int(os.environ.get("CALENDAR_POLL_SECONDS", "30"))
+PAYMENT_STATUS_URL = os.environ.get(
+    "PAYMENT_STATUS_URL",
+    "https://pay.hamooncloud.ir/payments/beonmeet/status",
+)
 
 MEET_RE = re.compile(r"https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}(?:\?[^\s]*)?", re.I)
 SCOPES = ["https://www.googleapis.com/auth/calendar.events.readonly"]
@@ -348,20 +355,52 @@ async def telegram_loop() -> None:
                     if info.get("premium"):
                         until = info.get("until")
                         until_text = until.astimezone().strftime("%Y/%m/%d") if until else ""
-                        await tg_text(chat_id, f"✨ پلن ویژه‌ت فعاله تا {until_text}.\n\nقابلیت‌های ویژه به مرور برات فعال می‌شن.")
-                    else:
                         await tg_text(
                             chat_id,
-                            "✨ پلن ویژه BeOnMeet\n\n"
-                            "۱ ماهه: ۱۹۸٬۰۰۰ تومان\n"
-                            "۳ ماهه: ۴۹۹٬۰۰۰ تومان\n"
-                            "۶ ماهه: ۷۹۹٬۰۰۰ تومان\n\n"
-                            "قابلیت‌ها:\n"
+                            f"✨ پلن ویژه‌ت فعاله تا {until_text}.\n\n"
+                            "قابلیت‌های ویژه:\n"
                             "• کیفیت بالاتر ضبط\n"
                             "• فایل صوتی جداگانه\n"
                             "• متن جلسه\n"
-                            "• پیش نویس صورتجلسه\n\n"
-                            "برای خرید یکی از پلن‌ها، از دکمه‌های پرداخت استفاده کن."
+                            "• پیش نویس صورتجلسه"
+                        )
+                    else:
+                        intents = {}
+                        for plan_code in ("monthly", "quarterly", "halfyear"):
+                            intents[plan_code] = await asyncio.to_thread(
+                                create_payment_intent, str(chat_id), plan_code
+                            )
+                        keyboard = {
+                            "inline_keyboard": [
+                                [{
+                                    "text": "۱ ماهه · ۱۹۸ هزار تومان",
+                                    "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['monthly']['intent']}",
+                                }],
+                                [{
+                                    "text": "۳ ماهه · ۴۹۹ هزار تومان",
+                                    "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['quarterly']['intent']}",
+                                }],
+                                [{
+                                    "text": "۶ ماهه · ۷۹۹ هزار تومان",
+                                    "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['halfyear']['intent']}",
+                                }],
+                            ]
+                        }
+                        await telegram(
+                            "sendMessage",
+                            {
+                                "chat_id": str(chat_id),
+                                "text": (
+                                    "✨ پلن ویژه BeOnMeet\n\n"
+                                    "قابلیت‌ها:\n"
+                                    "• کیفیت بالاتر ضبط\n"
+                                    "• فایل صوتی جداگانه\n"
+                                    "• متن جلسه\n"
+                                    "• پیش نویس صورتجلسه\n\n"
+                                    "یکی از پلن‌ها رو انتخاب کن:"
+                                ),
+                                "reply_markup": json.dumps(keyboard, ensure_ascii=False),
+                            },
                         )
                     continue
 
@@ -521,6 +560,70 @@ async def startup() -> None:
     asyncio.create_task(setup_telegram_profile())
     asyncio.create_task(telegram_loop())
     asyncio.create_task(calendar_loop())
+
+
+@app.get("/api/billing/payment-intent")
+async def billing_payment_intent(intent: str) -> dict[str, Any]:
+    row = await asyncio.to_thread(get_payment_intent, intent)
+    if not row:
+        raise HTTPException(status_code=404, detail="Payment intent not found")
+    plan = PLANS.get(str(row.get("plan_code") or ""))
+    if not plan:
+        raise HTTPException(status_code=409, detail="Unknown plan")
+    return {
+        "ok": True,
+        "intent": intent,
+        "status": row.get("status"),
+        "plan": row.get("plan_code"),
+        "amount_toman": int(row.get("amount_toman") or 0),
+        "label": f"پلن ویژه BeOnMeet، {plan['label']}",
+    }
+
+
+@app.get("/api/billing/payment-return", response_class=HTMLResponse)
+async def billing_payment_return(payment: str = "", receipt: str = "", intent: str = "") -> str:
+    row = await asyncio.to_thread(get_payment_intent, intent)
+    if not row:
+        return "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;padding:40px'>پرداخت پیدا نشد.</body></html>"
+
+    if payment != "success" or not receipt:
+        return "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;padding:40px'>پرداخت انجام نشد یا لغو شد. می‌تونی برگردی تلگرام و دوباره امتحان کنی.</body></html>"
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(PAYMENT_STATUS_URL, params={"receipt": receipt})
+        response.raise_for_status()
+        status = response.json()
+    except Exception:
+        return "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;padding:40px'>پرداخت انجام شده ولی تأیید نهایی فعلاً در دسترس نیست. چند دقیقه دیگه دوباره وضعیت پلن رو چک کن.</body></html>"
+
+    expected_plan = str(row.get("plan_code") or "")
+    expected_amount = int(row.get("amount_toman") or 0)
+    if (
+        not status.get("ok")
+        or status.get("status") != "paid"
+        or status.get("intent") != intent
+        or status.get("plan") != expected_plan
+        or int(status.get("amount_toman") or 0) != expected_amount
+    ):
+        return "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;padding:40px'>تأیید پرداخت کامل نشد. اگه مبلغ کم شده، رسید محفوظ می‌مونه و می‌تونیم پیگیریش کنیم.</body></html>"
+
+    already_paid = row.get("status") == "paid"
+    paid_row = await asyncio.to_thread(mark_payment_paid, intent, receipt)
+    telegram_id = str((paid_row or row).get("telegram_id") or "")
+    if not already_paid:
+        until = await asyncio.to_thread(activate_subscription, telegram_id, expected_plan, f"Zibal receipt {receipt}")
+        await tg_text(
+            telegram_id,
+            f"✨ پرداختت تأیید شد و پلن ویژه فعال شد.\nتا {until.astimezone().strftime('%Y/%m/%d')} فعاله."
+        )
+        if ADMINUSER and ADMINUSER != telegram_id:
+            await tg_text(
+                ADMINUSER,
+                f"💳 خرید پلن ویژه\nکاربر: {telegram_id}\nپلن: {expected_plan}\nمبلغ: {expected_amount:,} تومان\nرسید: {receipt}"
+            )
+
+    return "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;background:#0b0e17;color:white;display:grid;place-items:center;min-height:100vh;margin:0'><div style='text-align:center'><h2>پرداخت موفق بود ✅</h2><p>پلن ویژه فعال شد. می‌تونی این صفحه رو ببندی و برگردی تلگرام.</p></div></body></html>"
 
 
 @app.get("/health")
