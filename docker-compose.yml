@@ -59,9 +59,9 @@ services:
     restart: unless-stopped
     shm_size: "1gb"
     environment:
-      CHROME_USER_DATA_DIR: /chrome-profile
+      CHROME_USER_DATA_DIR: /tmp/chrome-profile
     volumes:
-      - chrome_profile:/chrome-profile
+      - ./chrome-profile:/tmp/chrome-profile
     expose:
       - "9223"
     healthcheck:
@@ -87,6 +87,5 @@ services:
 
 volumes:
   controller_state:
-  chrome_profile:
   caddy_data:
   caddy_config:
