@@ -73,6 +73,7 @@ jobs:
             INTERNAL_SECRET="$(cat .internal_secret)"
             BROWSER_SETUP_PASSWORD='BOM-2IJgHOWyXbaQ0LPe'
             BROWSER_SETUP_HASH="$(docker run --rm caddy:2-alpine caddy hash-password --plaintext "$BROWSER_SETUP_PASSWORD")"
+            BROWSER_SETUP_HASH_ESCAPED="$(printf '%s' "$BROWSER_SETUP_HASH" | sed 's/\$/$/g')"
 
             cat > .env <<EOF
             DOMAIN=beonmeet.smarbiz.sbs
@@ -88,7 +89,7 @@ jobs:
             CONTROLLER_UPLOAD_URL=http://controller:8000/internal/recording-ready
             RECORDING_TMP_DIR=/recordings
             CALENDAR_POLL_SECONDS=30
-            BROWSER_SETUP_HASH=${BROWSER_SETUP_HASH}
+            BROWSER_SETUP_HASH=${BROWSER_SETUP_HASH_ESCAPED}
             EOF
             chmod 600 .env
 
