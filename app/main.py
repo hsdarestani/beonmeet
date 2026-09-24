@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import quote
 
 import httpx
@@ -192,7 +193,20 @@ def list_calendar_events() -> list[dict[str, Any]]:
         )
         .execute()
     )
-    return result.get("items", [])
+    try:
+        calendar_tz = (
+            service.calendarList()
+            .get(calendarId="primary")
+            .execute()
+            .get("timeZone")
+        )
+    except Exception:
+        calendar_tz = None
+    events = result.get("items", [])
+    if calendar_tz:
+        for event in events:
+            event["_calendarTimeZone"] = calendar_tz
+    return events
 
 
 def event_meet_url(event: dict[str, Any]) -> str:
@@ -209,20 +223,40 @@ def event_meet_url(event: dict[str, Any]) -> str:
     return ""
 
 
-def event_start(event: dict[str, Any]) -> datetime | None:
-    value = event.get("start", {}).get("dateTime")
+def _event_timezone_name(event: dict[str, Any], edge: str = "start") -> str | None:
+    return (
+        event.get(edge, {}).get("timeZone")
+        or event.get("start", {}).get("timeZone")
+        or event.get("_calendarTimeZone")
+    )
+
+
+def _event_datetime(event: dict[str, Any], edge: str) -> datetime | None:
+    value = event.get(edge, {}).get("dateTime")
     if not value:
         return None
     dt = isoparse(value)
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    tz_name = _event_timezone_name(event, edge)
+    tz = None
+    if tz_name:
+        try:
+            tz = ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError:
+            tz = None
+
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=tz or timezone.utc)
+    if tz:
+        return dt.astimezone(tz)
+    return dt
+
+
+def event_start(event: dict[str, Any]) -> datetime | None:
+    return _event_datetime(event, "start")
 
 
 def event_end(event: dict[str, Any]) -> datetime | None:
-    value = event.get("end", {}).get("dateTime")
-    if not value:
-        return None
-    dt = isoparse(value)
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return _event_datetime(event, "end")
 
 
 def find_calendar_event_for_meet(meet_url: str) -> dict[str, Any] | None:
@@ -237,9 +271,11 @@ def fmt_event_time(event: dict[str, Any]) -> str:
     end = event_end(event)
     if not start:
         return "زمان نامشخص"
+    tz_name = _event_timezone_name(event, "start")
+    tz_label = f" ({tz_name})" if tz_name else ""
     if end:
-        return f"{start.strftime('%Y-%m-%d %H:%M')} تا {end.strftime('%H:%M')}"
-    return start.strftime("%Y-%m-%d %H:%M")
+        return f"{start.strftime('%Y-%m-%d %H:%M')} تا {end.strftime('%H:%M')}{tz_label}"
+    return f"{start.strftime('%Y-%m-%d %H:%M')}{tz_label}"
 
 
 async def launch_meeting(event: dict[str, Any], req: dict[str, Any], meet_url: str) -> bool:
@@ -669,6 +705,36 @@ async def auth_google_callback(request: Request, state: str) -> str:
     globals()["state"]["oauth_state"] = None
     await save_state()
     return "<h2>کلندر با موفقیت وصل شد ✅</h2><p>می‌تونی این صفحه رو ببندی و برگردی تلگرام.</p>"
+
+
+@app.post("/internal/waiting-for-admission")
+async def waiting_for_admission(
+    request: Request,
+    x_beonmeet_secret: str = Header(...),
+) -> dict[str, Any]:
+    if x_beonmeet_secret != INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    data = await request.json()
+    chat_id = str(data.get("userId") or "").strip()
+    event_id = str(data.get("eventId") or data.get("botId") or "").strip()
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="Missing userId")
+
+    already_notified = False
+    if event_id:
+        launched = state["launched_events"].setdefault(event_id, {})
+        already_notified = launched.get("status") == "waiting_for_admission"
+        launched["status"] = "waiting_for_admission"
+        launched["waiting_since"] = datetime.now(timezone.utc).isoformat()
+        await save_state()
+
+    if not already_notified:
+        await tg_text(
+            chat_id,
+            "🚪 رسیدم پشت در جلسه. Google Meet از میزبان می‌خواد منو Admit کنه. "
+            "به محض اینکه وارد بشم، ضبط خودکار شروع می‌شه."
+        )
+    return {"ok": True}
 
 
 @app.post("/internal/recording-started")
