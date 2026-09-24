@@ -193,15 +193,21 @@ def list_calendar_events() -> list[dict[str, Any]]:
         )
         .execute()
     )
+    calendar_tz = None
     try:
         calendar_tz = (
-            service.calendarList()
+            service.calendars()
             .get(calendarId="primary")
             .execute()
             .get("timeZone")
         )
     except Exception:
-        calendar_tz = None
+        pass
+    if not calendar_tz:
+        try:
+            calendar_tz = service.settings().get(setting="timezone").execute().get("value")
+        except Exception:
+            pass
     events = result.get("items", [])
     if calendar_tz:
         for event in events:
