@@ -58,10 +58,6 @@ services:
       dockerfile: Dockerfile.chrome-cdp
     restart: unless-stopped
     shm_size: "1gb"
-    environment:
-      CHROME_USER_DATA_DIR: /tmp/chrome-profile
-    volumes:
-      - ./chrome-profile:/tmp/chrome-profile
     expose:
       - "9223"
     healthcheck:
