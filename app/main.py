@@ -123,8 +123,30 @@ async def telegram(method: str, data: dict[str, Any] | None = None, files: dict[
         return payload
 
 
-async def tg_text(chat_id: int | str, text: str) -> None:
-    await telegram("sendMessage", {"chat_id": str(chat_id), "text": text, "disable_web_page_preview": "true"})
+def telegram_reply_keyboard(chat_id: int | str) -> dict[str, Any]:
+    rows = [
+        [{"text": "🎬 ضبط جلسه جدید"}, {"text": "✨ پلن ویژه"}],
+        [{"text": "⚡ ورود فوری"}, {"text": "❓ راهنما"}],
+    ]
+    if ADMINUSER and str(chat_id) == ADMINUSER:
+        rows.append([{"text": "⚙️ پنل مدیریت"}])
+    return {
+        "keyboard": rows,
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "input_field_placeholder": "لینک Google Meet رو بفرست…",
+    }
+
+
+async def tg_text(chat_id: int | str, text: str, with_menu: bool = False) -> None:
+    data: dict[str, Any] = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "disable_web_page_preview": "true",
+    }
+    if with_menu:
+        data["reply_markup"] = json.dumps(telegram_reply_keyboard(chat_id), ensure_ascii=False)
+    await telegram("sendMessage", data)
 
 
 async def setup_telegram_profile() -> None:
@@ -423,6 +445,22 @@ async def telegram_loop() -> None:
                     str(from_user.get("last_name") or chat.get("last_name") or ""),
                 )
 
+                if text == "⚙️ پنل مدیریت":
+                    text = "/admin"
+                elif text == "✨ پلن ویژه":
+                    text = "/plans"
+                elif text == "⚡ ورود فوری":
+                    text = "/now"
+                elif text == "❓ راهنما":
+                    text = "/start"
+                elif text == "🎬 ضبط جلسه جدید":
+                    await tg_text(
+                        chat_id,
+                        "لینک Google Meet رو همینجا بفرست. اگه جلسه توی کلندر باشه سر وقت وارد می‌شم؛ اگه همین الان شروع شده می‌تونی از «⚡ ورود فوری» استفاده کنی.",
+                        with_menu=True,
+                    )
+                    continue
+
                 if text.startswith("/admin"):
                     if ADMINUSER and str(chat_id) == ADMINUSER:
                         await tg_text(chat_id, f"پنل مدیریت آماده‌ست 👇\n{make_admin_login_url()}\n\nاین لینک ۱۵ دقیقه اعتبار داره.")
@@ -442,7 +480,8 @@ async def telegram_loop() -> None:
                             "• کیفیت بالاتر ضبط\n"
                             "• فایل صوتی جداگانه\n"
                             "• متن جلسه\n"
-                            "• پیش نویس صورتجلسه"
+                            "• پیش نویس صورتجلسه",
+                            with_menu=True,
                         )
                     else:
                         intents = {}
@@ -493,12 +532,13 @@ async def telegram_loop() -> None:
                         f"فقط یادت باشه {BOT_EMAIL} رو هم به همون ایونت کلندر دعوت کنی. "
                         "سر وقت خودم وارد میت می‌شم، ضبطش می‌کنم و آخرش فایل رو همینجا برات می‌فرستم.\n\n"
                         + auth_status,
+                        with_menu=True,
                     )
                     continue
                 if text.strip().lower() == "/now":
                     state.setdefault("pending_now", {})[str(chat_id)] = True
                     await save_state()
-                    await tg_text(chat_id, "باشه. حالا لینک Google Meet رو بفرست تا همین الان واردش بشم.")
+                    await tg_text(chat_id, "باشه. حالا لینک Google Meet رو بفرست تا همین الان واردش بشم.", with_menu=True)
                     continue
 
                 force_now = text.strip().lower().startswith("/now") or bool(
