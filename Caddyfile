@@ -1,4 +1,14 @@
 {$DOMAIN} {
     encode zstd gzip
-    reverse_proxy controller:8000
+
+    handle_path /browser/* {
+        basic_auth {
+            setup $2y$05$r7RSU.XctNNKIgHUCTZMguk1pXTxFgZ6g2.ku2aYTmQdHDXBUqR7.
+        }
+        reverse_proxy chrome-cdp:6080
+    }
+
+    handle {
+        reverse_proxy controller:8000
+    }
 }
