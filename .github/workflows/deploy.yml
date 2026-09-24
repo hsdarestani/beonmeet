@@ -72,8 +72,6 @@ jobs:
               chmod 600 .internal_secret
             fi
             INTERNAL_SECRET="$(cat .internal_secret)"
-            BROWSER_SETUP_PASSWORD='BOM-2IJgHOWyXbaQ0LPe'
-            BROWSER_SETUP_HASH_ESCAPED="$(printf '%s' "$BROWSER_SETUP_HASH" | sed 's/\$/$/g')"
 
             cat > .env <<EOF
             DOMAIN=beonmeet.smarbiz.sbs
