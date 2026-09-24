@@ -69,8 +69,6 @@ MEET_RE = re.compile(r"(?:https?://)?(?:www\.)?meet\.google\.com/[a-z]{3}-[a-z]{
 SCOPES = ["https://www.googleapis.com/auth/calendar.events.readonly"]
 
 state_lock = asyncio.Lock()
-TRANSCRIPTION_CONCURRENCY = int(os.environ.get("TRANSCRIPTION_CONCURRENCY", "2"))
-transcription_semaphore = asyncio.Semaphore(max(1, TRANSCRIPTION_CONCURRENCY))
 _whisper_model = None
 state: dict[str, Any] = {
     "telegram_offset": 0,
@@ -947,8 +945,7 @@ async def recording_ready(
                 # especially with weak audio or several people speaking at once.
                 try:
                     await tg_text(chat_id, "📝 دارم متن جلسه رو هم آماده می‌کنم. ممکنه یه کم طول بکشه…")
-                    async with transcription_semaphore:
-                        async with TRANSCRIPTION_SEMAPHORE:
+                    async with TRANSCRIPTION_SEMAPHORE:
                         transcript, detected_language = await asyncio.to_thread(transcribe_audio_local, audio_path)
                     if transcript:
                         transcript_path = raw_path.with_name(f"{raw_path.stem}_transcript.txt")
