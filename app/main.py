@@ -172,6 +172,23 @@ def event_end(event: dict[str, Any]) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def find_calendar_event_for_meet(meet_url: str) -> dict[str, Any] | None:
+    for event in list_calendar_events():
+        if event_meet_url(event) == meet_url:
+            return event
+    return None
+
+
+def fmt_event_time(event: dict[str, Any]) -> str:
+    start = event_start(event)
+    end = event_end(event)
+    if not start:
+        return "unknown time"
+    if end:
+        return f"{start.astimezone().strftime('%Y-%m-%d %H:%M')} to {end.astimezone().strftime('%H:%M')}"
+    return start.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
 async def launch_meeting(event: dict[str, Any], req: dict[str, Any], meet_url: str) -> bool:
     event_id = event.get("id") or str(uuid.uuid4())
     chat_id = str(req["chat_id"])
@@ -227,7 +244,8 @@ async def calendar_loop() -> None:
                         continue
                     if end and now > end:
                         continue
-                    if start - timedelta(seconds=45) <= now <= start + timedelta(minutes=20):
+                    live_until = (end + timedelta(minutes=5)) if end else (start + timedelta(hours=3))
+                    if start - timedelta(minutes=2) <= now <= live_until:
                         await launch_meeting(event, req, meet_url)
         except Exception as exc:
             print("calendar loop error:", repr(exc), flush=True)
@@ -262,21 +280,60 @@ async def telegram_loop() -> None:
                         + auth_status,
                     )
                     continue
+                force_now = text.strip().lower().startswith("/now")
                 meet_url = normalize_meet_url(text)
                 if meet_url:
                     state["requests"][meet_url] = {
                         "chat_id": str(chat_id),
                         "requested_at": datetime.now(timezone.utc).isoformat(),
                     }
-                    await tg_text(
-                        chat_id,
-                        f"✅ Request saved\n{meet_url}\n\n"
-                        f"Now make sure {BOT_EMAIL} is invited to the Google Calendar event. "
-                        "I will join automatically at the scheduled time.",
-                    )
+                    await save_state()
+
+                    if force_now:
+                        synthetic_event = {
+                            "id": f"manual-{uuid.uuid4()}",
+                            "start": {"dateTime": datetime.now(timezone.utc).isoformat()},
+                            "end": {"dateTime": (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()},
+                        }
+                        launched = await launch_meeting(synthetic_event, state["requests"][meet_url], meet_url)
+                        if not launched:
+                            await tg_text(chat_id, "⏳ Join request is queued or the recorder is busy. I will retry from the calendar watcher if this link is also scheduled.")
+                        continue
+
+                    try:
+                        matched_event = await asyncio.to_thread(find_calendar_event_for_meet, meet_url)
+                    except Exception as exc:
+                        print("calendar lookup error after Telegram request:", repr(exc), flush=True)
+                        await tg_text(
+                            chat_id,
+                            "⚠️ I saved the request, but I could not read Google Calendar right now. "
+                            "Please try again in a moment.",
+                        )
+                        continue
+
+                    if matched_event:
+                        when = fmt_event_time(matched_event)
+                        await tg_text(
+                            chat_id,
+                            f"✅ Request saved and Calendar event found\n{meet_url}\n🕒 {when}",
+                        )
+                        now = datetime.now(timezone.utc)
+                        start = event_start(matched_event)
+                        end = event_end(matched_event)
+                        live_until = (end + timedelta(minutes=5)) if end else ((start + timedelta(hours=3)) if start else now)
+                        if start and start - timedelta(minutes=2) <= now <= live_until:
+                            await launch_meeting(matched_event, state["requests"][meet_url], meet_url)
+                    else:
+                        await tg_text(
+                            chat_id,
+                            f"⚠️ Request saved, but I cannot see this Meet in {BOT_EMAIL}'s Google Calendar yet.\n\n"
+                            f"Invite {BOT_EMAIL} to the Calendar event and make sure the invitation is actually added to that account's calendar. "
+                            "Then send the link again.\n\n"
+                            "If the meeting is already live and you want to force an immediate join, send:\n"
+                            f"/now {meet_url}",
+                        )
                 else:
                     await tg_text(chat_id, "Send a Google Meet link, for example:\nhttps://meet.google.com/abc-defg-hij")
-                await save_state()
         except Exception as exc:
             print("telegram loop error:", repr(exc), flush=True)
             await asyncio.sleep(5)
