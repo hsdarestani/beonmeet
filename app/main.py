@@ -366,7 +366,8 @@ async def auth_google_callback(request: Request, state: str) -> str:
     if state != globals()["state"].get("oauth_state"):
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
     flow = google_flow(state)
-    flow.fetch_token(authorization_response=str(request.url))
+    callback_url = f"https://{DOMAIN}/auth/google/callback?{request.url.query}"
+    flow.fetch_token(authorization_response=callback_url)
     creds = flow.credentials
     TOKEN_FILE.write_text(creds.to_json())
     globals()["state"]["oauth_state"] = None
