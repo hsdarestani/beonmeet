@@ -1,0 +1,104 @@
+name: Deploy BeOnMeet
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: beonmeet-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Copy application files
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          password: ${{ secrets.PASS }}
+          source: "app,patches,docker-compose.yml,Caddyfile,.env.example,README.md"
+          target: "/opt/beonmeet"
+          overwrite: true
+
+      - name: Deploy
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 30m
+          envs: GOOGLE_CLIENT_ID,GOOGLE_CLIENT_SECRET,TELEGRAM_BOT_TOKEN
+          script: |
+            set -euo pipefail
+
+            if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y git curl ca-certificates
+            fi
+
+            if ! command -v docker >/dev/null 2>&1; then
+              curl -fsSL https://get.docker.com | sh
+            fi
+
+            cd /opt/beonmeet
+
+            if [ ! -f .internal_secret ]; then
+              openssl rand -hex 32 > .internal_secret
+              chmod 600 .internal_secret
+            fi
+            INTERNAL_SECRET="$(cat .internal_secret)"
+
+            cat > .env <<EOF
+            DOMAIN=beonmeet.smarbiz.sbs
+            BOT_EMAIL=meetrecorderbot@gmail.com
+            BOT_DISPLAY_NAME=BeOnMeet Recorder
+            GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+            GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+            GOOGLE_REDIRECT_URI=https://beonmeet.smarbiz.sbs/auth/google/callback
+            TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+            TELEGRAM_API_BASE=https://api.telegram.org
+            INTERNAL_SECRET=${INTERNAL_SECRET}
+            MEETING_BOT_URL=http://meeting-bot:3000
+            CONTROLLER_UPLOAD_URL=http://controller:8000/internal/recording-ready
+            RECORDING_TMP_DIR=/recordings
+            CALENDAR_POLL_SECONDS=30
+            EOF
+            chmod 600 .env
+
+            UPSTREAM_COMMIT=1447ed3a38ce052a694872141a9b7085189e8513
+            if [ ! -d upstream/.git ]; then
+              rm -rf upstream
+              git clone https://github.com/screenappai/meeting-bot.git upstream
+            fi
+            cd upstream
+            git fetch --all --tags --prune
+            git reset --hard "${UPSTREAM_COMMIT}"
+            cd ..
+            cp patches/disk-uploader.ts upstream/src/middleware/disk-uploader.ts
+
+            mkdir -p /dev/shm/beonmeet
+            chmod 777 /dev/shm/beonmeet
+
+            docker compose up -d --build --remove-orphans
+            docker compose ps
+
+            for i in $(seq 1 30); do
+              if docker compose exec -T controller python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read().decode())"; then
+                exit 0
+              fi
+              sleep 5
+            done
+
+            echo "Controller health check failed"
+            docker compose logs --tail=200 controller meeting-bot chrome-cdp caddy
+            exit 1
