@@ -104,6 +104,7 @@ jobs:
             cp patches/Dockerfile.chrome-cdp upstream/Dockerfile.chrome-cdp
             cp patches/start-chrome-cdp.sh upstream/scripts/start-chrome-cdp.sh
             chmod +x upstream/scripts/start-chrome-cdp.sh
+            python3 patches/apply-upstream-fixes.py
 
             # Build only Chromium and give TypeScript enough heap on small servers.
             sed -i 's/npx playwright install --with-deps$/npx playwright install --with-deps chromium/' upstream/Dockerfile.production
