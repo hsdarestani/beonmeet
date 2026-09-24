@@ -107,9 +107,6 @@ jobs:
 
             mkdir -p /dev/shm/beonmeet
             chmod 777 /dev/shm/beonmeet
-            mkdir -p /opt/beonmeet/chrome-profile
-            chown -R 1001:1001 /opt/beonmeet/chrome-profile
-
             if ! docker compose up -d --build --remove-orphans; then
               docker compose ps -a || true
               docker compose logs --tail=250 controller meeting-bot chrome-cdp caddy redis || true
