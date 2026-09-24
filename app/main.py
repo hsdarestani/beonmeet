@@ -92,7 +92,10 @@ def normalize_meet_url(url: str) -> str:
     match = MEET_RE.search(url or "")
     if not match:
         return ""
-    return match.group(0).split("?")[0].lower()
+    raw = match.group(0).split("?")[0].lower()
+    raw = re.sub(r"^https?://", "", raw)
+    raw = re.sub(r"^www\\.", "", raw)
+    return f"https://{raw}"
 
 
 async def telegram(method: str, data: dict[str, Any] | None = None, files: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -225,10 +228,10 @@ def fmt_event_time(event: dict[str, Any]) -> str:
     start = event_start(event)
     end = event_end(event)
     if not start:
-        return "unknown time"
+        return "زمان نامشخص"
     if end:
-        return f"{start.astimezone().strftime('%Y-%m-%d %H:%M')} to {end.astimezone().strftime('%H:%M')}"
-    return start.astimezone().strftime("%Y-%m-%d %H:%M")
+        return f"{start.strftime('%Y-%m-%d %H:%M')} تا {end.strftime('%H:%M')}"
+    return start.strftime("%Y-%m-%d %H:%M")
 
 
 async def launch_meeting(event: dict[str, Any], req: dict[str, Any], meet_url: str) -> bool:
@@ -254,7 +257,7 @@ async def launch_meeting(event: dict[str, Any], req: dict[str, Any], meet_url: s
                 "launched_at": datetime.now(timezone.utc).isoformat(),
             }
             await save_state()
-            await tg_text(chat_id, f"🎥 وارد جلسه شدم و ضبط شروع شد.\n{meet_url}")
+            await tg_text(chat_id, f"⏳ درخواست ورود به جلسه ارسال شد. دارم وارد می‌شم…\n{meet_url}")
             return True
         if r.status_code == 409:
             return False
@@ -287,7 +290,7 @@ async def calendar_loop() -> None:
                     if end and now > end:
                         continue
                     live_until = (end + timedelta(minutes=5)) if end else (start + timedelta(hours=3))
-                    if start - timedelta(minutes=2) <= now <= live_until:
+                    if start <= now <= live_until:
                         await launch_meeting(event, req, meet_url)
         except Exception as exc:
             print("calendar loop error:", repr(exc), flush=True)
@@ -345,9 +348,8 @@ async def telegram_loop() -> None:
                             "• کیفیت بالاتر ضبط\n"
                             "• فایل صوتی جداگانه\n"
                             "• متن جلسه\n"
-                            "• پیش نویس صورتجلسه\n"
-                            "• خلاصه و کارهای بعدی جلسه\n\n"
-                            "پرداخت آنلاین به زودی اضافه می‌شه."
+                            "• پیش نویس صورتجلسه\n\n"
+                            "برای خرید یکی از پلن‌ها، از دکمه‌های پرداخت استفاده کن."
                         )
                     continue
 
@@ -362,7 +364,15 @@ async def telegram_loop() -> None:
                         + auth_status,
                     )
                     continue
-                force_now = text.strip().lower().startswith("/now")
+                if text.strip().lower() == "/now":
+                    state.setdefault("pending_now", {})[str(chat_id)] = True
+                    await save_state()
+                    await tg_text(chat_id, "باشه. حالا لینک Google Meet رو بفرست تا همین الان واردش بشم.")
+                    continue
+
+                force_now = text.strip().lower().startswith("/now") or bool(
+                    state.setdefault("pending_now", {}).pop(str(chat_id), False)
+                )
                 meet_url = normalize_meet_url(text)
                 if meet_url:
                     state["requests"][meet_url] = {
@@ -407,7 +417,7 @@ async def telegram_loop() -> None:
                         start = event_start(matched_event)
                         end = event_end(matched_event)
                         live_until = (end + timedelta(minutes=5)) if end else ((start + timedelta(hours=3)) if start else now)
-                        if start and start - timedelta(minutes=2) <= now <= live_until:
+                        if start and start <= now <= live_until:
                             await launch_meeting(matched_event, state["requests"][meet_url], meet_url)
                     else:
                         await tg_text(
