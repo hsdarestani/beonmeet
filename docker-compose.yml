@@ -1,4 +1,5 @@
-# BeOnMeet production concurrency: 8 simultaneous meeting slots
+# BeOnMeet production capacity: 5 free slots + 3 reserved Premium slots.
+# Premium can also borrow an unused free slot. Free users never consume Premium slots.
 services:
   controller:
     build: ./app
@@ -6,7 +7,10 @@ services:
     env_file: .env
     environment:
       TRANSCRIPTION_CONCURRENCY: "1"
-      MAX_CONCURRENT_MEETINGS: "8"
+      FREE_MEETING_BOT_URL: http://meeting-bot:3000
+      PREMIUM_MEETING_BOT_URL: http://meeting-bot-premium:3000
+      FREE_MEETING_SLOTS: "5"
+      PREMIUM_MEETING_SLOTS: "3"
     volumes:
       - controller_state:/data
       - /dev/shm/beonmeet:/recordings
@@ -14,6 +18,8 @@ services:
       - "8000"
     depends_on:
       meeting-bot:
+        condition: service_started
+      meeting-bot-premium:
         condition: service_started
 
   redis:
@@ -26,6 +32,7 @@ services:
       - "6379"
 
   meeting-bot:
+    image: beonmeet-meeting-bot:latest
     platform: linux/amd64
     build:
       context: ./upstream
@@ -44,7 +51,38 @@ services:
       CONTROLLER_WAITING_FOR_ADMISSION_URL: http://controller:8000/internal/waiting-for-admission
       UPLOADER_FILE_EXTENSION: .webm
       MAX_RECORDING_DURATION_MINUTES: "240"
-      MAX_CONCURRENT_MEETINGS: "8"
+      MAX_CONCURRENT_MEETINGS: "5"
+      MEETING_INACTIVITY_MINUTES: "1"
+      INACTIVITY_DETECTION_START_DELAY_MINUTES: "3"
+      JOIN_WAIT_TIME_MINUTES: "5"
+    volumes:
+      - /dev/shm/beonmeet:/recordings
+    depends_on:
+      redis:
+        condition: service_started
+      chrome-cdp:
+        condition: service_healthy
+    expose:
+      - "3000"
+
+  meeting-bot-premium:
+    image: beonmeet-meeting-bot:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_CONSUMER_ENABLED: "false"
+      GOOGLE_CHROME_CDP_URL: http://chrome-cdp:9223
+      RECORDING_TMP_DIR: /recordings
+      CONTROLLER_UPLOAD_URL: http://controller:8000/internal/recording-ready
+      CONTROLLER_RECORDING_STARTED_URL: http://controller:8000/internal/recording-started
+      CONTROLLER_WAITING_FOR_ADMISSION_URL: http://controller:8000/internal/waiting-for-admission
+      UPLOADER_FILE_EXTENSION: .webm
+      MAX_RECORDING_DURATION_MINUTES: "240"
+      MAX_CONCURRENT_MEETINGS: "3"
       MEETING_INACTIVITY_MINUTES: "1"
       INACTIVITY_DETECTION_START_DELAY_MINUTES: "3"
       JOIN_WAIT_TIME_MINUTES: "5"
