@@ -58,6 +58,8 @@ services:
       dockerfile: Dockerfile.chrome-cdp
     restart: unless-stopped
     shm_size: "1gb"
+    volumes:
+      - ./chrome-profile:/tmp/chrome-profile
     expose:
       - "9223"
       - "6080"
