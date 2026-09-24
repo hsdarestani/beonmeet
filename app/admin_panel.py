@@ -4,6 +4,7 @@ import html
 import os
 import sqlite3
 import time
+import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -24,12 +25,10 @@ PLANS = {
 }
 
 PREMIUM_FEATURES = [
-    ("کیفیت بالاتر ضبط", "ضبط با رزولوشن و بیت ریت بالاتر تا سقف کیفیت واقعی Google Meet", "planned"),
+    ("کیفیت بالاتر ضبط", "ضبط با کیفیت بالاتر نسبت به پلن رایگان، تا سقف کیفیت واقعی دریافتی از Google Meet", "planned"),
     ("فایل صوتی جداگانه", "خروجی MP3 مستقل بعد از پایان جلسه", "ready"),
-    ("متن جلسه", "تبدیل صوت به متن با ذکر احتمال خطا در صداهای ضعیف یا همزمان", "provider"),
-    ("پیش نویس صورتجلسه", "خلاصه موضوعات، تصمیم ها و نکات مهم با ذکر احتمال خطا", "provider"),
-    ("اقدامات بعدی", "استخراج Action Item ها و کارهای بعدی از متن جلسه", "provider"),
-    ("خلاصه کوتاه", "نسخه خیلی کوتاه برای مرور سریع جلسه", "provider"),
+    ("متن جلسه", "تبدیل صوت به متن؛ در صداهای ضعیف یا همزمان ممکنه خطا داشته باشه", "provider"),
+    ("پیش نویس صورتجلسه", "خلاصه نکات مطرح شده در جلسه؛ ممکنه نیاز به بازبینی داشته باشه", "provider"),
 ]
 
 
@@ -83,6 +82,17 @@ def init_db() -> None:
                 status TEXT NOT NULL DEFAULT 'active',
                 note TEXT DEFAULT '',
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS payment_intents (
+                intent TEXT PRIMARY KEY,
+                telegram_id TEXT NOT NULL,
+                plan_code TEXT NOT NULL,
+                amount_toman INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                receipt TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                paid_at TEXT
             );
             """
         )
@@ -207,6 +217,60 @@ def deactivate_subscription(telegram_id: str) -> None:
             "UPDATE subscriptions SET status='cancelled' WHERE telegram_id=? AND status='active'",
             (str(telegram_id),),
         )
+
+
+def create_payment_intent(telegram_id: str, plan_code: str) -> dict:
+    if plan_code not in PLANS:
+        raise ValueError("invalid plan")
+    plan = PLANS[plan_code]
+    now = utcnow()
+    intent = secrets.token_urlsafe(24)
+    expires = now + timedelta(minutes=30)
+    with _db() as db:
+        db.execute(
+            """INSERT INTO payment_intents
+               (intent, telegram_id, plan_code, amount_toman, status, created_at, expires_at)
+               VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+            (intent, str(telegram_id), plan_code, int(plan["price"]), now.isoformat(), expires.isoformat()),
+        )
+    return {
+        "intent": intent,
+        "telegram_id": str(telegram_id),
+        "plan": plan_code,
+        "amount_toman": int(plan["price"]),
+        "label": f"پلن ویژه BeOnMeet، {plan['label']}",
+        "expires_at": expires,
+    }
+
+
+def get_payment_intent(intent: str) -> dict | None:
+    with _db() as db:
+        row = db.execute("SELECT * FROM payment_intents WHERE intent=? LIMIT 1", (str(intent),)).fetchone()
+    if not row:
+        return None
+    data = dict(row)
+    expires = _parse_dt(data.get("expires_at"))
+    if data.get("status") == "pending" and expires and expires <= utcnow():
+        with _db() as db:
+            db.execute("UPDATE payment_intents SET status='expired' WHERE intent=? AND status='pending'", (str(intent),))
+        data["status"] = "expired"
+    return data
+
+
+def mark_payment_paid(intent: str, receipt: str) -> dict | None:
+    now = utcnow().isoformat()
+    with _db() as db:
+        row = db.execute("SELECT * FROM payment_intents WHERE intent=? LIMIT 1", (str(intent),)).fetchone()
+        if not row:
+            return None
+        if row["status"] == "paid":
+            return dict(row)
+        db.execute(
+            "UPDATE payment_intents SET status='paid', receipt=?, paid_at=? WHERE intent=?",
+            (str(receipt), now, str(intent)),
+        )
+        fresh = db.execute("SELECT * FROM payment_intents WHERE intent=? LIMIT 1", (str(intent),)).fetchone()
+    return dict(fresh) if fresh else None
 
 
 def make_admin_login_url() -> str:
@@ -496,6 +560,6 @@ async def plans_page(request: Request):
       <div class="feature"><span class="dot"></span><div><b>ورود خودکار به Google Meet</b><div class="muted">از طریق لینک و Calendar</div></div></div>
       <div class="feature"><span class="dot"></span><div><b>ضبط کامل جلسه</b><div class="muted">کیفیت استاندارد</div></div></div>
       <div class="feature"><span class="dot"></span><div><b>ارسال در تلگرام</b><div class="muted">مستقیم برای درخواست دهنده</div></div></div>
-      <div class="alert" style="margin-top:15px">پرداخت آنلاین هنوز متصل نشده. فعلاً می تونی اشتراک رو از صفحه کاربر دستی فعال یا تمدید کنی.</div>
+      <div class="alert" style="margin-top:15px">پرداخت آنلاین زیبال از مسیر HamoonCloud برای خرید کاربرها در حال استفاده است. فعال سازی دستی هم همچنان از صفحه کاربر در دسترسه.</div>
     </div></div>"""
     return _layout("پلن ویژه", body, "plans")
