@@ -96,6 +96,24 @@ async def tg_text(chat_id: int | str, text: str) -> None:
     await telegram("sendMessage", {"chat_id": str(chat_id), "text": text, "disable_web_page_preview": "true"})
 
 
+async def setup_telegram_profile() -> None:
+    try:
+        await telegram("setMyDescription", {
+            "description": "لینک Google Meet رو بفرست. سر وقت وارد جلسه می‌شم، ضبطش می‌کنم و آخرش فایل رو همینجا برات می‌فرستم."
+        })
+        await telegram("setMyShortDescription", {
+            "short_description": "ضبط خودکار Google Meet و ارسال مستقیم توی تلگرام"
+        })
+        await telegram("setMyCommands", {
+            "commands": json.dumps([
+                {"command": "start", "description": "شروع و راهنما"},
+                {"command": "now", "description": "ورود فوری به یک Meet در حال اجرا"},
+            ], ensure_ascii=False)
+        })
+    except Exception as exc:
+        print("telegram profile setup error:", repr(exc), flush=True)
+
+
 def google_flow(state_value: str | None = None) -> Flow:
     cfg = {
         "web": {
@@ -212,11 +230,11 @@ async def launch_meeting(event: dict[str, Any], req: dict[str, Any], meet_url: s
                 "launched_at": datetime.now(timezone.utc).isoformat(),
             }
             await save_state()
-            await tg_text(chat_id, f"🎥 Recording started\n{meet_url}")
+            await tg_text(chat_id, f"🎥 وارد جلسه شدم و ضبط شروع شد.\n{meet_url}")
             return True
         if r.status_code == 409:
             return False
-        await tg_text(chat_id, f"⚠️ Recorder could not join yet. It will retry automatically.\n{meet_url}")
+        await tg_text(chat_id, f"⚠️ فعلاً نتونستم وارد جلسه بشم. خودم دوباره امتحان می‌کنم.\n{meet_url}")
     except Exception:
         return False
     return False
@@ -270,13 +288,13 @@ async def telegram_loop() -> None:
                 if not chat_id:
                     continue
                 if text.startswith("/start"):
-                    auth_status = "✅ Calendar connected" if TOKEN_FILE.exists() else f"⚠️ Calendar not connected yet\nhttps://{DOMAIN}/auth/google"
+                    auth_status = "✅ کلندر وصله" if TOKEN_FILE.exists() else f"⚠️ کلندر هنوز وصل نیست\nhttps://{DOMAIN}/auth/google"
                     await tg_text(
                         chat_id,
-                        "BeOnMeet Recorder\n\n"
-                        "Send me the Google Meet link you want recorded. "
-                        f"Also invite {BOT_EMAIL} to that Calendar event. "
-                        "At the meeting time I will join, record, and send the result back here.\n\n"
+                        "سلام 👋 من BeOnMeet هستم.\n\n"
+                        "لینک Google Meet رو برام بفرست. "
+                        f"فقط یادت باشه {BOT_EMAIL} رو هم به همون ایونت کلندر دعوت کنی. "
+                        "سر وقت خودم وارد میت می‌شم، ضبطش می‌کنم و آخرش فایل رو همینجا برات می‌فرستم.\n\n"
                         + auth_status,
                     )
                     continue
@@ -297,7 +315,7 @@ async def telegram_loop() -> None:
                         }
                         launched = await launch_meeting(synthetic_event, state["requests"][meet_url], meet_url)
                         if not launched:
-                            await tg_text(chat_id, "⏳ Join request is queued or the recorder is busy. I will retry from the calendar watcher if this link is also scheduled.")
+                            await tg_text(chat_id, "⏳ درخواست ورود ثبت شد. اگه رکوردر مشغول باشه، به محض آزاد شدن دوباره امتحان می‌کنم.")
                         continue
 
                     try:
@@ -306,8 +324,7 @@ async def telegram_loop() -> None:
                         print("calendar lookup error after Telegram request:", repr(exc), flush=True)
                         await tg_text(
                             chat_id,
-                            "⚠️ I saved the request, but I could not read Google Calendar right now. "
-                            "Please try again in a moment.",
+                            "⚠️ درخواستت ذخیره شد ولی الان نتونستم کلندر گوگل رو بخونم. یه کوچولو بعد دوباره لینک رو بفرست.",
                         )
                         continue
 
@@ -315,7 +332,7 @@ async def telegram_loop() -> None:
                         when = fmt_event_time(matched_event)
                         await tg_text(
                             chat_id,
-                            f"✅ Request saved and Calendar event found\n{meet_url}\n🕒 {when}",
+                            f"✅ گرفتمش. ایونت کلندر هم پیدا شد.\n{meet_url}\n🕒 {when}",
                         )
                         now = datetime.now(timezone.utc)
                         start = event_start(matched_event)
@@ -326,14 +343,13 @@ async def telegram_loop() -> None:
                     else:
                         await tg_text(
                             chat_id,
-                            f"⚠️ Request saved, but I cannot see this Meet in {BOT_EMAIL}'s Google Calendar yet.\n\n"
-                            f"Invite {BOT_EMAIL} to the Calendar event and make sure the invitation is actually added to that account's calendar. "
-                            "Then send the link again.\n\n"
-                            "If the meeting is already live and you want to force an immediate join, send:\n"
+                            f"⚠️ لینکت رو ذخیره کردم، ولی هنوز این جلسه رو توی کلندر {BOT_EMAIL} نمی‌بینم.\n\n"
+                            f"اول {BOT_EMAIL} رو به ایونت دعوت کن. اگه قبلاً دعوتش کردی، توی تنظیمات Google Calendar همین اکانت گزینه «Add invitations to my calendar» رو روی «From everyone» بذار یا دعوت فعلی رو قبول کن. بعد لینک رو دوباره برام بفرست.\n\n"
+                            "اگه جلسه همین الان شروع شده و می‌خوای بدون منتظر موندن وارد بشم، اینو بفرست:\n"
                             f"/now {meet_url}",
                         )
                 else:
-                    await tg_text(chat_id, "Send a Google Meet link, for example:\nhttps://meet.google.com/abc-defg-hij")
+                    await tg_text(chat_id, "یه لینک Google Meet برام بفرست، مثلاً:\nhttps://meet.google.com/abc-defg-hij")
         except Exception as exc:
             print("telegram loop error:", repr(exc), flush=True)
             await asyncio.sleep(5)
@@ -346,7 +362,7 @@ async def send_recording(chat_id: str, path: Path, filename: str) -> None:
         with path.open("rb") as fp:
             await telegram(
                 "sendDocument",
-                {"chat_id": chat_id, "caption": "🎥 Meeting recording"},
+                {"chat_id": chat_id, "caption": "🎥 ضبط جلسه‌ت آماده‌ست"},
                 {"document": (filename, fp, "video/webm" if filename.endswith(".webm") else "video/mp4")},
             )
         return
@@ -371,12 +387,12 @@ async def send_recording(chat_id: str, path: Path, filename: str) -> None:
         check=True,
     )
     parts = sorted(path.parent.glob(f"{path.stem}_part_*.mp4"))
-    await tg_text(chat_id, f"Recording is larger than Telegram Bot API cloud limit, so it is being sent in {len(parts)} playable parts.")
+    await tg_text(chat_id, f"حجم ویدیو زیاده، برای همین توی {len(parts)} قسمت قابل پخش برات می‌فرستم.")
     for idx, part in enumerate(parts, 1):
         with part.open("rb") as fp:
             await telegram(
                 "sendDocument",
-                {"chat_id": chat_id, "caption": f"🎥 Meeting recording {idx}/{len(parts)}"},
+                {"chat_id": chat_id, "caption": f"🎥 ضبط جلسه، قسمت {idx} از {len(parts)}"},
                 {"document": (part.name, fp, "video/mp4")},
             )
         part.unlink(missing_ok=True)
@@ -386,6 +402,7 @@ async def send_recording(chat_id: str, path: Path, filename: str) -> None:
 async def startup() -> None:
     load_state()
     RECORDING_ROOT.mkdir(parents=True, exist_ok=True)
+    asyncio.create_task(setup_telegram_profile())
     asyncio.create_task(telegram_loop())
     asyncio.create_task(calendar_loop())
 
@@ -402,7 +419,8 @@ async def health() -> dict[str, Any]:
 @app.get("/", response_class=HTMLResponse)
 async def home() -> str:
     status = "connected" if TOKEN_FILE.exists() else "not connected"
-    return f"<h1>BeOnMeet</h1><p>Google Calendar: {status}</p><p><a href='/auth/google'>Connect Calendar</a></p>"
+    fa_status = "وصله ✅" if TOKEN_FILE.exists() else "هنوز وصل نیست ⚠️"
+    return f"<h1>BeOnMeet</h1><p>Google Calendar: {fa_status}</p><p><a href='/auth/google'>وصل کردن کلندر</a></p>"
 
 
 @app.get("/auth/google")
@@ -429,7 +447,7 @@ async def auth_google_callback(request: Request, state: str) -> str:
     TOKEN_FILE.write_text(creds.to_json())
     globals()["state"]["oauth_state"] = None
     await save_state()
-    return "<h2>Google Calendar connected successfully.</h2><p>You can close this page and return to Telegram.</p>"
+    return "<h2>کلندر با موفقیت وصل شد ✅</h2><p>می‌تونی این صفحه رو ببندی و برگردی تلگرام.</p>"
 
 
 @app.post("/internal/recording-ready")
@@ -452,10 +470,10 @@ async def recording_ready(
         raise HTTPException(status_code=400, detail="Missing userId")
     filename = str(data.get("filename") or raw_path.name)
     try:
-        await tg_text(chat_id, "✅ Meeting ended. Uploading the recording now…")
+        await tg_text(chat_id, "✅ جلسه تموم شد. دارم فایل ضبط شده رو برات می‌فرستم…")
         await send_recording(chat_id, raw_path, filename)
         raw_path.unlink(missing_ok=True)
         return {"ok": True}
     except Exception as exc:
-        await tg_text(chat_id, "⚠️ Recording finished, but Telegram upload failed. I will keep it in temporary RAM until the service restarts.")
+        await tg_text(chat_id, "⚠️ ضبط تموم شده ولی ارسالش به تلگرام خطا خورد. فایل فعلاً فقط توی حافظه موقت نگه داشته شده تا بتونم دوباره بفرستم.")
         raise HTTPException(status_code=502, detail=str(exc))
