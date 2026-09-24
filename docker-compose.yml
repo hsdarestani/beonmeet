@@ -47,7 +47,6 @@ services:
       MEETING_INACTIVITY_MINUTES: "1"
       INACTIVITY_DETECTION_START_DELAY_MINUTES: "3"
       JOIN_WAIT_TIME_MINUTES: "5"
-      MAX_CONCURRENT_MEETINGS: "8"
     volumes:
       - /dev/shm/beonmeet:/recordings
     depends_on:
