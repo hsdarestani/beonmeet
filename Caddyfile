@@ -3,7 +3,7 @@
 
     handle_path /browser/* {
         basic_auth {
-            setup $2y$05$r7RSU.XctNNKIgHUCTZMguk1pXTxFgZ6g2.ku2aYTmQdHDXBUqR7.
+            setup {$BROWSER_SETUP_HASH}
         }
         reverse_proxy chrome-cdp:6080
     }
