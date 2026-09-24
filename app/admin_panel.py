@@ -221,7 +221,7 @@ def _valid_token(exp: str, sig: str) -> bool:
         exp_i = int(exp)
     except Exception:
         return False
-    if exp_i < int(time.time()) or exp_i > int(time.time()) + 3600:
+    if exp_i < int(time.time()) or exp_i > int(time.time()) + 86400:
         return False
     payload = f"admin:{ADMINUSER}:{exp_i}"
     expected = hmac.new(INTERNAL_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
@@ -284,7 +284,7 @@ main{{padding:34px 38px 60px;max-width:1500px;width:100%}} .top{{display:flex;ju
 .grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:15px}} .card{{background:linear-gradient(145deg,#151927dd,#0f121ddd);border:1px solid var(--line);border-radius:20px;padding:20px;box-shadow:0 18px 55px #0004;backdrop-filter:blur(16px)}} .metric .label{{color:var(--muted);font-size:12px}} .metric .num{{font-size:28px;font-weight:900;margin-top:12px}} .metric .hint{{font-size:11px;color:#697289;margin-top:8px}}
 .good{{color:var(--good)}} .warn{{color:var(--warn)}} .purple{{color:#b99cff}} .cyan{{color:#73dfff}}
 .section{{margin-top:20px}} .section-head{{display:flex;justify-content:space-between;align-items:center;margin:0 2px 12px}} .section-head h2{{font-size:16px;margin:0}} .pill{{padding:7px 11px;border-radius:99px;background:#ffffff0b;border:1px solid var(--line);color:var(--muted);font-size:11px}}
-table{{width:100%;border-collapse:collapse}} th{{text-align:right;color:#737d94;font-weight:500;font-size:11px;padding:0 10px 13px}} td{{padding:14px 10px;border-top:1px solid #22283a;font-size:12px;vertical-align:middle}} tr:hover td{{background:#ffffff02}} .user{{display:flex;gap:10px;align-items:center}} .avatar{{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;font-weight:800;background:linear-gradient(135deg,#7856dd,#196f91)}} .muted{{color:var(--muted)}} .badge{{font-size:10px;padding:5px 8px;border-radius:9px;border:1px solid var(--line)}} .premium{{color:#dbc9ff;background:#8c5cff1e;border-color:#7d5bdd66}} .free{{color:#a6afc1;background:#fff05}}
+table{{width:100%;border-collapse:collapse}} th{{text-align:right;color:#737d94;font-weight:500;font-size:11px;padding:0 10px 13px}} td{{padding:14px 10px;border-top:1px solid #22283a;font-size:12px;vertical-align:middle}} tr:hover td{{background:#ffffff02}} .user{{display:flex;gap:10px;align-items:center}} .avatar{{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;font-weight:800;background:linear-gradient(135deg,#7856dd,#196f91)}} .muted{{color:var(--muted)}} .badge{{font-size:10px;padding:5px 8px;border-radius:9px;border:1px solid var(--line)}} .premium{{color:#dbc9ff;background:#8c5cff1e;border-color:#7d5bdd66}} .free{{color:#a6afc1;background:#ffffff05}}
 .btn{{border:0;border-radius:10px;padding:9px 12px;font:inherit;font-size:11px;cursor:pointer;color:white;background:#ffffff0c;border:1px solid var(--line)}} .btn.primary{{background:linear-gradient(135deg,#7654f5,#4e7dff);border:0}} .btn.danger{{color:#ff9aad;border-color:#ff668544;background:#ff668510}}
 form.inline{{display:flex;gap:7px;align-items:center;flex-wrap:wrap}} select,input{{background:#0d1019;color:#eef1ff;border:1px solid var(--line);border-radius:9px;padding:8px 9px;font:inherit;font-size:11px}} .search{{min-width:260px}}
 .two{{display:grid;grid-template-columns:1.2fr .8fr;gap:18px}} .chart{{height:180px;display:flex;align-items:flex-end;gap:10px;padding-top:15px}} .barwrap{{flex:1;text-align:center;color:#697289;font-size:10px}} .bar{{background:linear-gradient(180deg,var(--b),var(--a));border-radius:7px 7px 3px 3px;min-height:4px;box-shadow:0 0 22px #8c5cff40;margin-bottom:7px}}
@@ -320,8 +320,18 @@ def _stats():
 async def admin_login(exp: str, sig: str):
     if not _valid_token(exp, sig):
         raise HTTPException(status_code=403, detail="لینک ورود منقضی یا نامعتبره. دوباره /admin رو توی ربات بفرست.")
+    session_exp = int(time.time()) + 12 * 3600
+    payload = f"admin:{ADMINUSER}:{session_exp}"
+    session_sig = hmac.new(INTERNAL_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
     response = RedirectResponse("/admin", status_code=302)
-    response.set_cookie("beonmeet_admin", f"{exp}.{sig}", max_age=900, httponly=True, secure=True, samesite="lax")
+    response.set_cookie(
+        "beonmeet_admin",
+        f"{session_exp}.{session_sig}",
+        max_age=12 * 3600,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+    )
     return response
 
 
@@ -407,7 +417,7 @@ async def user_page(request: Request, telegram_id: str):
     if not u: raise HTTPException(404, "کاربر پیدا نشد")
     active=is_premium(telegram_id)
     name=(f'{u["first_name"]} {u["last_name"]}').strip() or "بدون نام"
-    sub_rows="".join(f'<tr><td>{_esc(PLANS.get(s["plan_code"],{{"label":s["plan_code"]}})["label"])}</td><td>{_money(s["price_toman"])}</td><td>{_fa_date(s["starts_at"])}</td><td>{_fa_date(s["ends_at"])}</td><td>{_esc(s["status"])}</td></tr>' for s in subs) or '<tr><td colspan="5" class="empty">اشتراکی ندارد</td></tr>'
+    sub_rows="".join(f'<tr><td>{_esc(PLANS.get(s["plan_code"], {"label": s["plan_code"]})["label"])}</td><td>{_money(s["price_toman"])}</td><td>{_fa_date(s["starts_at"])}</td><td>{_fa_date(s["ends_at"])}</td><td>{_esc(s["status"])}</td></tr>' for s in subs) or '<tr><td colspan="5" class="empty">اشتراکی ندارد</td></tr>'
     rec_rows="".join(f'<tr><td>{_fa_date(r["created_at"])}</td><td>{_esc(r["meet_url"])}</td><td>{round(r["size_bytes"]/1024/1024,1)} MB</td><td>{round(r["duration_seconds"]/60,1)} دقیقه</td></tr>' for r in recs) or '<tr><td colspan="4" class="empty">ضبطی ندارد</td></tr>'
     body=f"""<div class="top"><div><h1>{_esc(name)}</h1><div class="sub">{_esc("@"+u["username"] if u["username"] else telegram_id)}</div></div>
       {'<span class="badge premium">پلن ویژه فعال تا '+_fa_date(u["premium_until"])+'</span>' if active else '<span class="badge free">پلن رایگان</span>'}</div>
@@ -463,7 +473,7 @@ async def subscriptions_page(request: Request):
     _require_admin(request)
     with _db() as db:
         rows=db.execute("""SELECT s.*,u.username,u.first_name,u.last_name FROM subscriptions s LEFT JOIN users u ON u.telegram_id=s.telegram_id ORDER BY s.id DESC LIMIT 300""").fetchall()
-    trs="".join(f'<tr><td>{_esc((str(r["first_name"] or "")+" "+str(r["last_name"] or "")).strip() or r["username"] or r["telegram_id"])}</td><td>{_esc(PLANS.get(r["plan_code"],{{"label":r["plan_code"]}})["label"])}</td><td>{_money(r["price_toman"])} تومان</td><td>{_fa_date(r["starts_at"])}</td><td>{_fa_date(r["ends_at"])}</td><td>{_esc(r["status"])}</td></tr>' for r in rows) or '<tr><td colspan="6" class="empty">هنوز اشتراکی ثبت نشده</td></tr>'
+    trs="".join(f'<tr><td>{_esc((str(r["first_name"] or "")+" "+str(r["last_name"] or "")).strip() or r["username"] or r["telegram_id"])}</td><td>{_esc(PLANS.get(r["plan_code"], {"label": r["plan_code"]})["label"])}</td><td>{_money(r["price_toman"])} تومان</td><td>{_fa_date(r["starts_at"])}</td><td>{_fa_date(r["ends_at"])}</td><td>{_esc(r["status"])}</td></tr>' for r in rows) or '<tr><td colspan="6" class="empty">هنوز اشتراکی ثبت نشده</td></tr>'
     body=f'<div class="top"><div><h1>اشتراک ها</h1><div class="sub">سابقه فعال سازی و تمدید پلن ویژه</div></div></div><div class="card"><table><thead><tr><th>کاربر</th><th>پلن</th><th>مبلغ</th><th>شروع</th><th>پایان</th><th>وضعیت</th></tr></thead><tbody>{trs}</tbody></table></div>'
     return _layout("اشتراک ها", body, "subscriptions")
 
