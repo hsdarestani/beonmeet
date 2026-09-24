@@ -132,19 +132,31 @@ async def setup_telegram_profile() -> None:
             "short_description": "ضبط خودکار Google Meet و ارسال مستقیم توی تلگرام"
         })
         public_commands = [
-            {"command": "start", "description": "شروع و راهنما"},
-            {"command": "plans", "description": "پلن ویژه و قیمت ها"},
-            {"command": "now", "description": "ورود فوری به یک Meet در حال اجرا"},
+            {"command": "start", "description": "راهنمای استفاده"},
+            {"command": "plans", "description": "پلن ویژه و خرید اشتراک"},
+            {"command": "now", "description": "ورود فوری به جلسه"},
         ]
+
+        # Show Telegram's native command menu next to the chat input.
         await telegram("setMyCommands", {
-            "commands": json.dumps(public_commands, ensure_ascii=False)
+            "scope": json.dumps({"type": "all_private_chats"}),
+            "commands": json.dumps(public_commands, ensure_ascii=False),
         })
+        await telegram("setChatMenuButton", {
+            "menu_button": json.dumps({"type": "commands"})
+        })
+
         if ADMINUSER:
+            admin_commands = public_commands + [
+                {"command": "admin", "description": "پنل مدیریت"}
+            ]
             await telegram("setMyCommands", {
                 "scope": json.dumps({"type": "chat", "chat_id": int(ADMINUSER)}),
-                "commands": json.dumps(public_commands + [
-                    {"command": "admin", "description": "پنل مدیریت"}
-                ], ensure_ascii=False)
+                "commands": json.dumps(admin_commands, ensure_ascii=False),
+            })
+            await telegram("setChatMenuButton", {
+                "chat_id": int(ADMINUSER),
+                "menu_button": json.dumps({"type": "commands"}),
             })
     except Exception as exc:
         print("telegram profile setup error:", repr(exc), flush=True)
