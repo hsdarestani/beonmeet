@@ -61,7 +61,7 @@ PAYMENT_STATUS_URL = os.environ.get(
     "https://pay.hamooncloud.ir/payments/beonmeet/status",
 )
 
-MEET_RE = re.compile(r"https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}(?:\?[^\s]*)?", re.I)
+MEET_RE = re.compile(r"(?:https?://)?(?:www\.)?meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}(?:\?[^\s]*)?", re.I)
 SCOPES = ["https://www.googleapis.com/auth/calendar.events.readonly"]
 
 state_lock = asyncio.Lock()
@@ -101,7 +101,8 @@ def normalize_meet_url(url: str) -> str:
         return ""
     raw = match.group(0).split("?")[0].lower()
     raw = re.sub(r"^https?://", "", raw)
-    raw = re.sub(r"^www\\.", "", raw)
+    if raw.startswith("www."):
+        raw = raw[4:]
     return f"https://{raw}"
 
 
