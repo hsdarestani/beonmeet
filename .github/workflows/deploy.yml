@@ -99,6 +99,9 @@ jobs:
             git reset --hard "${UPSTREAM_COMMIT}"
             cd ..
             cp patches/disk-uploader.ts upstream/src/middleware/disk-uploader.ts
+            cp patches/Dockerfile.chrome-cdp upstream/Dockerfile.chrome-cdp
+            cp patches/start-chrome-cdp.sh upstream/scripts/start-chrome-cdp.sh
+            chmod +x upstream/scripts/start-chrome-cdp.sh
 
             # Build only Chromium and give TypeScript enough heap on small servers.
             sed -i 's/npx playwright install --with-deps$/npx playwright install --with-deps chromium/' upstream/Dockerfile.production
