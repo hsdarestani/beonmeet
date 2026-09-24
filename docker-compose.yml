@@ -36,6 +36,7 @@ services:
       GOOGLE_CHROME_CDP_URL: http://chrome-cdp:9223
       RECORDING_TMP_DIR: /recordings
       CONTROLLER_UPLOAD_URL: http://controller:8000/internal/recording-ready
+      CONTROLLER_RECORDING_STARTED_URL: http://controller:8000/internal/recording-started
       UPLOADER_FILE_EXTENSION: .webm
       MAX_RECORDING_DURATION_MINUTES: "180"
       MEETING_INACTIVITY_MINUTES: "1"
@@ -58,6 +59,8 @@ services:
       dockerfile: Dockerfile.chrome-cdp
     restart: unless-stopped
     shm_size: "1gb"
+    environment:
+      CHROME_WINDOW_SIZE: "1600,900"
     volumes:
       - ./chrome-profile:/tmp/chrome-profile
     expose:
