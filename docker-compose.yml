@@ -37,6 +37,7 @@ services:
       RECORDING_TMP_DIR: /recordings
       CONTROLLER_UPLOAD_URL: http://controller:8000/internal/recording-ready
       CONTROLLER_RECORDING_STARTED_URL: http://controller:8000/internal/recording-started
+      CONTROLLER_WAITING_FOR_ADMISSION_URL: http://controller:8000/internal/waiting-for-admission
       UPLOADER_FILE_EXTENSION: .webm
       MAX_RECORDING_DURATION_MINUTES: "180"
       MEETING_INACTIVITY_MINUTES: "1"
