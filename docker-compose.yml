@@ -1,3 +1,4 @@
+# BeOnMeet production concurrency: 8 simultaneous meeting slots
 services:
   controller:
     build: ./app
