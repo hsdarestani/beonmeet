@@ -89,7 +89,7 @@ jobs:
             CONTROLLER_UPLOAD_URL=http://controller:8000/internal/recording-ready
             RECORDING_TMP_DIR=/recordings
             CALENDAR_POLL_SECONDS=30
-            BROWSER_SETUP_HASH=${BROWSER_SETUP_HASH_ESCAPED}
+            BROWSER_SETUP_HASH='${BROWSER_SETUP_HASH}'
             EOF
             chmod 600 .env
 
