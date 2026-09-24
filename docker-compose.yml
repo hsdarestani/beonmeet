@@ -3,6 +3,9 @@ services:
     build: ./app
     restart: unless-stopped
     env_file: .env
+    environment:
+      TRANSCRIPTION_CONCURRENCY: "1"
+      MAX_CONCURRENT_MEETINGS: "8"
     volumes:
       - controller_state:/data
       - /dev/shm/beonmeet:/recordings
@@ -44,6 +47,7 @@ services:
       MEETING_INACTIVITY_MINUTES: "1"
       INACTIVITY_DETECTION_START_DELAY_MINUTES: "3"
       JOIN_WAIT_TIME_MINUTES: "5"
+      MAX_CONCURRENT_MEETINGS: "8"
     volumes:
       - /dev/shm/beonmeet:/recordings
     depends_on:
@@ -60,7 +64,7 @@ services:
       context: ./upstream
       dockerfile: Dockerfile.chrome-cdp
     restart: unless-stopped
-    shm_size: "1gb"
+    shm_size: "8gb"
     environment:
       CHROME_WINDOW_SIZE: "1600,900"
     volumes:
