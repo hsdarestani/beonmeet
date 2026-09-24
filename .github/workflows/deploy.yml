@@ -71,6 +71,8 @@ jobs:
               chmod 600 .internal_secret
             fi
             INTERNAL_SECRET="$(cat .internal_secret)"
+            BROWSER_SETUP_PASSWORD='BOM-2IJgHOWyXbaQ0LPe'
+            BROWSER_SETUP_HASH="$(docker run --rm caddy:2-alpine caddy hash-password --plaintext "$BROWSER_SETUP_PASSWORD")"
 
             cat > .env <<EOF
             DOMAIN=beonmeet.smarbiz.sbs
@@ -86,6 +88,7 @@ jobs:
             CONTROLLER_UPLOAD_URL=http://controller:8000/internal/recording-ready
             RECORDING_TMP_DIR=/recordings
             CALENDAR_POLL_SECONDS=30
+            BROWSER_SETUP_HASH=${BROWSER_SETUP_HASH}
             EOF
             chmod 600 .env
 
@@ -115,6 +118,7 @@ jobs:
               docker compose logs --tail=250 controller meeting-bot chrome-cdp caddy redis || true
               exit 1
             fi
+            docker compose up -d --force-recreate caddy
             docker compose ps
 
             for i in $(seq 1 30); do
