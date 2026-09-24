@@ -1,21 +1,4 @@
 {$DOMAIN} {
     encode zstd gzip
-
-    handle_path /browser/* {
-        basic_auth {
-            setup {$BROWSER_SETUP_HASH}
-        }
-        reverse_proxy chrome-cdp:6080
-    }
-
-    handle /websockify* {
-        basic_auth {
-            setup {$BROWSER_SETUP_HASH}
-        }
-        reverse_proxy chrome-cdp:6080
-    }
-
-    handle {
-        reverse_proxy controller:8000
-    }
+    reverse_proxy controller:8000
 }
