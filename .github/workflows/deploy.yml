@@ -52,6 +52,20 @@ jobs:
 
             cd /opt/beonmeet
 
+            echo "Server resources:"
+            free -h || true
+            df -h / || true
+
+            # The upstream TypeScript build can briefly exceed 1 GB. Add swap for small VPSes.
+            if ! swapon --show | grep -q '^/swapfile'; then
+              if [ ! -f /swapfile ]; then
+                fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
+                chmod 600 /swapfile
+                mkswap /swapfile
+              fi
+              swapon /swapfile || true
+            fi
+
             if [ ! -f .internal_secret ]; then
               openssl rand -hex 32 > .internal_secret
               chmod 600 .internal_secret
@@ -85,6 +99,11 @@ jobs:
             git reset --hard "${UPSTREAM_COMMIT}"
             cd ..
             cp patches/disk-uploader.ts upstream/src/middleware/disk-uploader.ts
+
+            # Build only Chromium and give TypeScript enough heap on small servers.
+            sed -i 's/npx playwright install --with-deps$/npx playwright install --with-deps chromium/' upstream/Dockerfile.production
+            sed -i 's/npx playwright install$/npx playwright install chromium/' upstream/Dockerfile.production
+            sed -i 's/RUN npm run build/RUN NODE_OPTIONS=--max-old-space-size=2048 npm run build/' upstream/Dockerfile.production
 
             mkdir -p /dev/shm/beonmeet
             chmod 777 /dev/shm/beonmeet
