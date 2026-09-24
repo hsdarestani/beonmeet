@@ -119,14 +119,21 @@ async def setup_telegram_profile() -> None:
         await telegram("setMyShortDescription", {
             "short_description": "ضبط خودکار Google Meet و ارسال مستقیم توی تلگرام"
         })
+        public_commands = [
+            {"command": "start", "description": "شروع و راهنما"},
+            {"command": "plans", "description": "پلن ویژه و قیمت ها"},
+            {"command": "now", "description": "ورود فوری به یک Meet در حال اجرا"},
+        ]
         await telegram("setMyCommands", {
-            "commands": json.dumps([
-                {"command": "start", "description": "شروع و راهنما"},
-                {"command": "plans", "description": "پلن ویژه و قیمت ها"},
-                {"command": "now", "description": "ورود فوری به یک Meet در حال اجرا"},
-                {"command": "admin", "description": "پنل مدیریت"},
-            ], ensure_ascii=False)
+            "commands": json.dumps(public_commands, ensure_ascii=False)
         })
+        if ADMINUSER:
+            await telegram("setMyCommands", {
+                "scope": json.dumps({"type": "chat", "chat_id": int(ADMINUSER)}),
+                "commands": json.dumps(public_commands + [
+                    {"command": "admin", "description": "پنل مدیریت"}
+                ], ensure_ascii=False)
+            })
     except Exception as exc:
         print("telegram profile setup error:", repr(exc), flush=True)
 
