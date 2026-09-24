@@ -61,6 +61,9 @@ PAYMENT_STATUS_URL = os.environ.get(
     "PAYMENT_STATUS_URL",
     "https://pay.hamooncloud.ir/payments/beonmeet/status",
 )
+TRANSCRIPTION_SEMAPHORE = asyncio.Semaphore(
+    max(1, int(os.environ.get("TRANSCRIPTION_CONCURRENCY", "1")))
+)
 
 MEET_RE = re.compile(r"(?:https?://)?(?:www\.)?meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}(?:\?[^\s]*)?", re.I)
 SCOPES = ["https://www.googleapis.com/auth/calendar.events.readonly"]
@@ -745,6 +748,8 @@ async def health() -> dict[str, Any]:
         "calendar_connected": TOKEN_FILE.exists(),
         "bot_email": BOT_EMAIL,
         "admin_recipient_configured": bool(ADMINUSER),
+        "max_concurrent_meetings": int(os.environ.get("MAX_CONCURRENT_MEETINGS", "8")),
+        "transcription_concurrency": int(os.environ.get("TRANSCRIPTION_CONCURRENCY", "1")),
     }
 
 
@@ -943,6 +948,7 @@ async def recording_ready(
                 try:
                     await tg_text(chat_id, "📝 دارم متن جلسه رو هم آماده می‌کنم. ممکنه یه کم طول بکشه…")
                     async with transcription_semaphore:
+                        async with TRANSCRIPTION_SEMAPHORE:
                         transcript, detected_language = await asyncio.to_thread(transcribe_audio_local, audio_path)
                     if transcript:
                         transcript_path = raw_path.with_name(f"{raw_path.stem}_transcript.txt")
