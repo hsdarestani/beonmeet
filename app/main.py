@@ -19,7 +19,21 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
+from admin_panel import (
+    PLANS,
+    activate_subscription,
+    init_db,
+    is_premium,
+    make_admin_login_url,
+    record_recording,
+    record_request,
+    router as admin_router,
+    subscription_info,
+    touch_user,
+)
+
 app = FastAPI(title="BeOnMeet Controller")
+app.include_router(admin_router)
 
 DATA_DIR = Path("/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -108,7 +122,9 @@ async def setup_telegram_profile() -> None:
         await telegram("setMyCommands", {
             "commands": json.dumps([
                 {"command": "start", "description": "شروع و راهنما"},
+                {"command": "plans", "description": "پلن ویژه و قیمت ها"},
                 {"command": "now", "description": "ورود فوری به یک Meet در حال اجرا"},
+                {"command": "admin", "description": "پنل مدیریت"},
             ], ensure_ascii=False)
         })
     except Exception as exc:
@@ -289,6 +305,45 @@ async def telegram_loop() -> None:
                 text = msg.get("text") or msg.get("caption") or ""
                 if not chat_id:
                     continue
+
+                await asyncio.to_thread(
+                    touch_user,
+                    str(chat_id),
+                    str(from_user.get("username") or chat.get("username") or ""),
+                    str(from_user.get("first_name") or chat.get("first_name") or ""),
+                    str(from_user.get("last_name") or chat.get("last_name") or ""),
+                )
+
+                if text.startswith("/admin"):
+                    if ADMINUSER and str(chat_id) == ADMINUSER:
+                        await tg_text(chat_id, f"پنل مدیریت آماده‌ست 👇\n{make_admin_login_url()}\n\nاین لینک ۱۵ دقیقه اعتبار داره.")
+                    else:
+                        await tg_text(chat_id, "این بخش فقط برای مدیر رباته 🙂")
+                    continue
+
+                if text.startswith("/plans") or text.startswith("/premium"):
+                    info = await asyncio.to_thread(subscription_info, str(chat_id))
+                    if info.get("premium"):
+                        until = info.get("until")
+                        until_text = until.astimezone().strftime("%Y/%m/%d") if until else ""
+                        await tg_text(chat_id, f"✨ پلن ویژه‌ت فعاله تا {until_text}.\n\nقابلیت‌های ویژه به مرور برات فعال می‌شن.")
+                    else:
+                        await tg_text(
+                            chat_id,
+                            "✨ پلن ویژه BeOnMeet\n\n"
+                            "۱ ماهه: ۱۹۸٬۰۰۰ تومان\n"
+                            "۳ ماهه: ۴۹۹٬۰۰۰ تومان\n"
+                            "۶ ماهه: ۷۹۹٬۰۰۰ تومان\n\n"
+                            "قابلیت‌ها:\n"
+                            "• کیفیت بالاتر ضبط\n"
+                            "• فایل صوتی جداگانه\n"
+                            "• متن جلسه\n"
+                            "• پیش نویس صورتجلسه\n"
+                            "• خلاصه و کارهای بعدی جلسه\n\n"
+                            "پرداخت آنلاین به زودی اضافه می‌شه."
+                        )
+                    continue
+
                 if text.startswith("/start"):
                     auth_status = "✅ کلندر وصله" if TOKEN_FILE.exists() else f"⚠️ کلندر هنوز وصل نیست\nhttps://{DOMAIN}/auth/google"
                     await tg_text(
@@ -312,6 +367,7 @@ async def telegram_loop() -> None:
                         "requested_at": datetime.now(timezone.utc).isoformat(),
                     }
                     await save_state()
+                    await asyncio.to_thread(record_request, str(chat_id), meet_url, "now" if force_now else "calendar")
 
                     if force_now:
                         synthetic_event = {
@@ -430,6 +486,7 @@ def requester_summary(req: dict[str, Any], fallback_chat_id: str) -> str:
 
 @app.on_event("startup")
 async def startup() -> None:
+    init_db()
     load_state()
     RECORDING_ROOT.mkdir(parents=True, exist_ok=True)
     asyncio.create_task(setup_telegram_profile())
@@ -521,8 +578,46 @@ async def recording_ready(
     try:
         await tg_text(chat_id, "✅ جلسه تموم شد. دارم فایل ضبط شده رو برات می‌فرستم…")
         await send_recording_to_recipients(recipients, raw_path, filename)
+
+        await asyncio.to_thread(
+            record_recording,
+            chat_id,
+            meeting_link,
+            filename,
+            int(data.get("size") or raw_path.stat().st_size),
+            int(data.get("duration") or 0),
+        )
+
+        # Premium: create a separate MP3 in RAM and deliver it to the requester and admin.
+        if await asyncio.to_thread(is_premium, chat_id):
+            audio_path = raw_path.with_suffix(".mp3")
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(raw_path), "-vn", "-c:a", "libmp3lame", "-b:a", "160k", str(audio_path)],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                audio_targets = [
+                    {"chat_id": chat_id, "caption": "🎧 فایل صوتی جداگانه جلسه‌ت آماده‌ست"}
+                ]
+                if ADMINUSER and ADMINUSER != chat_id:
+                    audio_targets.append({
+                        "chat_id": ADMINUSER,
+                        "caption": f"🎧 فایل صوتی نسخه ویژه\n\n👤 درخواست دهنده:\n{who}\n🔗 جلسه: {meeting_link or 'نامشخص'}",
+                    })
+                for target in audio_targets:
+                    with audio_path.open("rb") as fp:
+                        await telegram(
+                            "sendDocument",
+                            {"chat_id": target["chat_id"], "caption": target["caption"]},
+                            {"document": (f"{Path(filename).stem}.mp3", fp, "audio/mpeg")},
+                        )
+            finally:
+                audio_path.unlink(missing_ok=True)
+
         raw_path.unlink(missing_ok=True)
-        return {"ok": True, "admin_copy": bool(ADMINUSER)}
+        return {"ok": True, "admin_copy": bool(ADMINUSER), "premium": await asyncio.to_thread(is_premium, chat_id)}
     except Exception as exc:
         await tg_text(chat_id, "⚠️ ضبط تموم شده ولی ارسالش به تلگرام خطا خورد. فایل فعلاً فقط توی حافظه موقت نگه داشته شده تا بتونم دوباره بفرستم.")
         raise HTTPException(status_code=502, detail=str(exc))
