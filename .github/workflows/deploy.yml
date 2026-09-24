@@ -56,6 +56,8 @@ jobs:
             echo "Server resources:"
             free -h || true
             df -h / || true
+            df -h /dev/shm || true
+            nproc || true
 
             # The upstream TypeScript build can briefly exceed 1 GB. Add swap for small VPSes.
             if ! swapon --show | grep -q '^/swapfile'; then
@@ -103,6 +105,7 @@ jobs:
             cp patches/disk-uploader.ts upstream/src/middleware/disk-uploader.ts
             cp patches/Dockerfile.chrome-cdp upstream/Dockerfile.chrome-cdp
             cp patches/start-chrome-cdp.sh upstream/scripts/start-chrome-cdp.sh
+            cp patches/JobStore.ts upstream/src/lib/JobStore.ts
             chmod +x upstream/scripts/start-chrome-cdp.sh
             python3 patches/apply-upstream-fixes.py
 
