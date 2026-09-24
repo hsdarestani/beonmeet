@@ -66,6 +66,9 @@ MEET_RE = re.compile(r"(?:https?://)?(?:www\.)?meet\.google\.com/[a-z]{3}-[a-z]{
 SCOPES = ["https://www.googleapis.com/auth/calendar.events.readonly"]
 
 state_lock = asyncio.Lock()
+TRANSCRIPTION_CONCURRENCY = int(os.environ.get("TRANSCRIPTION_CONCURRENCY", "2"))
+transcription_semaphore = asyncio.Semaphore(max(1, TRANSCRIPTION_CONCURRENCY))
+_whisper_model = None
 state: dict[str, Any] = {
     "telegram_offset": 0,
     "requests": {},
@@ -614,16 +617,19 @@ async def send_recording_to_recipients(
 
 
 def transcribe_audio_local(audio_path: Path) -> tuple[str, str]:
+    global _whisper_model
     from faster_whisper import WhisperModel
 
-    model_name = os.environ.get("WHISPER_MODEL", "base")
-    model = WhisperModel(
-        model_name,
-        device="cpu",
-        compute_type="int8",
-        download_root=str(DATA_DIR / "whisper-models"),
-    )
-    segments, info = model.transcribe(
+    if _whisper_model is None:
+        model_name = os.environ.get("WHISPER_MODEL", "base")
+        _whisper_model = WhisperModel(
+            model_name,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=max(2, min(8, (os.cpu_count() or 4) // 2)),
+            download_root=str(DATA_DIR / "whisper-models"),
+        )
+    segments, info = _whisper_model.transcribe(
         str(audio_path),
         beam_size=3,
         vad_filter=True,
@@ -936,7 +942,8 @@ async def recording_ready(
                 # especially with weak audio or several people speaking at once.
                 try:
                     await tg_text(chat_id, "📝 دارم متن جلسه رو هم آماده می‌کنم. ممکنه یه کم طول بکشه…")
-                    transcript, detected_language = await asyncio.to_thread(transcribe_audio_local, audio_path)
+                    async with transcription_semaphore:
+                        transcript, detected_language = await asyncio.to_thread(transcribe_audio_local, audio_path)
                     if transcript:
                         transcript_path = raw_path.with_name(f"{raw_path.stem}_transcript.txt")
                         transcript_path.write_text(
