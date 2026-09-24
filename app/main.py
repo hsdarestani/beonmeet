@@ -305,7 +305,7 @@ async def send_recording(chat_id: str, path: Path, filename: str) -> None:
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", str(path),
-            "-vf", "scale='min(1280,iw)':-2",
+            "-vf", "scale=min(1280\\,iw):-2",
             "-c:v", "libx264", "-preset", "veryfast", "-b:v", "650k",
             "-c:a", "aac", "-b:a", "64k",
             "-f", "segment", "-segment_time", str(target_seconds),
