@@ -885,19 +885,28 @@ def transcribe_audio_local(audio_path: Path) -> tuple[str, str]:
     from faster_whisper import WhisperModel
 
     if _whisper_model is None:
-        model_name = os.environ.get("WHISPER_MODEL", "base")
+        # Medium is much more reliable for Persian and multilingual meetings than
+        # the previous base model. With 16 vCPU / 32 GB RAM and transcription
+        # concurrency=1 it is a safe quality/performance tradeoff.
+        model_name = os.environ.get("WHISPER_MODEL", "medium")
         _whisper_model = WhisperModel(
             model_name,
             device="cpu",
             compute_type="int8",
-            cpu_threads=max(2, min(8, (os.cpu_count() or 4) // 2)),
+            cpu_threads=max(4, min(12, (os.cpu_count() or 8) - 2)),
             download_root=str(DATA_DIR / "whisper-models"),
         )
+
     segments, info = _whisper_model.transcribe(
         str(audio_path),
-        beam_size=3,
+        beam_size=5,
+        best_of=5,
         vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 350},
         condition_on_previous_text=True,
+        multilingual=True,
+        language_detection_threshold=0.70,
+        language_detection_segments=5,
     )
 
     lines = []
@@ -910,7 +919,9 @@ def transcribe_audio_local(audio_path: Path) -> tuple[str, str]:
         lines.append(f"[{minutes:02d}:{seconds:02d}] {text_value}")
 
     language = getattr(info, "language", None) or "unknown"
-    return "\n".join(lines).strip(), str(language)
+    probability = float(getattr(info, "language_probability", 0.0) or 0.0)
+    language_label = f"{language} ({probability * 100:.0f}٪) · تشخیص چندزبانه فعاله"
+    return "\n".join(lines).strip(), language_label
 
 
 def requester_summary(req: dict[str, Any], fallback_chat_id: str) -> str:
@@ -1220,7 +1231,7 @@ async def recording_ready(
                         transcript_path.write_text(
                             "متن خودکار جلسه BeOnMeet\n"
                             "توجه: این متن به صورت خودکار ساخته شده و ممکنه خطا داشته باشه.\n"
-                            f"زبان تشخیص داده شده: {detected_language}\n\n"
+                            f"تشخیص زبان: {detected_language}\n\n"
                             + transcript,
                             encoding="utf-8",
                         )
