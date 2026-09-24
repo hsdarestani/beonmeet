@@ -734,20 +734,44 @@ async def recording_ready(
         recipients.append({"chat_id": ADMINUSER, "caption": admin_caption})
 
     try:
+        premium_active = await asyncio.to_thread(is_premium, chat_id)
+        delivery_path = raw_path
+        delivery_filename = filename
+        free_path: Path | None = None
+
+        # Everyone is captured from the higher-resolution Meet tab. Free users receive
+        # a standard 720p encode, while Premium users receive the higher-quality original.
+        if not premium_active:
+            free_path = raw_path.with_name(f"{raw_path.stem}_standard.mp4")
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(raw_path),
+                    "-vf", "scale='min(1280,iw)':-2",
+                    "-c:v", "libx264", "-preset", "veryfast", "-b:v", "1200k",
+                    "-c:a", "aac", "-b:a", "96k",
+                    str(free_path),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            delivery_path = free_path
+            delivery_filename = f"{Path(filename).stem}.mp4"
+
         await tg_text(chat_id, "✅ جلسه تموم شد. دارم فایل ضبط شده رو برات می‌فرستم…")
-        await send_recording_to_recipients(recipients, raw_path, filename)
+        await send_recording_to_recipients(recipients, delivery_path, delivery_filename)
 
         await asyncio.to_thread(
             record_recording,
             chat_id,
             meeting_link,
-            filename,
-            int(data.get("size") or raw_path.stat().st_size),
+            delivery_filename,
+            int(delivery_path.stat().st_size),
             int(data.get("duration") or 0),
         )
 
         # Premium: create a separate MP3 in RAM and deliver it to the requester and admin.
-        if await asyncio.to_thread(is_premium, chat_id):
+        if premium_active:
             audio_path = raw_path.with_suffix(".mp3")
             try:
                 subprocess.run(
@@ -774,8 +798,10 @@ async def recording_ready(
             finally:
                 audio_path.unlink(missing_ok=True)
 
+        if free_path:
+            free_path.unlink(missing_ok=True)
         raw_path.unlink(missing_ok=True)
-        return {"ok": True, "admin_copy": bool(ADMINUSER), "premium": await asyncio.to_thread(is_premium, chat_id)}
+        return {"ok": True, "admin_copy": bool(ADMINUSER), "premium": premium_active}
     except Exception as exc:
         await tg_text(chat_id, "⚠️ ضبط تموم شده ولی ارسالش به تلگرام خطا خورد. فایل فعلاً فقط توی حافظه موقت نگه داشته شده تا بتونم دوباره بفرستم.")
         raise HTTPException(status_code=502, detail=str(exc))
