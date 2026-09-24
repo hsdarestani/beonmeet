@@ -255,6 +255,7 @@ async def launch_meeting(event: dict[str, Any], req: dict[str, Any], meet_url: s
                 "meet_url": meet_url,
                 "chat_id": chat_id,
                 "launched_at": datetime.now(timezone.utc).isoformat(),
+                "status": "joining",
             }
             await save_state()
             await tg_text(chat_id, f"⏳ درخواست ورود به جلسه ارسال شد. دارم وارد می‌شم…\n{meet_url}")
@@ -281,8 +282,19 @@ async def calendar_loop() -> None:
                     if not req:
                         continue
                     event_id = event.get("id")
-                    if not event_id or event_id in state["launched_events"]:
+                    if not event_id:
                         continue
+                    launched = state["launched_events"].get(event_id)
+                    if launched:
+                        status = str(launched.get("status") or "joining")
+                        launched_at_raw = launched.get("launched_at")
+                        launched_at = isoparse(launched_at_raw) if launched_at_raw else None
+                        if status == "recording":
+                            continue
+                        if launched_at and now - launched_at < timedelta(minutes=7):
+                            continue
+                        state["launched_events"].pop(event_id, None)
+                        await save_state()
                     start = event_start(event)
                     end = event_end(event)
                     if not start:
@@ -553,6 +565,32 @@ async def auth_google_callback(request: Request, state: str) -> str:
     globals()["state"]["oauth_state"] = None
     await save_state()
     return "<h2>کلندر با موفقیت وصل شد ✅</h2><p>می‌تونی این صفحه رو ببندی و برگردی تلگرام.</p>"
+
+
+@app.post("/internal/recording-started")
+async def recording_started(
+    request: Request,
+    x_beonmeet_secret: str = Header(...),
+) -> dict[str, Any]:
+    if x_beonmeet_secret != INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    data = await request.json()
+    chat_id = str(data.get("userId") or "").strip()
+    event_id = str(data.get("eventId") or data.get("botId") or "").strip()
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="Missing userId")
+
+    already_notified = False
+    if event_id:
+        launched = state["launched_events"].setdefault(event_id, {})
+        already_notified = launched.get("status") == "recording"
+        launched["status"] = "recording"
+        launched["recording_started_at"] = datetime.now(timezone.utc).isoformat()
+        await save_state()
+
+    if not already_notified:
+        await tg_text(chat_id, "🎥 وارد جلسه شدم و ضبط شروع شد.")
+    return {"ok": True}
 
 
 @app.post("/internal/recording-ready")
