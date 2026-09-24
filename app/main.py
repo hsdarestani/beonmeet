@@ -53,6 +53,10 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ADMINUSER = os.environ.get("ADMINUSER", "").strip()
 TELEGRAM_API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 MEETING_BOT_URL = os.environ.get("MEETING_BOT_URL", "http://meeting-bot:3000").rstrip("/")
+FREE_MEETING_BOT_URL = os.environ.get("FREE_MEETING_BOT_URL", MEETING_BOT_URL).rstrip("/")
+PREMIUM_MEETING_BOT_URL = os.environ.get("PREMIUM_MEETING_BOT_URL", FREE_MEETING_BOT_URL).rstrip("/")
+FREE_MEETING_SLOTS = int(os.environ.get("FREE_MEETING_SLOTS", "5"))
+PREMIUM_MEETING_SLOTS = int(os.environ.get("PREMIUM_MEETING_SLOTS", "3"))
 INTERNAL_SECRET = os.environ["INTERNAL_SECRET"]
 RECORDING_ROOT = Path(os.environ.get("RECORDING_TMP_DIR", "/recordings")).resolve()
 BOT_DISPLAY_NAME = os.environ.get("BOT_DISPLAY_NAME", "BeOnMeet Recorder")
@@ -74,6 +78,7 @@ state: dict[str, Any] = {
     "telegram_offset": 0,
     "requests": {},
     "launched_events": {},
+    "join_queue": [],
     "oauth_state": None,
 }
 
@@ -85,6 +90,9 @@ def load_state() -> None:
             loaded = json.loads(STATE_FILE.read_text())
             if isinstance(loaded, dict):
                 state.update(loaded)
+                state.setdefault("join_queue", [])
+                state.setdefault("requests", {})
+                state.setdefault("launched_events", {})
         except Exception:
             pass
 
@@ -343,38 +351,251 @@ def fmt_event_time(event: dict[str, Any]) -> str:
     return f"{start.strftime('%Y-%m-%d %H:%M')}{tz_label}"
 
 
-async def launch_meeting(event: dict[str, Any], req: dict[str, Any], meet_url: str) -> bool:
+def _queue_event_id(event: dict[str, Any]) -> str:
+    return str(event.get("id") or "")
+
+
+def _is_queued(event_id: str) -> bool:
+    return any(str(item.get("event_id") or "") == str(event_id) for item in state.get("join_queue", []))
+
+
+def _queue_position(event_id: str, premium: bool) -> int:
+    queue = state.get("join_queue", [])
+    ordered = sorted(
+        queue,
+        key=lambda item: (
+            0 if bool(item.get("premium")) else 1,
+            str(item.get("queued_at") or ""),
+        ),
+    )
+    matching = [
+        item for item in ordered
+        if bool(item.get("premium")) == bool(premium)
+    ]
+    for idx, item in enumerate(matching, 1):
+        if str(item.get("event_id") or "") == str(event_id):
+            return idx
+    return len(matching) + 1
+
+
+async def enqueue_meeting(
+    event: dict[str, Any],
+    req: dict[str, Any],
+    meet_url: str,
+    premium: bool,
+    notify: bool = True,
+) -> None:
+    event_id = _queue_event_id(event) or f"queued-{uuid.uuid4()}"
+    if _is_queued(event_id):
+        return
+
+    state.setdefault("join_queue", []).append({
+        "event_id": event_id,
+        "event": event,
+        "req": req,
+        "meet_url": meet_url,
+        "premium": bool(premium),
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+    })
+    await save_state()
+
+    if not notify:
+        return
+
+    chat_id = str(req["chat_id"])
+    position = _queue_position(event_id, premium)
+    if premium:
+        await tg_text(
+            chat_id,
+            "⚡ ظرفیت اختصاصی پلن ویژه و ظرفیت اضافه فعلاً همزمان پر شدن. "
+            f"درخواستت با اولویت ویژه ثبت شد و نفر {position} صف ویژه‌ای. "
+            "به محض آزاد شدن اولین ورکر، مستقیم وارد می‌شم."
+        )
+    else:
+        await tg_text(
+            chat_id,
+            f"⏳ رکوردرهای رایگان الان پرن. درخواستت تو صف ثبت شد و نفر {position} صفی. "
+            "به محض آزاد شدن ظرفیت، خودکار وارد جلسه می‌شم."
+        )
+
+
+async def _dispatch_meeting(
+    event: dict[str, Any],
+    req: dict[str, Any],
+    meet_url: str,
+    premium: bool,
+) -> tuple[bool, bool, str]:
     event_id = event.get("id") or str(uuid.uuid4())
     chat_id = str(req["chat_id"])
     payload = {
         "bearerToken": "beonmeet-local",
         "url": meet_url,
         "name": BOT_DISPLAY_NAME,
-        "teamId": "beonmeet",
+        "teamId": "beonmeet-premium" if premium else "beonmeet-free",
         "timezone": "UTC",
         "userId": chat_id,
         "eventId": event_id,
         "botId": event_id,
     }
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(f"{MEETING_BOT_URL}/google/join", json=payload)
-        if r.status_code == 202:
-            state["launched_events"][event_id] = {
-                "meet_url": meet_url,
-                "chat_id": chat_id,
-                "launched_at": datetime.now(timezone.utc).isoformat(),
-                "status": "joining",
-            }
-            await save_state()
-            await tg_text(chat_id, f"⏳ درخواست ورود به جلسه ارسال شد. دارم وارد می‌شم…\n{meet_url}")
-            return True
-        if r.status_code == 409:
-            return False
-        await tg_text(chat_id, f"⚠️ فعلاً نتونستم وارد جلسه بشم. خودم دوباره امتحان می‌کنم.\n{meet_url}")
-    except Exception:
+
+    # Premium always gets the reserved worker pool first. If it is full, Premium
+    # is allowed to borrow unused capacity from the free pool. Free users can
+    # never consume the reserved Premium pool.
+    targets: list[tuple[str, str]] = []
+    if premium:
+        targets.append(("premium", PREMIUM_MEETING_BOT_URL))
+        if FREE_MEETING_BOT_URL != PREMIUM_MEETING_BOT_URL:
+            targets.append(("free-overflow", FREE_MEETING_BOT_URL))
+    else:
+        targets.append(("free", FREE_MEETING_BOT_URL))
+
+    saw_busy = False
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for pool_name, base_url in targets:
+            try:
+                response = await client.post(f"{base_url}/google/join", json=payload)
+            except Exception as exc:
+                print(f"meeting dispatch error ({pool_name}):", repr(exc), flush=True)
+                continue
+
+            if response.status_code == 202:
+                state["launched_events"][event_id] = {
+                    "meet_url": meet_url,
+                    "chat_id": chat_id,
+                    "launched_at": datetime.now(timezone.utc).isoformat(),
+                    "status": "joining",
+                    "premium": bool(premium),
+                    "pool": pool_name,
+                }
+                await save_state()
+                return True, False, pool_name
+
+            if response.status_code == 409:
+                saw_busy = True
+                continue
+
+            print(
+                "meeting dispatch rejected:",
+                pool_name,
+                response.status_code,
+                response.text[:500],
+                flush=True,
+            )
+
+    return False, saw_busy, ""
+
+
+async def launch_meeting(
+    event: dict[str, Any],
+    req: dict[str, Any],
+    meet_url: str,
+    *,
+    queue_if_busy: bool = True,
+    notify_start: bool = True,
+) -> bool:
+    chat_id = str(req["chat_id"])
+    premium = await asyncio.to_thread(is_premium, chat_id)
+
+    launched, busy, pool_name = await _dispatch_meeting(
+        event, req, meet_url, premium
+    )
+    if launched:
+        if notify_start:
+            if premium and pool_name == "premium":
+                await tg_text(
+                    chat_id,
+                    f"⚡ ورکر اختصاصی پلن ویژه رزرو شد. دارم وارد جلسه می‌شم…\n{meet_url}"
+                )
+            elif premium:
+                await tg_text(
+                    chat_id,
+                    f"⚡ با اولویت ویژه از ظرفیت آزاد وارد صف اجرا شدم. دارم وارد جلسه می‌شم…\n{meet_url}"
+                )
+            else:
+                await tg_text(
+                    chat_id,
+                    f"⏳ درخواست ورود به جلسه ارسال شد. دارم وارد می‌شم…\n{meet_url}"
+                )
+        return True
+
+    if busy and queue_if_busy:
+        await enqueue_meeting(event, req, meet_url, premium, notify=True)
         return False
+
+    if not busy and notify_start:
+        await tg_text(
+            chat_id,
+            f"⚠️ فعلاً نتونستم درخواست ورود رو به رکوردر برسونم. خودم دوباره امتحان می‌کنم.\n{meet_url}"
+        )
     return False
+
+
+async def queue_loop() -> None:
+    while True:
+        try:
+            queue = state.setdefault("join_queue", [])
+            if queue:
+                ordered = sorted(
+                    list(queue),
+                    key=lambda item: (
+                        0 if bool(item.get("premium")) else 1,
+                        str(item.get("queued_at") or ""),
+                    ),
+                )
+                for item in ordered:
+                    event_id = str(item.get("event_id") or "")
+                    event = item.get("event") or {}
+                    req = item.get("req") or {}
+                    meet_url = str(item.get("meet_url") or "")
+                    premium = bool(item.get("premium"))
+                    chat_id = str(req.get("chat_id") or "")
+
+                    if not event_id or not chat_id or not meet_url:
+                        state["join_queue"] = [
+                            q for q in state.get("join_queue", [])
+                            if str(q.get("event_id") or "") != event_id
+                        ]
+                        await save_state()
+                        continue
+
+                    end = event_end(event)
+                    if end and datetime.now(timezone.utc) > end.astimezone(timezone.utc) + timedelta(minutes=5):
+                        state["join_queue"] = [
+                            q for q in state.get("join_queue", [])
+                            if str(q.get("event_id") or "") != event_id
+                        ]
+                        await save_state()
+                        await tg_text(
+                            chat_id,
+                            "⌛ نوبت رکوردر قبل از پایان جلسه آزاد نشد و این درخواست از صف خارج شد."
+                        )
+                        continue
+
+                    launched, busy, pool_name = await _dispatch_meeting(
+                        event, req, meet_url, premium
+                    )
+                    if launched:
+                        state["join_queue"] = [
+                            q for q in state.get("join_queue", [])
+                            if str(q.get("event_id") or "") != event_id
+                        ]
+                        await save_state()
+                        if premium:
+                            await tg_text(
+                                chat_id,
+                                f"⚡ ظرفیت ویژه آزاد شد و الان دارم وارد جلسه می‌شم…\n{meet_url}"
+                            )
+                        else:
+                            await tg_text(
+                                chat_id,
+                                f"✅ نوبتت از صف رسید. الان دارم وارد جلسه می‌شم…\n{meet_url}"
+                            )
+                    elif not busy:
+                        # Transient dispatch/network error. Keep the queue item and retry.
+                        continue
+        except Exception as exc:
+            print("queue loop error:", repr(exc), flush=True)
+        await asyncio.sleep(3)
 
 
 async def calendar_loop() -> None:
@@ -392,6 +613,8 @@ async def calendar_loop() -> None:
                         continue
                     event_id = event.get("id")
                     if not event_id:
+                        continue
+                    if _is_queued(str(event_id)):
                         continue
                     launched = state["launched_events"].get(event_id)
                     if launched:
@@ -480,7 +703,8 @@ async def telegram_loop() -> None:
                             "• کیفیت بالاتر ضبط\n"
                             "• فایل صوتی جداگانه\n"
                             "• متن جلسه\n"
-                            "• پیش نویس صورتجلسه",
+                            "• پیش نویس صورتجلسه\n"
+                            "• ظرفیت اختصاصی و اولویت ورود؛ پشت صف کاربران رایگان نمی‌مونی",
                             with_menu=True,
                         )
                     else:
@@ -515,7 +739,8 @@ async def telegram_loop() -> None:
                                     "• کیفیت بالاتر ضبط\n"
                                     "• فایل صوتی جداگانه\n"
                                     "• متن جلسه\n"
-                                    "• پیش نویس صورتجلسه\n\n"
+                                    "• پیش نویس صورتجلسه\n"
+                                    "• ظرفیت اختصاصی و اولویت ورود؛ پشت صف کاربران رایگان نمی‌مونی\n\n"
                                     "یکی از پلن‌ها رو انتخاب کن:"
                                 ),
                                 "reply_markup": json.dumps(keyboard, ensure_ascii=False),
@@ -563,9 +788,7 @@ async def telegram_loop() -> None:
                             "start": {"dateTime": datetime.now(timezone.utc).isoformat()},
                             "end": {"dateTime": (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()},
                         }
-                        launched = await launch_meeting(synthetic_event, state["requests"][meet_url], meet_url)
-                        if not launched:
-                            await tg_text(chat_id, "⏳ درخواست ورود ثبت شد. اگه رکوردر مشغول باشه، به محض آزاد شدن دوباره امتحان می‌کنم.")
+                        await launch_meeting(synthetic_event, state["requests"][meet_url], meet_url)
                         continue
 
                     try:
@@ -713,6 +936,7 @@ async def startup() -> None:
     asyncio.create_task(setup_telegram_profile())
     asyncio.create_task(telegram_loop())
     asyncio.create_task(calendar_loop())
+    asyncio.create_task(queue_loop())
 
 
 @app.get("/api/billing/payment-intent")
@@ -786,7 +1010,11 @@ async def health() -> dict[str, Any]:
         "calendar_connected": TOKEN_FILE.exists(),
         "bot_email": BOT_EMAIL,
         "admin_recipient_configured": bool(ADMINUSER),
-        "max_concurrent_meetings": int(os.environ.get("MAX_CONCURRENT_MEETINGS", "8")),
+        "max_concurrent_meetings": FREE_MEETING_SLOTS + PREMIUM_MEETING_SLOTS,
+        "free_meeting_slots": FREE_MEETING_SLOTS,
+        "premium_reserved_slots": PREMIUM_MEETING_SLOTS,
+        "free_queue": sum(1 for item in state.get("join_queue", []) if not bool(item.get("premium"))),
+        "premium_queue": sum(1 for item in state.get("join_queue", []) if bool(item.get("premium"))),
         "transcription_concurrency": int(os.environ.get("TRANSCRIPTION_CONCURRENCY", "1")),
     }
 
