@@ -152,11 +152,11 @@ if old_count not in source:
     raise SystemExit("PARTICIPANT_COUNT_PATCH_MARKER_NOT_FOUND")
 source = source.replace(old_count, new_count, 1)
 
-old_alt = """                        if (label && /People.*?\d+/.test(label)) {
+old_alt = r"""                        if (label && /People.*?\d+/.test(label)) {
                           return true;
                         }
 """
-new_alt = """                        if (label && /People.*?\d+/.test(label)) {
+new_alt = r"""                        if (label && /People.*?\d+/.test(label)) {
                           const match = label.match(/People.*?(\d+)/);
                           if (match && parseInt(match[1]) >= 2) {
                             return true;
@@ -167,7 +167,7 @@ if old_alt not in source:
     raise SystemExit("ALT_PARTICIPANT_COUNT_PATCH_MARKER_NOT_FOUND")
 source = source.replace(old_alt, new_alt, 1)
 
-old_fallback = """                      // Fallback: Check for Leave call button which indicates we're in a call
+old_fallback = r"""                      // Fallback: Check for Leave call button which indicates we're in a call
                       const leaveCallButton = document.querySelector('button[aria-label="Leave call"], button[aria-label="Anruf verlassen"]');
                       if (leaveCallButton) {
                         // If we have Leave call button AND no lobby mode text, we're likely in the call
