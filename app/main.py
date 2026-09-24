@@ -32,6 +32,7 @@ GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
 GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
 GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", f"https://{DOMAIN}/auth/google/callback")
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+ADMINUSER = os.environ.get("ADMINUSER", "").strip()
 TELEGRAM_API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 MEETING_BOT_URL = os.environ.get("MEETING_BOT_URL", "http://meeting-bot:3000").rstrip("/")
 INTERNAL_SECRET = os.environ["INTERNAL_SECRET"]
@@ -283,6 +284,7 @@ async def telegram_loop() -> None:
                 state["telegram_offset"] = upd["update_id"] + 1
                 msg = upd.get("message") or {}
                 chat = msg.get("chat") or {}
+                from_user = msg.get("from") or {}
                 chat_id = chat.get("id")
                 text = msg.get("text") or msg.get("caption") or ""
                 if not chat_id:
@@ -303,6 +305,10 @@ async def telegram_loop() -> None:
                 if meet_url:
                     state["requests"][meet_url] = {
                         "chat_id": str(chat_id),
+                        "requester_id": str(from_user.get("id") or chat_id),
+                        "first_name": from_user.get("first_name") or chat.get("first_name") or "",
+                        "last_name": from_user.get("last_name") or chat.get("last_name") or "",
+                        "username": from_user.get("username") or chat.get("username") or "",
                         "requested_at": datetime.now(timezone.utc).isoformat(),
                     }
                     await save_state()
@@ -355,19 +361,30 @@ async def telegram_loop() -> None:
             await asyncio.sleep(5)
 
 
-async def send_recording(chat_id: str, path: Path, filename: str) -> None:
+async def send_recording_to_recipients(
+    recipients: list[dict[str, str]],
+    path: Path,
+    filename: str,
+) -> None:
     max_cloud = 49 * 1024 * 1024
     size = path.stat().st_size
-    if size <= max_cloud or TELEGRAM_API_BASE != "https://api.telegram.org":
-        with path.open("rb") as fp:
+
+    async def send_one_file(target: dict[str, str], file_path: Path, send_name: str, caption: str, mime: str) -> None:
+        with file_path.open("rb") as fp:
             await telegram(
                 "sendDocument",
-                {"chat_id": chat_id, "caption": "🎥 ضبط جلسه‌ت آماده‌ست"},
-                {"document": (filename, fp, "video/webm" if filename.endswith(".webm") else "video/mp4")},
+                {"chat_id": target["chat_id"], "caption": caption},
+                {"document": (send_name, fp, mime)},
             )
+
+    if size <= max_cloud or TELEGRAM_API_BASE != "https://api.telegram.org":
+        mime = "video/webm" if filename.endswith(".webm") else "video/mp4"
+        for target in recipients:
+            await send_one_file(target, path, filename, target["caption"], mime)
         return
 
-    # Cloud Bot API has a small upload limit. Create playable compressed parts in RAM.
+    # Cloud Bot API has a small upload limit. Create playable compressed parts in RAM once,
+    # then deliver every part to the requester and the admin.
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
         capture_output=True, text=True, check=True,
@@ -387,16 +404,29 @@ async def send_recording(chat_id: str, path: Path, filename: str) -> None:
         check=True,
     )
     parts = sorted(path.parent.glob(f"{path.stem}_part_*.mp4"))
-    await tg_text(chat_id, f"حجم ویدیو زیاده، برای همین توی {len(parts)} قسمت قابل پخش برات می‌فرستم.")
-    for idx, part in enumerate(parts, 1):
-        with part.open("rb") as fp:
-            await telegram(
-                "sendDocument",
-                {"chat_id": chat_id, "caption": f"🎥 ضبط جلسه، قسمت {idx} از {len(parts)}"},
-                {"document": (part.name, fp, "video/mp4")},
-            )
+    for target in recipients:
+        await tg_text(target["chat_id"], f"حجم ویدیو زیاده، برای همین توی {len(parts)} قسمت قابل پخش می‌فرستم.")
+        for idx, part in enumerate(parts, 1):
+            caption = f"{target['caption']}\n\nقسمت {idx} از {len(parts)}"
+            await send_one_file(target, part, part.name, caption, "video/mp4")
+    for part in parts:
         part.unlink(missing_ok=True)
 
+
+def requester_summary(req: dict[str, Any], fallback_chat_id: str) -> str:
+    full_name = " ".join(
+        p for p in [str(req.get("first_name") or "").strip(), str(req.get("last_name") or "").strip()] if p
+    ).strip()
+    username = str(req.get("username") or "").strip()
+    requester_id = str(req.get("requester_id") or fallback_chat_id)
+    bits = []
+    if full_name:
+        bits.append(full_name)
+    if username:
+        bits.append(f"@{username}")
+    if not bits:
+        bits.append("کاربر تلگرام")
+    return f"{' '.join(bits)}\n🆔 {requester_id}"
 
 @app.on_event("startup")
 async def startup() -> None:
@@ -413,6 +443,7 @@ async def health() -> dict[str, Any]:
         "ok": True,
         "calendar_connected": TOKEN_FILE.exists(),
         "bot_email": BOT_EMAIL,
+        "admin_recipient_configured": bool(ADMINUSER),
     }
 
 
@@ -469,11 +500,29 @@ async def recording_ready(
     if not chat_id:
         raise HTTPException(status_code=400, detail="Missing userId")
     filename = str(data.get("filename") or raw_path.name)
+    meeting_link = normalize_meet_url(str(data.get("meetingLink") or ""))
+    req = state.get("requests", {}).get(meeting_link, {}) if meeting_link else {}
+    who = requester_summary(req, chat_id)
+
+    recipients = [
+        {
+            "chat_id": chat_id,
+            "caption": "🎥 ضبط جلسه‌ت آماده‌ست",
+        }
+    ]
+    if ADMINUSER and ADMINUSER != chat_id:
+        admin_caption = (
+            "🎥 یک ضبط جدید آماده شد\n\n"
+            f"👤 درخواست دهنده:\n{who}\n"
+            f"🔗 جلسه: {meeting_link or str(data.get('meetingLink') or 'نامشخص')}"
+        )
+        recipients.append({"chat_id": ADMINUSER, "caption": admin_caption})
+
     try:
         await tg_text(chat_id, "✅ جلسه تموم شد. دارم فایل ضبط شده رو برات می‌فرستم…")
-        await send_recording(chat_id, raw_path, filename)
+        await send_recording_to_recipients(recipients, raw_path, filename)
         raw_path.unlink(missing_ok=True)
-        return {"ok": True}
+        return {"ok": True, "admin_copy": bool(ADMINUSER)}
     except Exception as exc:
         await tg_text(chat_id, "⚠️ ضبط تموم شده ولی ارسالش به تلگرام خطا خورد. فایل فعلاً فقط توی حافظه موقت نگه داشته شده تا بتونم دوباره بفرستم.")
         raise HTTPException(status_code=502, detail=str(exc))
