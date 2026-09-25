@@ -761,6 +761,7 @@ async def system_page(request: Request):
     remote_premium_slots = int(health.get("remote_premium_slots") or 0)
     db_backend = _esc(health.get("database_backend") or "نامشخص")
     redis_ok = bool(health.get("redis_state"))
+    autoscaler_ok = bool(health.get("autoscaler_enabled"))
 
     body = f"""
     <div class="top">
@@ -788,6 +789,7 @@ async def system_page(request: Request):
         <div class="feature"><span class="dot"></span><div><b>Free Pool</b><div class="muted">{free_workers} ورکر مستقل با {free_slots} اسلات</div></div></div>
         <div class="feature"><span class="dot"></span><div><b>Premium Pool</b><div class="muted">{premium_workers} ورکر محلی با {premium_slots} اسلات رزرو</div></div></div>
         <div class="feature"><span class="dot"></span><div><b>Remote Workers</b><div class="muted">{remote_workers} آنلاین · {remote_free_slots} عمومی · {remote_premium_slots} ویژه</div></div></div>
+        <div class="feature"><span class="dot {'planned' if not autoscaler_ok else ''}"></span><div><b>Hetzner Autoscaler</b><div class="muted">{'فعاله و بر اساس صف ورکر می‌سازه' if autoscaler_ok else 'غیرفعاله'}</div></div></div>
         <div class="feature"><span class="dot"></span><div><b>Transcription</b><div class="muted">{health.get('transcription_concurrency', 1)} پردازش همزمان برای محافظت از ضبط‌ها</div></div></div>
       </div>
     </div>
