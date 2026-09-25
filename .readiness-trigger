@@ -6,3 +6,5 @@ production readiness workflow after the production deploy completes.
 Retry after Chrome profile detection fix: 2026-09-25T18:41+03:30
 
 Retry after persistent profile recovery fix: 2026-09-25T18:42+03:30
+
+Retry to diagnose Hetzner 422: 2026-09-25T18:44+03:30
