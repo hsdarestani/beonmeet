@@ -18,9 +18,23 @@ services:
       FREE_MEETING_SLOTS: "8"
       PREMIUM_MEETING_SLOTS: "4"
       DATABASE_URL: postgresql://beonmeet:${POSTGRES_PASSWORD}@postgres:5432/beonmeet
+      AUTOSCALE_ENABLED: "true"
+      CONTROLLER_PUBLIC_URL: https://beonmeet.smarbiz.sbs
+      AUTOSCALE_SERVER_TYPE: cpx31
+      AUTOSCALE_SERVER_IMAGE: ubuntu-24.04
+      AUTOSCALE_SERVER_LOCATION: nbg1
+      AUTOSCALE_WORKER_SLOTS: "3"
+      AUTOSCALE_MAX_FREE_WORKERS: "6"
+      AUTOSCALE_MAX_PREMIUM_WORKERS: "3"
+      AUTOSCALE_MIN_FREE_WORKERS: "0"
+      AUTOSCALE_MIN_PREMIUM_WORKERS: "0"
+      AUTOSCALE_IDLE_MINUTES: "20"
+      AUTOSCALE_SCALE_UP_COOLDOWN_SECONDS: "60"
+      AUTOSCALE_BOOT_TIMEOUT_MINUTES: "15"
     volumes:
       - controller_state:/data
       - /dev/shm/beonmeet:/recordings
+      - ./chrome-profile:/bootstrap/chrome-profile:ro
     expose:
       - "8000"
     depends_on:
