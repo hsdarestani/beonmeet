@@ -33,12 +33,13 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           ADMINUSER: ${{ secrets.ADMINUSER }}
+          HETZNER_API_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
         with:
           host: ${{ secrets.HOST }}
           username: root
           password: ${{ secrets.PASS }}
           command_timeout: 30m
-          envs: GOOGLE_CLIENT_ID,GOOGLE_CLIENT_SECRET,TELEGRAM_BOT_TOKEN,ADMINUSER
+          envs: GOOGLE_CLIENT_ID,GOOGLE_CLIENT_SECRET,TELEGRAM_BOT_TOKEN,ADMINUSER,HETZNER_API_TOKEN
           script: |
             set -euo pipefail
 
@@ -93,6 +94,7 @@ jobs:
             TELEGRAM_API_BASE=https://api.telegram.org
             INTERNAL_SECRET=${INTERNAL_SECRET}
             POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+            HETZNER_API_TOKEN=${HETZNER_API_TOKEN}
             MEETING_BOT_URL=http://meeting-bot-free1:3000
             CONTROLLER_UPLOAD_URL=http://controller:8000/internal/recording-ready
             CONTROLLER_STREAM_UPLOAD_URL=http://controller:8000/internal/recording-upload
@@ -100,6 +102,12 @@ jobs:
             CALENDAR_POLL_SECONDS=30
             EOF
             chmod 600 .env
+
+            if [ -n "${HETZNER_API_TOKEN:-}" ]; then
+              echo "Checking Hetzner API token..."
+              curl -fsS                 -H "Authorization: Bearer ${HETZNER_API_TOKEN}"                 "https://api.hetzner.cloud/v1/servers?per_page=1"                 >/dev/null
+              echo "Hetzner API token verified"
+            fi
 
             UPSTREAM_COMMIT=1447ed3a38ce052a694872141a9b7085189e8513
             if [ ! -d upstream/.git ]; then
