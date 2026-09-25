@@ -1,0 +1,92 @@
+name: Deploy Recorder Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_id:
+        description: Unique worker ID, for example worker-eu-01
+        required: true
+        type: string
+      pool:
+        description: Recorder pool
+        required: true
+        default: free
+        type: choice
+        options:
+          - free
+          - premium
+      slots:
+        description: Simultaneous meetings on this worker
+        required: true
+        default: "4"
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SSH helper
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Prepare source bundle
+        run: |
+          tar -czf /tmp/beonmeet-worker-src.tgz worker patches
+
+      - name: Copy signed-in profile and worker secret from controller
+        env:
+          CONTROLLER_HOST: ${{ secrets.HOST }}
+          CONTROLLER_PASS: ${{ secrets.PASS }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$CONTROLLER_PASS"
+          sshpass -e ssh -o StrictHostKeyChecking=no root@"$CONTROLLER_HOST"             'cd /opt/beonmeet && tar -czf - chrome-profile .internal_secret'             > /tmp/beonmeet-controller-bootstrap.tgz
+          chmod 600 /tmp/beonmeet-controller-bootstrap.tgz
+
+      - name: Upload worker
+        env:
+          WORKER_HOST: ${{ secrets.WORKER_HOST }}
+          WORKER_PASS: ${{ secrets.WORKER_PASS }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$WORKER_PASS"
+          sshpass -e ssh -o StrictHostKeyChecking=no root@"$WORKER_HOST"             'mkdir -p /opt/beonmeet-worker'
+          sshpass -e scp -o StrictHostKeyChecking=no             /tmp/beonmeet-worker-src.tgz             /tmp/beonmeet-controller-bootstrap.tgz             root@"$WORKER_HOST":/tmp/
+
+      - name: Start worker
+        env:
+          WORKER_HOST: ${{ secrets.WORKER_HOST }}
+          WORKER_PASS: ${{ secrets.WORKER_PASS }}
+          WORKER_ID: ${{ inputs.worker_id }}
+          WORKER_POOL: ${{ inputs.pool }}
+          WORKER_SLOTS: ${{ inputs.slots }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$WORKER_PASS"
+          sshpass -e ssh -o StrictHostKeyChecking=no root@"$WORKER_HOST"             "WORKER_ID='$WORKER_ID' WORKER_POOL='$WORKER_POOL' WORKER_SLOTS='$WORKER_SLOTS' bash -s" <<'REMOTE'
+          set -euo pipefail
+          rm -rf /opt/beonmeet-worker/worker /opt/beonmeet-worker/patches
+          tar -xzf /tmp/beonmeet-worker-src.tgz -C /opt/beonmeet-worker
+          tar -xzf /tmp/beonmeet-controller-bootstrap.tgz -C /opt/beonmeet-worker
+          cd /opt/beonmeet-worker
+          INTERNAL_SECRET="$(cat .internal_secret)"
+          cat > worker.env <<EOF
+          CONTROLLER_BASE_URL=https://beonmeet.smarbiz.sbs
+          INTERNAL_SECRET=${INTERNAL_SECRET}
+          WORKER_ID=${WORKER_ID}
+          WORKER_POOL=${WORKER_POOL}
+          WORKER_SLOTS=${WORKER_SLOTS}
+          EOF
+          chmod 600 worker.env .internal_secret
+          chmod +x worker/bootstrap.sh
+          ./worker/bootstrap.sh /opt/beonmeet-worker
+          rm -f /tmp/beonmeet-worker-src.tgz /tmp/beonmeet-controller-bootstrap.tgz
+          REMOTE
+
+      - name: Remove temporary sensitive files
+        if: always()
+        run: |
+          rm -f /tmp/beonmeet-controller-bootstrap.tgz /tmp/beonmeet-worker-src.tgz
