@@ -39,34 +39,41 @@ def test_1000_user_priority() -> None:
     assert free_times == sorted(free_times)
 
 
-def test_30_concurrent_burst() -> None:
-    # 30 simultaneous meeting requests: 6 Premium and 24 Free.
-    # Local production baseline currently has 4 Premium + 8 Free slots.
-    premium_waiting = max(0, 6 - 4)
-    free_waiting = max(0, 24 - 8)
+def _assert_burst(total: int, premium: int, expected_premium_waiting: int, expected_free_waiting: int) -> None:
+    free = total - premium
+    premium_waiting = max(0, premium - 4)
+    free_waiting = max(0, free - 8)
 
-    assert premium_waiting == 2
-    assert free_waiting == 16
+    assert premium_waiting == expected_premium_waiting
+    assert free_waiting == expected_free_waiting
 
-    # Remote worker size is 3. A scale cycle is intentionally capped at two
-    # workers to avoid runaway Hetzner creation on one bad metric sample.
-    assert bounded_scale_up(
+    premium_scale = bounded_scale_up(
         queue_size=premium_waiting,
         available_slots=0,
         worker_slots=3,
         current_workers=0,
         max_workers=3,
         per_cycle_limit=2,
-    ) == 1
-
-    assert bounded_scale_up(
+    )
+    free_scale = bounded_scale_up(
         queue_size=free_waiting,
         available_slots=0,
         worker_slots=3,
         current_workers=0,
         max_workers=6,
         per_cycle_limit=2,
-    ) == 2
+    )
+
+    assert premium_scale == min(2, (premium_waiting + 2) // 3)
+    assert free_scale == min(2, (free_waiting + 2) // 3)
+
+
+def test_peak_bursts() -> None:
+    # Explicit readiness checkpoints requested for 12, 20 and 30 simultaneous meetings.
+    # Local baseline is 4 Premium-reserved + 8 Free/general slots.
+    _assert_burst(total=12, premium=4, expected_premium_waiting=0, expected_free_waiting=0)
+    _assert_burst(total=20, premium=4, expected_premium_waiting=0, expected_free_waiting=8)
+    _assert_burst(total=30, premium=6, expected_premium_waiting=2, expected_free_waiting=16)
 
 
 def test_capacity_math() -> None:
@@ -85,11 +92,11 @@ def test_capacity_math() -> None:
 
 def main() -> None:
     test_1000_user_priority()
-    test_30_concurrent_burst()
+    test_peak_bursts()
     test_capacity_math()
     print("READINESS_LOAD_TEST_PASS")
     print("simulated_users=1000")
-    print("simulated_peak_meetings=30")
+    print("simulated_peak_meetings=12,20,30")
     print("premium_priority=pass")
     print("autoscale_policy=pass")
 
