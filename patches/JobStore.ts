@@ -110,6 +110,14 @@ export class JobStore {
     return this.runningJobs >= this.maxConcurrentJobs;
   }
 
+  getStats(): { runningJobs: number; maxConcurrentJobs: number; availableSlots: number } {
+    return {
+      runningJobs: this.runningJobs,
+      maxConcurrentJobs: this.maxConcurrentJobs,
+      availableSlots: Math.max(0, this.maxConcurrentJobs - this.runningJobs),
+    };
+  }
+
   isShutdownRequested(): boolean {
     return this.shutdownRequested;
   }
