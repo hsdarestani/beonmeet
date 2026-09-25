@@ -12,6 +12,8 @@ from urllib.parse import parse_qs
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from db_compat import connect_db, is_postgres
+
 router = APIRouter()
 DB_PATH = Path(os.environ.get("BEONMEET_DB_PATH", "/data/beonmeet.db"))
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
@@ -33,14 +35,178 @@ PREMIUM_FEATURES = [
 ]
 
 
-def _db() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _db():
+    return connect_db(DB_PATH)
+
+
+def _migrate_sqlite_to_postgres_once() -> None:
+    if not is_postgres() or not DB_PATH.exists():
+        return
+
+    with _db() as db:
+        marker = db.execute(
+            "SELECT value FROM system_meta WHERE key=?",
+            ("sqlite_migrated",),
+        ).fetchone()
+        if marker:
+            return
+
+    try:
+        legacy = sqlite3.connect(DB_PATH, timeout=5)
+        legacy.row_factory = sqlite3.Row
+    except Exception as exc:
+        print("legacy sqlite migration skipped:", repr(exc), flush=True)
+        return
+
+    try:
+        with _db() as db:
+            for row in legacy.execute("SELECT * FROM users"):
+                db.execute(
+                    """
+                    INSERT INTO users
+                        (telegram_id, username, first_name, last_name, first_seen, last_seen,
+                         total_requests, total_recordings, premium_until, premium_plan)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(telegram_id) DO UPDATE SET
+                        username=excluded.username,
+                        first_name=excluded.first_name,
+                        last_name=excluded.last_name,
+                        first_seen=excluded.first_seen,
+                        last_seen=excluded.last_seen,
+                        total_requests=excluded.total_requests,
+                        total_recordings=excluded.total_recordings,
+                        premium_until=excluded.premium_until,
+                        premium_plan=excluded.premium_plan
+                    """,
+                    tuple(row[k] for k in (
+                        "telegram_id", "username", "first_name", "last_name",
+                        "first_seen", "last_seen", "total_requests", "total_recordings",
+                        "premium_until", "premium_plan",
+                    )),
+                )
+
+            migrations = [
+                (
+                    "meeting_requests",
+                    ("telegram_id", "meet_url", "mode", "created_at"),
+                ),
+                (
+                    "recordings",
+                    ("telegram_id", "meet_url", "filename", "size_bytes", "duration_seconds", "created_at"),
+                ),
+                (
+                    "subscriptions",
+                    ("telegram_id", "plan_code", "price_toman", "starts_at", "ends_at", "status", "note", "created_at"),
+                ),
+            ]
+            for table, columns in migrations:
+                count = db.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
+                if int(count or 0) > 0:
+                    continue
+                placeholders = ",".join(["?"] * len(columns))
+                column_sql = ",".join(columns)
+                for row in legacy.execute(f"SELECT {column_sql} FROM {table}"):
+                    db.execute(
+                        f"INSERT INTO {table} ({column_sql}) VALUES ({placeholders})",
+                        tuple(row[k] for k in columns),
+                    )
+
+            for row in legacy.execute("SELECT * FROM payment_intents"):
+                db.execute(
+                    """
+                    INSERT INTO payment_intents
+                        (intent, telegram_id, plan_code, amount_toman, status, receipt, created_at, expires_at, paid_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(intent) DO NOTHING
+                    """,
+                    tuple(row[k] for k in (
+                        "intent", "telegram_id", "plan_code", "amount_toman",
+                        "status", "receipt", "created_at", "expires_at", "paid_at",
+                    )),
+                )
+
+            db.execute(
+                """
+                INSERT INTO system_meta (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                ("sqlite_migrated", utcnow().isoformat()),
+            )
+        print("legacy SQLite data migrated to PostgreSQL", flush=True)
+    except Exception as exc:
+        print("legacy SQLite migration failed:", repr(exc), flush=True)
+    finally:
+        legacy.close()
 
 
 def init_db() -> None:
+    if is_postgres():
+        schema = """
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id TEXT PRIMARY KEY,
+            username TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
+            last_name TEXT DEFAULT '',
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            total_requests BIGINT NOT NULL DEFAULT 0,
+            total_recordings BIGINT NOT NULL DEFAULT 0,
+            premium_until TEXT,
+            premium_plan TEXT
+        );
+        CREATE TABLE IF NOT EXISTS meeting_requests (
+            id BIGSERIAL PRIMARY KEY,
+            telegram_id TEXT NOT NULL,
+            meet_url TEXT NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'calendar',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS recordings (
+            id BIGSERIAL PRIMARY KEY,
+            telegram_id TEXT NOT NULL,
+            meet_url TEXT DEFAULT '',
+            filename TEXT DEFAULT '',
+            size_bytes BIGINT NOT NULL DEFAULT 0,
+            duration_seconds BIGINT NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id BIGSERIAL PRIMARY KEY,
+            telegram_id TEXT NOT NULL,
+            plan_code TEXT NOT NULL,
+            price_toman BIGINT NOT NULL,
+            starts_at TEXT NOT NULL,
+            ends_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            note TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS payment_intents (
+            intent TEXT PRIMARY KEY,
+            telegram_id TEXT NOT NULL,
+            plan_code TEXT NOT NULL,
+            amount_toman BIGINT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            receipt TEXT,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            paid_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS system_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen);
+        CREATE INDEX IF NOT EXISTS idx_requests_created_at ON meeting_requests(created_at);
+        CREATE INDEX IF NOT EXISTS idx_recordings_created_at ON recordings(created_at);
+        CREATE INDEX IF NOT EXISTS idx_subscriptions_telegram ON subscriptions(telegram_id);
+        """
+        with _db() as db:
+            db.executescript(schema)
+        _migrate_sqlite_to_postgres_once()
+        return
+
     with _db() as db:
         db.executescript(
             """
