@@ -164,6 +164,9 @@ jobs:
               chmod 700 "/opt/beonmeet/$PROFILE"
             done
 
+            mkdir -p /opt/beonmeet/recorder-accounts
+            chown -R 1001:1001 /opt/beonmeet/recorder-accounts
+            chmod 700 /opt/beonmeet/recorder-accounts
             mkdir -p /dev/shm/beonmeet
             chmod 777 /dev/shm/beonmeet
             if ! docker compose up -d --build --remove-orphans; then
