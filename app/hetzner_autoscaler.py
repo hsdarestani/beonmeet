@@ -24,7 +24,7 @@ CONTROLLER_PUBLIC_URL = os.environ.get("CONTROLLER_PUBLIC_URL", "https://beonmee
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 
-SERVER_TYPE = os.environ.get("AUTOSCALE_SERVER_TYPE", "cpx31")
+SERVER_TYPE = os.environ.get("AUTOSCALE_SERVER_TYPE", "cpx32")
 SERVER_IMAGE = os.environ.get("AUTOSCALE_SERVER_IMAGE", "ubuntu-24.04")
 SERVER_LOCATION = os.environ.get("AUTOSCALE_SERVER_LOCATION", "nbg1")
 WORKER_SLOTS = max(1, int(os.environ.get("AUTOSCALE_WORKER_SLOTS", "3")))
