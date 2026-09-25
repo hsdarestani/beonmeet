@@ -4,5 +4,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certi
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py admin_panel.py state_store.py db_compat.py hetzner_autoscaler.py .
+COPY main.py admin_panel.py state_store.py db_compat.py hetzner_autoscaler.py scaling_policy.py .
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
