@@ -7,7 +7,9 @@ services:
   controller:
     build: ./app
     restart: unless-stopped
-    env_file: .env
+    env_file:
+      - .env
+      - .autoscale.env
     environment:
       TRANSCRIPTION_CONCURRENCY: "1"
       REDIS_URL: redis://redis:6379/0
