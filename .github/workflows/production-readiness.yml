@@ -1,0 +1,96 @@
+name: Production Readiness
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Deploy BeOnMeet"]
+    types: [completed]
+
+jobs:
+  readiness:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       contains(github.event.workflow_run.head_commit.message, '[readiness-smoke]'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout tested revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Run synthetic scaling load test
+        run: python3 tests/scaling_load_test.py
+
+      - name: Check production health
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 10 --retry-delay 3 https://beonmeet.smarbiz.sbs/health | tee /tmp/health.json
+          python3 - <<'PY'
+          import json
+          h=json.load(open('/tmp/health.json'))
+          assert h.get('ok') is True, h
+          assert h.get('calendar_connected') is True, h
+          assert h.get('redis_state') is True, h
+          assert h.get('database_backend') == 'postgresql', h
+          assert h.get('autoscaler_enabled') is True, h
+          assert int(h.get('healthy_free_workers') or 0) >= 2, h
+          assert int(h.get('healthy_premium_workers') or 0) >= 1, h
+          assert int(h.get('recorder_account_profiles') or 0) >= 1, h
+          print('PRODUCTION_HEALTH_PASS')
+          print(json.dumps(h, ensure_ascii=False))
+          PY
+
+      - name: Install SSH helper
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Verify exact local recorder capacity
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          sshpass -e ssh -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/beonmeet && docker compose exec -T controller python - <<'"'"'PY'"'"'
+          import json, urllib.request
+          urls = {
+              "free1": "http://meeting-bot-free1:3000/capacity",
+              "free2": "http://meeting-bot-free2:3000/capacity",
+              "premium1": "http://meeting-bot-premium1:3000/capacity",
+          }
+          result = {}
+          for name, url in urls.items():
+              data = json.loads(urllib.request.urlopen(url, timeout=5).read().decode())
+              result[name] = data["data"]
+          assert result["free1"]["maxConcurrentJobs"] == 4, result
+          assert result["free2"]["maxConcurrentJobs"] == 4, result
+          assert result["premium1"]["maxConcurrentJobs"] == 4, result
+          print("LOCAL_CAPACITY_PASS", json.dumps(result))
+          PY'
+
+      - name: Real Hetzner autoscaler smoke test
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          sshpass -e ssh -o StrictHostKeyChecking=no root@"$HOST"             'cd /opt/beonmeet && docker compose exec -T -e AUTOSCALER_SMOKE_TIMEOUT_SECONDS=900 controller python /app/autoscaler_smoke.py'
+
+      - name: Final production health
+        run: |
+          set -euo pipefail
+          sleep 10
+          curl -fsS https://beonmeet.smarbiz.sbs/health | tee /tmp/final-health.json
+          python3 - <<'PY'
+          import json
+          h=json.load(open('/tmp/final-health.json'))
+          assert h.get('ok') is True, h
+          assert h.get('redis_state') is True, h
+          assert h.get('database_backend') == 'postgresql', h
+          print('READINESS_SUITE_PASS')
+          PY
