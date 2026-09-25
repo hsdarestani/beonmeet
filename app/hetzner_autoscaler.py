@@ -201,6 +201,11 @@ async def _hetzner(client: httpx.AsyncClient, method: str, path: str, **kwargs) 
     headers = dict(kwargs.pop("headers", {}))
     headers["Authorization"] = f"Bearer {HETZNER_API_TOKEN}"
     response = await client.request(method, f"{HETZNER_API_BASE}{path}", headers=headers, **kwargs)
+    if response.is_error:
+        print(
+            f"Hetzner API error {method} {path}: {response.status_code} {response.text[:2000]}",
+            flush=True,
+        )
     response.raise_for_status()
     return response
 
