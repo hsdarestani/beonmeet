@@ -2,3 +2,5 @@ Production readiness smoke trigger.
 
 This file exists only to provide an auditable commit that runs the one-time
 production readiness workflow after the production deploy completes.
+
+Retry after Chrome profile detection fix: 2026-09-25T18:41+03:30
