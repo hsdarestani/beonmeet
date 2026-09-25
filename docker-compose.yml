@@ -1,5 +1,8 @@
-# BeOnMeet production capacity: 5 free slots + 3 reserved Premium slots.
-# Premium can also borrow an unused free slot. Free users never consume Premium slots.
+# BeOnMeet production stack.
+# 12 local recorder slots on the current 16 vCPU / 32 GB host:
+#   8 general slots across two isolated Chrome workers
+#   4 reserved Premium slots on a dedicated Chrome worker
+# Premium may borrow unused general capacity. Free never consumes Premium slots.
 services:
   controller:
     build: ./app
@@ -7,23 +10,47 @@ services:
     env_file: .env
     environment:
       TRANSCRIPTION_CONCURRENCY: "1"
-      FREE_MEETING_BOT_URL: http://meeting-bot:3000
-      PREMIUM_MEETING_BOT_URL: http://meeting-bot-premium:3000
-      FREE_WORKER_URLS: http://meeting-bot:3000
-      PREMIUM_WORKER_URLS: http://meeting-bot-premium:3000
-      FREE_MEETING_SLOTS: "5"
-      PREMIUM_MEETING_SLOTS: "3"
       REDIS_URL: redis://redis:6379/0
+      FREE_MEETING_BOT_URL: http://meeting-bot-free1:3000
+      PREMIUM_MEETING_BOT_URL: http://meeting-bot-premium1:3000
+      FREE_WORKER_URLS: http://meeting-bot-free1:3000,http://meeting-bot-free2:3000
+      PREMIUM_WORKER_URLS: http://meeting-bot-premium1:3000
+      FREE_MEETING_SLOTS: "8"
+      PREMIUM_MEETING_SLOTS: "4"
+      DATABASE_URL: postgresql://beonmeet:${POSTGRES_PASSWORD}@postgres:5432/beonmeet
     volumes:
       - controller_state:/data
       - /dev/shm/beonmeet:/recordings
     expose:
       - "8000"
     depends_on:
-      meeting-bot:
+      postgres:
+        condition: service_healthy
+      redis:
         condition: service_started
-      meeting-bot-premium:
+      meeting-bot-free1:
         condition: service_started
+      meeting-bot-free2:
+        condition: service_started
+      meeting-bot-premium1:
+        condition: service_started
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: beonmeet
+      POSTGRES_USER: beonmeet
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U beonmeet -d beonmeet"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    expose:
+      - "5432"
 
   redis:
     image: redis:7-alpine
@@ -42,7 +69,7 @@ services:
     expose:
       - "6379"
 
-  meeting-bot:
+  meeting-bot-free1:
     image: beonmeet-meeting-bot:latest
     platform: linux/amd64
     build:
@@ -55,14 +82,14 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       REDIS_CONSUMER_ENABLED: "false"
-      GOOGLE_CHROME_CDP_URL: http://chrome-cdp:9223
+      GOOGLE_CHROME_CDP_URL: http://chrome-cdp-free1:9223
       RECORDING_TMP_DIR: /recordings
       CONTROLLER_UPLOAD_URL: http://controller:8000/internal/recording-ready
       CONTROLLER_RECORDING_STARTED_URL: http://controller:8000/internal/recording-started
       CONTROLLER_WAITING_FOR_ADMISSION_URL: http://controller:8000/internal/waiting-for-admission
       UPLOADER_FILE_EXTENSION: .webm
       MAX_RECORDING_DURATION_MINUTES: "240"
-      MAX_CONCURRENT_MEETINGS: "5"
+      MAX_CONCURRENT_MEETINGS: "4"
       MEETING_INACTIVITY_MINUTES: "1"
       INACTIVITY_DETECTION_START_DELAY_MINUTES: "3"
       JOIN_WAIT_TIME_MINUTES: "5"
@@ -71,12 +98,12 @@ services:
     depends_on:
       redis:
         condition: service_started
-      chrome-cdp:
+      chrome-cdp-free1:
         condition: service_healthy
     expose:
       - "3000"
 
-  meeting-bot-premium:
+  meeting-bot-free2:
     image: beonmeet-meeting-bot:latest
     platform: linux/amd64
     restart: unless-stopped
@@ -86,14 +113,14 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       REDIS_CONSUMER_ENABLED: "false"
-      GOOGLE_CHROME_CDP_URL: http://chrome-cdp:9223
+      GOOGLE_CHROME_CDP_URL: http://chrome-cdp-free2:9223
       RECORDING_TMP_DIR: /recordings
       CONTROLLER_UPLOAD_URL: http://controller:8000/internal/recording-ready
       CONTROLLER_RECORDING_STARTED_URL: http://controller:8000/internal/recording-started
       CONTROLLER_WAITING_FOR_ADMISSION_URL: http://controller:8000/internal/waiting-for-admission
       UPLOADER_FILE_EXTENSION: .webm
       MAX_RECORDING_DURATION_MINUTES: "240"
-      MAX_CONCURRENT_MEETINGS: "3"
+      MAX_CONCURRENT_MEETINGS: "4"
       MEETING_INACTIVITY_MINUTES: "1"
       INACTIVITY_DETECTION_START_DELAY_MINUTES: "3"
       JOIN_WAIT_TIME_MINUTES: "5"
@@ -102,22 +129,90 @@ services:
     depends_on:
       redis:
         condition: service_started
-      chrome-cdp:
+      chrome-cdp-free2:
         condition: service_healthy
     expose:
       - "3000"
 
-  chrome-cdp:
+  meeting-bot-premium1:
+    image: beonmeet-meeting-bot:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_CONSUMER_ENABLED: "false"
+      GOOGLE_CHROME_CDP_URL: http://chrome-cdp-premium1:9223
+      RECORDING_TMP_DIR: /recordings
+      CONTROLLER_UPLOAD_URL: http://controller:8000/internal/recording-ready
+      CONTROLLER_RECORDING_STARTED_URL: http://controller:8000/internal/recording-started
+      CONTROLLER_WAITING_FOR_ADMISSION_URL: http://controller:8000/internal/waiting-for-admission
+      UPLOADER_FILE_EXTENSION: .webm
+      MAX_RECORDING_DURATION_MINUTES: "240"
+      MAX_CONCURRENT_MEETINGS: "4"
+      MEETING_INACTIVITY_MINUTES: "1"
+      INACTIVITY_DETECTION_START_DELAY_MINUTES: "3"
+      JOIN_WAIT_TIME_MINUTES: "5"
+    volumes:
+      - /dev/shm/beonmeet:/recordings
+    depends_on:
+      redis:
+        condition: service_started
+      chrome-cdp-premium1:
+        condition: service_healthy
+    expose:
+      - "3000"
+
+  chrome-cdp-free1:
+    image: beonmeet-chrome-cdp:latest
     platform: linux/amd64
     build:
       context: ./upstream
       dockerfile: Dockerfile.chrome-cdp
     restart: unless-stopped
-    shm_size: "8gb"
+    shm_size: "4gb"
     environment:
       CHROME_WINDOW_SIZE: "1600,900"
     volumes:
       - ./chrome-profile:/tmp/chrome-profile
+    expose:
+      - "9223"
+      - "6080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9223/json/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  chrome-cdp-free2:
+    image: beonmeet-chrome-cdp:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    shm_size: "4gb"
+    environment:
+      CHROME_WINDOW_SIZE: "1600,900"
+    volumes:
+      - ./chrome-profile-free2:/tmp/chrome-profile
+    expose:
+      - "9223"
+      - "6080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9223/json/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  chrome-cdp-premium1:
+    image: beonmeet-chrome-cdp:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    shm_size: "4gb"
+    environment:
+      CHROME_WINDOW_SIZE: "1600,900"
+    volumes:
+      - ./chrome-profile-premium1:/tmp/chrome-profile
     expose:
       - "9223"
       - "6080"
@@ -144,6 +239,7 @@ services:
 
 volumes:
   controller_state:
+  postgres_data:
   redis_data:
   caddy_data:
   caddy_config:
