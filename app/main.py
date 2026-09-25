@@ -22,6 +22,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
 from state_store import DurableStateStore
+from db_compat import is_postgres
 
 from admin_panel import (
     PLANS,
@@ -87,6 +88,7 @@ MEET_RE = re.compile(r"(?:https?://)?(?:www\.)?meet\.google\.com/[a-z]{3}-[a-z]{
 SCOPES = ["https://www.googleapis.com/auth/calendar.events.readonly"]
 
 state_lock = asyncio.Lock()
+worker_health_cache: dict[str, bool] = {}
 _whisper_model = None
 state: dict[str, Any] = {
     "telegram_offset": 0,
@@ -544,6 +546,30 @@ async def launch_meeting(
     return False
 
 
+async def worker_health_loop() -> None:
+    global worker_health_cache
+    while True:
+        urls = list(dict.fromkeys(FREE_WORKER_URLS + PREMIUM_WORKER_URLS))
+        results: dict[str, bool] = {}
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                async def check(url: str) -> tuple[str, bool]:
+                    try:
+                        response = await client.get(f"{url}/health")
+                        return url, response.status_code == 200
+                    except Exception:
+                        return url, False
+
+                checks = await asyncio.gather(*(check(url) for url in urls))
+                results = dict(checks)
+        except Exception as exc:
+            print("worker health loop error:", repr(exc), flush=True)
+
+        if results:
+            worker_health_cache = results
+        await asyncio.sleep(10)
+
+
 async def queue_loop() -> None:
     while True:
         try:
@@ -962,6 +988,7 @@ async def startup() -> None:
     asyncio.create_task(telegram_loop())
     asyncio.create_task(calendar_loop())
     asyncio.create_task(queue_loop())
+    asyncio.create_task(worker_health_loop())
 
 
 @app.get("/api/billing/payment-intent")
@@ -1041,6 +1068,9 @@ async def health() -> dict[str, Any]:
         "free_worker_endpoints": len(FREE_WORKER_URLS),
         "premium_worker_endpoints": len(PREMIUM_WORKER_URLS),
         "redis_state": STATE_STORE.ping(),
+        "database_backend": "postgresql" if is_postgres() else "sqlite",
+        "healthy_free_workers": sum(1 for url in FREE_WORKER_URLS if worker_health_cache.get(url, True)),
+        "healthy_premium_workers": sum(1 for url in PREMIUM_WORKER_URLS if worker_health_cache.get(url, True)),
         "free_queue": sum(1 for item in state.get("join_queue", []) if not bool(item.get("premium"))),
         "premium_queue": sum(1 for item in state.get("join_queue", []) if bool(item.get("premium"))),
         "transcription_concurrency": int(os.environ.get("TRANSCRIPTION_CONCURRENCY", "1")),
