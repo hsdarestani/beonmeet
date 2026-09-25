@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs
 
+import httpx
+
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
@@ -494,6 +496,7 @@ def _layout(title: str, body: str, active: str = "dashboard") -> str:
         ("recordings", "/admin/recordings", "ضبط ها", "◍"),
         ("subscriptions", "/admin/subscriptions", "اشتراک ها", "◆"),
         ("plans", "/admin/plans", "پلن ویژه", "✦"),
+        ("system", "/admin/system", "سیستم", "◫"),
     ]
     nav_html = "".join(
         f'<a class="nav {"active" if key==active else ""}" href="{href}"><span>{icon}</span>{label}</a>'
@@ -730,3 +733,59 @@ async def plans_page(request: Request):
       <div class="alert" style="margin-top:15px">پرداخت آنلاین زیبال از مسیر HamoonCloud برای خرید کاربرها در حال استفاده است. فعال سازی دستی هم همچنان از صفحه کاربر در دسترسه.</div>
     </div></div>"""
     return _layout("پلن ویژه", body, "plans")
+
+
+
+@router.get("/admin/system", response_class=HTMLResponse)
+async def system_page(request: Request):
+    _require_admin(request)
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get("http://127.0.0.1:8000/health")
+            response.raise_for_status()
+            health = response.json()
+    except Exception as exc:
+        health = {"ok": False, "error": str(exc)}
+
+    ok = bool(health.get("ok"))
+    free_slots = int(health.get("free_meeting_slots") or 0)
+    premium_slots = int(health.get("premium_reserved_slots") or 0)
+    free_workers = int(health.get("free_worker_endpoints") or 0)
+    premium_workers = int(health.get("premium_worker_endpoints") or 0)
+    healthy_free = int(health.get("healthy_free_workers") or 0)
+    healthy_premium = int(health.get("healthy_premium_workers") or 0)
+    free_queue = int(health.get("free_queue") or 0)
+    premium_queue = int(health.get("premium_queue") or 0)
+    db_backend = _esc(health.get("database_backend") or "نامشخص")
+    redis_ok = bool(health.get("redis_state"))
+
+    body = f"""
+    <div class="top">
+      <div><h1>وضعیت سیستم</h1><div class="sub">ظرفیت، صف و زیرساخت BeOnMeet</div></div>
+      <span class="pill">{'● همه چیز آنلاین' if ok and redis_ok else '● نیاز به بررسی'}</span>
+    </div>
+
+    <div class="grid">
+      <div class="card metric"><div class="label">ظرفیت همزمان</div><div class="num cyan">{free_slots + premium_slots}</div><div class="hint">{free_slots} عمومی + {premium_slots} ویژه</div></div>
+      <div class="card metric"><div class="label">ورکرهای عمومی</div><div class="num {'good' if healthy_free == free_workers else 'warn'}">{healthy_free}/{free_workers}</div><div class="hint">Recorder endpoint سالم</div></div>
+      <div class="card metric"><div class="label">ورکرهای ویژه</div><div class="num {'good' if healthy_premium == premium_workers else 'warn'}">{healthy_premium}/{premium_workers}</div><div class="hint">ظرفیت رزرو Premium</div></div>
+      <div class="card metric"><div class="label">صف فعلی</div><div class="num">{free_queue + premium_queue}</div><div class="hint">{free_queue} رایگان · {premium_queue} ویژه</div></div>
+    </div>
+
+    <div class="two section">
+      <div class="card">
+        <div class="section-head"><h2>زیرساخت داده</h2><span class="pill">Production</span></div>
+        <div class="feature"><span class="dot"></span><div><b>Database</b><div class="muted">{db_backend}</div></div></div>
+        <div class="feature"><span class="dot {'planned' if not redis_ok else ''}"></span><div><b>Redis Queue</b><div class="muted">{'متصل و پایدار' if redis_ok else 'قطع یا در دسترس نیست'}</div></div></div>
+        <div class="feature"><span class="dot"></span><div><b>Calendar</b><div class="muted">{'متصل' if health.get('calendar_connected') else 'قطع'}</div></div></div>
+      </div>
+      <div class="card">
+        <div class="section-head"><h2>معماری فعلی</h2><span class="pill">Scale ready</span></div>
+        <div class="feature"><span class="dot"></span><div><b>Controller</b><div class="muted">Telegram، Calendar، Queue، پرداخت و مدیریت</div></div></div>
+        <div class="feature"><span class="dot"></span><div><b>Free Pool</b><div class="muted">{free_workers} ورکر مستقل با {free_slots} اسلات</div></div></div>
+        <div class="feature"><span class="dot"></span><div><b>Premium Pool</b><div class="muted">{premium_workers} ورکر مستقل با {premium_slots} اسلات رزرو</div></div></div>
+        <div class="feature"><span class="dot"></span><div><b>Transcription</b><div class="muted">{health.get('transcription_concurrency', 1)} پردازش همزمان برای محافظت از ضبط‌ها</div></div></div>
+      </div>
+    </div>
+    """
+    return _layout("سیستم", body, "system")
