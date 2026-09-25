@@ -33,10 +33,12 @@ services:
       AUTOSCALE_IDLE_MINUTES: "20"
       AUTOSCALE_SCALE_UP_COOLDOWN_SECONDS: "60"
       AUTOSCALE_BOOT_TIMEOUT_MINUTES: "15"
+      AUTOSCALE_MAX_WORKERS_PER_ACCOUNT: "3"
     volumes:
       - controller_state:/data
       - /dev/shm/beonmeet:/recordings
       - ./chrome-profile:/bootstrap/chrome-profile:ro
+      - ./recorder-accounts:/bootstrap/accounts:ro
     expose:
       - "8000"
     depends_on:
