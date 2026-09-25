@@ -66,13 +66,27 @@ def _worker_key(worker_id: str) -> str:
     return f"beonmeet:worker:{worker_id}"
 
 
+def _looks_like_chrome_profile(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    if (path / "Local State").exists():
+        return True
+    try:
+        return any(
+            child.is_dir() and (child / "Preferences").exists()
+            for child in path.iterdir()
+        )
+    except Exception:
+        return False
+
+
 def available_account_profiles() -> dict[str, Path]:
     profiles: dict[str, Path] = {}
-    if (PROFILE_DIR / "Default").exists():
+    if _looks_like_chrome_profile(PROFILE_DIR):
         profiles["primary"] = PROFILE_DIR
     if ACCOUNT_PROFILE_ROOT.exists():
         for path in sorted(ACCOUNT_PROFILE_ROOT.iterdir()):
-            if path.is_dir() and (path / "Default").exists():
+            if _looks_like_chrome_profile(path):
                 profiles[path.name] = path
     return profiles
 
