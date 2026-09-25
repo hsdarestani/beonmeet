@@ -22,7 +22,7 @@ services:
       DATABASE_URL: postgresql://beonmeet:${POSTGRES_PASSWORD}@postgres:5432/beonmeet
       AUTOSCALE_ENABLED: "true"
       CONTROLLER_PUBLIC_URL: https://beonmeet.smarbiz.sbs
-      AUTOSCALE_SERVER_TYPE: cpx31
+      AUTOSCALE_SERVER_TYPE: cpx32
       AUTOSCALE_SERVER_IMAGE: ubuntu-24.04
       AUTOSCALE_SERVER_LOCATION: fsn1
       AUTOSCALE_FALLBACK_LOCATIONS: fsn1,hel1
