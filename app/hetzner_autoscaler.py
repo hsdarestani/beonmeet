@@ -38,6 +38,8 @@ BOOT_TIMEOUT_MINUTES = max(5, int(os.environ.get("AUTOSCALE_BOOT_TIMEOUT_MINUTES
 
 PROFILE_ROOT = Path(os.environ.get("AUTOSCALE_PROFILE_ROOT", "/bootstrap"))
 PROFILE_DIR = PROFILE_ROOT / "chrome-profile"
+ACCOUNT_PROFILE_ROOT = PROFILE_ROOT / "accounts"
+MAX_WORKERS_PER_ACCOUNT = max(1, int(os.environ.get("AUTOSCALE_MAX_WORKERS_PER_ACCOUNT", "3")))
 
 redis_client = redis.Redis.from_url(
     REDIS_URL,
@@ -64,6 +66,46 @@ def _worker_key(worker_id: str) -> str:
     return f"beonmeet:worker:{worker_id}"
 
 
+def available_account_profiles() -> dict[str, Path]:
+    profiles: dict[str, Path] = {}
+    if (PROFILE_DIR / "Default").exists():
+        profiles["primary"] = PROFILE_DIR
+    if ACCOUNT_PROFILE_ROOT.exists():
+        for path in sorted(ACCOUNT_PROFILE_ROOT.iterdir()):
+            if path.is_dir() and (path / "Default").exists():
+                profiles[path.name] = path
+    return profiles
+
+
+def profile_status() -> dict[str, Any]:
+    profiles = available_account_profiles()
+    return {
+        "count": len(profiles),
+        "ids": sorted(profiles.keys()),
+    }
+
+
+def _select_account_id(existing_servers: list[dict[str, Any]]) -> str:
+    profiles = available_account_profiles()
+    if not profiles:
+        raise RuntimeError("No signed-in recorder account profile is available")
+
+    counts = {account_id: 0 for account_id in profiles}
+    for server in existing_servers:
+        account_id = str((server.get("labels") or {}).get("account-id") or "primary")
+        if account_id in counts:
+            counts[account_id] += 1
+
+    ranked = sorted(counts.items(), key=lambda item: (item[1], item[0]))
+    if len(ranked) == 1:
+        return ranked[0][0]
+
+    for account_id, count in ranked:
+        if count < MAX_WORKERS_PER_ACCOUNT:
+            return account_id
+    return ranked[0][0]
+
+
 def _load_bootstrap(token: str) -> dict[str, Any]:
     try:
         raw = redis_client.get(_bootstrap_key(token))
@@ -86,6 +128,7 @@ async def bootstrap_env(token: str) -> PlainTextResponse:
         f"WORKER_ID={entry['worker_id']}",
         f"WORKER_POOL={entry['pool']}",
         f"WORKER_SLOTS={entry['slots']}",
+        f"RECORDER_ACCOUNT_ID={entry.get('account_id', 'primary')}",
         "",
     ])
     return PlainTextResponse(
@@ -96,12 +139,21 @@ async def bootstrap_env(token: str) -> PlainTextResponse:
 
 @router.get("/internal/autoscale/profile/{token}")
 async def bootstrap_profile(token: str) -> StreamingResponse:
-    _load_bootstrap(token)
-    if not PROFILE_DIR.exists():
+    entry = _load_bootstrap(token)
+    account_id = str(entry.get("account_id") or "primary")
+    profiles = available_account_profiles()
+    profile_dir = profiles.get(account_id)
+    if not profile_dir or not profile_dir.exists():
         raise HTTPException(status_code=503, detail="Signed-in Chrome profile is unavailable")
 
     proc = subprocess.Popen(
-        ["tar", "-C", str(PROFILE_ROOT), "-czf", "-", "chrome-profile"],
+        [
+            "tar",
+            "-C", str(profile_dir.parent),
+            f"--transform=s|^{profile_dir.name}|chrome-profile|",
+            "-czf", "-",
+            profile_dir.name,
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -185,13 +237,19 @@ runcmd:
 """
 
 
-async def _create_server(client: httpx.AsyncClient, pool: str) -> dict[str, Any]:
+async def _create_server(
+    client: httpx.AsyncClient,
+    pool: str,
+    existing_servers: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     token = secrets.token_urlsafe(32)
     worker_id = f"beonmeet-{pool}-{secrets.token_hex(4)}"
+    account_id = _select_account_id(existing_servers or [])
     entry = {
         "worker_id": worker_id,
         "pool": pool,
         "slots": WORKER_SLOTS,
+        "account_id": account_id,
         "created_at": time.time(),
     }
     redis_client.setex(_bootstrap_key(token), 1800, json.dumps(entry, separators=(",", ":")))
@@ -207,6 +265,7 @@ async def _create_server(client: httpx.AsyncClient, pool: str) -> dict[str, Any]
             "service": "recorder",
             "pool": pool,
             "worker-id": worker_id,
+            "account-id": account_id,
         },
     }
     response = await _hetzner(client, "POST", "/servers", json=payload)
@@ -214,7 +273,7 @@ async def _create_server(client: httpx.AsyncClient, pool: str) -> dict[str, Any]
     server = data.get("server") or {}
     print(
         f"autoscaler created {pool} worker {worker_id} "
-        f"server_id={server.get('id')} type={SERVER_TYPE} location={SERVER_LOCATION}",
+        f"server_id={server.get('id')} account={account_id} type={SERVER_TYPE} location={SERVER_LOCATION}",
         flush=True,
     )
     return server
@@ -342,7 +401,9 @@ async def autoscale_loop() -> None:
                         and now - last_scale_up[pool] >= SCALE_UP_COOLDOWN
                     ):
                         for _ in range(to_create):
-                            await _create_server(client, pool)
+                            server = await _create_server(client, pool, managed)
+                            managed.append(server)
+                            by_pool[pool].append(server)
                         last_scale_up[pool] = now
 
                 # Scale down only workers with an exact zero active-job count.
