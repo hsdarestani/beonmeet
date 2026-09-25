@@ -160,6 +160,7 @@ packages:
   - curl
   - ca-certificates
   - tar
+  - python3
 runcmd:
   - |
       set -euo pipefail
