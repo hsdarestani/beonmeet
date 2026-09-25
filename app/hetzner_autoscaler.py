@@ -13,6 +13,8 @@ import redis
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
+from scaling_policy import bounded_scale_up
+
 router = APIRouter()
 
 HETZNER_API_TOKEN = os.environ.get("HETZNER_API_TOKEN", "").strip()
@@ -326,10 +328,14 @@ async def autoscale_loop() -> None:
                         max(0, int((rt or {}).get("available_slots") or 0))
                         for rt in runtimes
                     )
-                    missing_slots = max(0, queue_size - available)
-                    needed_workers = math.ceil(missing_slots / WORKER_SLOTS) if missing_slots else 0
-                    room = max(0, max_workers - len(by_pool[pool]))
-                    to_create = min(room, needed_workers, 2)
+                    to_create = bounded_scale_up(
+                        queue_size=queue_size,
+                        available_slots=available,
+                        worker_slots=WORKER_SLOTS,
+                        current_workers=len(by_pool[pool]),
+                        max_workers=max_workers,
+                        per_cycle_limit=2,
+                    )
 
                     if (
                         to_create > 0
