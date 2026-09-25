@@ -1,0 +1,75 @@
+services:
+  agent:
+    build:
+      context: ..
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    env_file: ../worker.env
+    environment:
+      MEETING_BOT_URL: http://meeting-bot:3000
+    depends_on:
+      meeting-bot:
+        condition: service_started
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    tmpfs:
+      - /data
+    expose:
+      - "6379"
+
+  meeting-bot:
+    image: beonmeet-remote-meeting-bot:latest
+    platform: linux/amd64
+    build:
+      context: ../upstream
+      dockerfile: Dockerfile.production
+    restart: unless-stopped
+    env_file: ../worker.env
+    environment:
+      NODE_ENV: production
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_CONSUMER_ENABLED: "false"
+      GOOGLE_CHROME_CDP_URL: http://chrome-cdp:9223
+      RECORDING_TMP_DIR: /recordings
+      CONTROLLER_STREAM_UPLOAD_URL: https://beonmeet.smarbiz.sbs/internal/recording-upload
+      CONTROLLER_RECORDING_STARTED_URL: https://beonmeet.smarbiz.sbs/internal/recording-started
+      CONTROLLER_WAITING_FOR_ADMISSION_URL: https://beonmeet.smarbiz.sbs/internal/waiting-for-admission
+      UPLOADER_FILE_EXTENSION: .webm
+      MAX_RECORDING_DURATION_MINUTES: "240"
+      MAX_CONCURRENT_MEETINGS: "${WORKER_SLOTS:-4}"
+      MEETING_INACTIVITY_MINUTES: "1"
+      INACTIVITY_DETECTION_START_DELAY_MINUTES: "3"
+      JOIN_WAIT_TIME_MINUTES: "5"
+    volumes:
+      - /dev/shm/beonmeet:/recordings
+    depends_on:
+      redis:
+        condition: service_started
+      chrome-cdp:
+        condition: service_healthy
+    expose:
+      - "3000"
+
+  chrome-cdp:
+    image: beonmeet-remote-chrome:latest
+    platform: linux/amd64
+    build:
+      context: ../upstream
+      dockerfile: Dockerfile.chrome-cdp
+    restart: unless-stopped
+    shm_size: "6gb"
+    environment:
+      CHROME_WINDOW_SIZE: "1600,900"
+    volumes:
+      - ../chrome-profile:/tmp/chrome-profile
+    expose:
+      - "9223"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9223/json/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
