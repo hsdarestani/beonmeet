@@ -277,7 +277,6 @@ async def _create_server(
         "name": worker_id,
         "server_type": SERVER_TYPE,
         "image": SERVER_IMAGE,
-        "location": SERVER_LOCATION,
         "user_data": _cloud_init(token),
         "labels": {
             "managed-by": "beonmeet",
@@ -287,12 +286,51 @@ async def _create_server(
             "account-id": account_id,
         },
     }
-    response = await _hetzner(client, "POST", "/servers", json=payload)
+
+    configured_locations = [
+        item.strip()
+        for item in (
+            [SERVER_LOCATION]
+            + os.environ.get("AUTOSCALE_FALLBACK_LOCATIONS", "fsn1,hel1").split(",")
+        )
+        if item.strip()
+    ]
+    response = None
+    last_error: Exception | None = None
+    for location in dict.fromkeys(configured_locations):
+        try:
+            response = await _hetzner(
+                client,
+                "POST",
+                "/servers",
+                json={**payload, "location": location},
+            )
+            break
+        except httpx.HTTPStatusError as exc:
+            last_error = exc
+            body = exc.response.text.lower()
+            if exc.response.status_code == 422 and "unsupported location for server type" in body:
+                print(
+                    f"Hetzner server type {SERVER_TYPE} is unavailable in {location}; trying fallback",
+                    flush=True,
+                )
+                continue
+            raise
+
+    if response is None:
+        # Final safe fallback: let Hetzner choose any compatible location.
+        try:
+            response = await _hetzner(client, "POST", "/servers", json=payload)
+        except Exception:
+            if last_error:
+                raise last_error
+            raise
+
     data = response.json() or {}
     server = data.get("server") or {}
     print(
         f"autoscaler created {pool} worker {worker_id} "
-        f"server_id={server.get('id')} account={account_id} type={SERVER_TYPE} location={SERVER_LOCATION}",
+        f"server_id={server.get('id')} account={account_id} type={SERVER_TYPE} location={server.get('datacenter', {}).get('location', {}).get('name', SERVER_LOCATION)}",
         flush=True,
     )
     return server
