@@ -15,7 +15,25 @@ WORKER_SLOTS = max(1, int(os.environ.get("WORKER_SLOTS", "4")))
 HEADERS = {"x-beonmeet-secret": SECRET}
 
 
-async def heartbeat(client: httpx.AsyncClient) -> None:
+async def local_capacity(client: httpx.AsyncClient) -> dict:
+    try:
+        response = await client.get(f"{MEETING_BOT}/capacity")
+        response.raise_for_status()
+        data = (response.json() or {}).get("data") or {}
+        return {
+            "running_jobs": int(data.get("runningJobs") or 0),
+            "max_jobs": int(data.get("maxConcurrentJobs") or WORKER_SLOTS),
+            "available_slots": int(data.get("availableSlots") or 0),
+        }
+    except Exception:
+        return {
+            "running_jobs": WORKER_SLOTS,
+            "max_jobs": WORKER_SLOTS,
+            "available_slots": 0,
+        }
+
+
+async def heartbeat(client: httpx.AsyncClient, capacity: dict) -> None:
     await client.post(
         f"{CONTROLLER}/internal/worker/heartbeat",
         headers=HEADERS,
@@ -23,17 +41,11 @@ async def heartbeat(client: httpx.AsyncClient) -> None:
             "worker_id": WORKER_ID,
             "pool": WORKER_POOL,
             "slots": WORKER_SLOTS,
+            "active_jobs": int(capacity.get("running_jobs") or 0),
+            "max_jobs": int(capacity.get("max_jobs") or WORKER_SLOTS),
+            "available_slots": int(capacity.get("available_slots") or 0),
         },
     )
-
-
-async def local_busy(client: httpx.AsyncClient) -> bool:
-    try:
-        response = await client.get(f"{MEETING_BOT}/isbusy")
-        response.raise_for_status()
-        return bool((response.json() or {}).get("data"))
-    except Exception:
-        return True
 
 
 async def claim(client: httpx.AsyncClient) -> dict | None:
@@ -90,11 +102,12 @@ async def run() -> None:
         while True:
             try:
                 now = loop.time()
+                capacity = await local_capacity(client)
                 if now >= heartbeat_due:
-                    await heartbeat(client)
+                    await heartbeat(client, capacity)
                     heartbeat_due = now + 10.0
 
-                if await local_busy(client):
+                if int(capacity.get("available_slots") or 0) <= 0:
                     await asyncio.sleep(1)
                     continue
 
