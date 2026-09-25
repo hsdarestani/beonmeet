@@ -9,8 +9,11 @@ services:
       TRANSCRIPTION_CONCURRENCY: "1"
       FREE_MEETING_BOT_URL: http://meeting-bot:3000
       PREMIUM_MEETING_BOT_URL: http://meeting-bot-premium:3000
+      FREE_WORKER_URLS: http://meeting-bot:3000
+      PREMIUM_WORKER_URLS: http://meeting-bot-premium:3000
       FREE_MEETING_SLOTS: "5"
       PREMIUM_MEETING_SLOTS: "3"
+      REDIS_URL: redis://redis:6379/0
     volumes:
       - controller_state:/data
       - /dev/shm/beonmeet:/recordings
@@ -25,9 +28,17 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
-    tmpfs:
-      - /data
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "60"
+      - "1000"
+    volumes:
+      - redis_data:/data
     expose:
       - "6379"
 
@@ -133,5 +144,6 @@ services:
 
 volumes:
   controller_state:
+  redis_data:
   caddy_data:
   caddy_config:
