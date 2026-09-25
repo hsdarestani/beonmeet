@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import re
@@ -1136,21 +1137,14 @@ async def recording_started(
     return {"ok": True}
 
 
-@app.post("/internal/recording-ready")
-async def recording_ready(
-    request: Request,
-    x_beonmeet_secret: str = Header(...),
-) -> dict[str, Any]:
-    if x_beonmeet_secret != INTERNAL_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    data = await request.json()
-    raw_path = Path(str(data.get("filePath", ""))).resolve()
+async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, Any]:
     try:
         raw_path.relative_to(RECORDING_ROOT)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid recording path")
     if not raw_path.exists() or not raw_path.is_file():
         raise HTTPException(status_code=404, detail="Recording not found")
+
     chat_id = str(data.get("userId", "")).strip()
     if not chat_id:
         raise HTTPException(status_code=400, detail="Missing userId")
@@ -1179,8 +1173,6 @@ async def recording_ready(
         delivery_filename = filename
         free_path: Path | None = None
 
-        # Everyone is captured from the higher-resolution Meet tab. Free users receive
-        # a standard 720p encode, while Premium users receive the higher-quality original.
         if not premium_active:
             free_path = raw_path.with_name(f"{raw_path.stem}_standard.mp4")
             subprocess.run(
@@ -1210,7 +1202,6 @@ async def recording_ready(
             int(data.get("duration") or 0),
         )
 
-        # Premium: create a separate MP3 in RAM and deliver it to the requester and admin.
         if premium_active:
             audio_path = raw_path.with_suffix(".mp3")
             try:
@@ -1236,8 +1227,6 @@ async def recording_ready(
                             {"document": (f"{Path(filename).stem}.mp3", fp, "audio/mpeg")},
                         )
 
-                # Premium: local multilingual transcription. This can contain mistakes,
-                # especially with weak audio or several people speaking at once.
                 try:
                     await tg_text(chat_id, "📝 دارم متن جلسه رو هم آماده می‌کنم. ممکنه یه کم طول بکشه…")
                     async with TRANSCRIPTION_SEMAPHORE:
@@ -1282,3 +1271,69 @@ async def recording_ready(
     except Exception as exc:
         await tg_text(chat_id, "⚠️ ضبط تموم شده ولی ارسالش به تلگرام خطا خورد. فایل فعلاً فقط توی حافظه موقت نگه داشته شده تا بتونم دوباره بفرستم.")
         raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/internal/recording-ready")
+async def recording_ready(
+    request: Request,
+    x_beonmeet_secret: str = Header(...),
+) -> dict[str, Any]:
+    if x_beonmeet_secret != INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    data = await request.json()
+    raw_path = Path(str(data.get("filePath", ""))).resolve()
+    return await _process_recording(data, raw_path)
+
+
+@app.post("/internal/recording-upload")
+async def recording_upload(
+    request: Request,
+    x_beonmeet_secret: str = Header(...),
+    x_beonmeet_meta: str = Header(...),
+) -> dict[str, Any]:
+    """Receive a recording stream from a recorder worker.
+
+    This removes the shared-filesystem requirement, so recorder workers can live
+    on separate servers later. Existing local-path delivery remains supported by
+    /internal/recording-ready as a rollback path.
+    """
+    if x_beonmeet_secret != INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    try:
+        padded = x_beonmeet_meta + "=" * (-len(x_beonmeet_meta) % 4)
+        meta = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid recording metadata")
+
+    suffix = Path(str(meta.get("filename") or "recording.webm")).suffix or ".webm"
+    raw_path = (RECORDING_ROOT / f"remote-{uuid.uuid4().hex}{suffix}").resolve()
+    try:
+        raw_path.relative_to(RECORDING_ROOT)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid recording path")
+
+    received = 0
+    try:
+        with raw_path.open("wb") as fp:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                received += len(chunk)
+                fp.write(chunk)
+        if received <= 0:
+            raise HTTPException(status_code=400, detail="Empty recording upload")
+
+        expected = int(meta.get("size") or 0)
+        if expected and expected != received:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Recording size mismatch: expected {expected}, received {received}",
+            )
+
+        meta["filePath"] = str(raw_path)
+        meta["size"] = received
+        return await _process_recording(meta, raw_path)
+    except Exception:
+        raw_path.unlink(missing_ok=True)
+        raise
