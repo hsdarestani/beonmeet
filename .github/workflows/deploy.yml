@@ -94,7 +94,6 @@ jobs:
             TELEGRAM_API_BASE=https://api.telegram.org
             INTERNAL_SECRET=${INTERNAL_SECRET}
             POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-            HETZNER_API_TOKEN=${HETZNER_API_TOKEN}
             MEETING_BOT_URL=http://meeting-bot-free1:3000
             CONTROLLER_UPLOAD_URL=http://controller:8000/internal/recording-ready
             CONTROLLER_STREAM_UPLOAD_URL=http://controller:8000/internal/recording-upload
@@ -102,6 +101,11 @@ jobs:
             CALENDAR_POLL_SECONDS=30
             EOF
             chmod 600 .env
+
+            cat > .autoscale.env <<EOF
+            HETZNER_API_TOKEN=${HETZNER_API_TOKEN}
+            EOF
+            chmod 600 .autoscale.env
 
             if [ -n "${HETZNER_API_TOKEN:-}" ]; then
               echo "Checking Hetzner API token..."
