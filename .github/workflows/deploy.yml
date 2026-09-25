@@ -75,6 +75,12 @@ jobs:
             fi
             INTERNAL_SECRET="$(cat .internal_secret)"
 
+            if [ ! -f .postgres_password ]; then
+              openssl rand -hex 24 > .postgres_password
+              chmod 600 .postgres_password
+            fi
+            POSTGRES_PASSWORD="$(cat .postgres_password)"
+
             cat > .env <<EOF
             DOMAIN=beonmeet.smarbiz.sbs
             BOT_EMAIL=meetrecorderbot@gmail.com
@@ -86,8 +92,10 @@ jobs:
             ADMINUSER=${ADMINUSER}
             TELEGRAM_API_BASE=https://api.telegram.org
             INTERNAL_SECRET=${INTERNAL_SECRET}
-            MEETING_BOT_URL=http://meeting-bot:3000
+            POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+            MEETING_BOT_URL=http://meeting-bot-free1:3000
             CONTROLLER_UPLOAD_URL=http://controller:8000/internal/recording-ready
+            CONTROLLER_STREAM_UPLOAD_URL=http://controller:8000/internal/recording-upload
             RECORDING_TMP_DIR=/recordings
             CALENDAR_POLL_SECONDS=30
             EOF
@@ -116,19 +124,39 @@ jobs:
 
             # Preserve the signed-in Chrome profile before any container recreation.
             mkdir -p /opt/beonmeet/chrome-profile
-            if docker ps --format '{{.Names}}' | grep -qx 'beonmeet-chrome-cdp-1'; then
+            SOURCE_CHROME=""
+            if docker ps --format '{{.Names}}' | grep -qx 'beonmeet-chrome-cdp-free1-1'; then
+              SOURCE_CHROME="beonmeet-chrome-cdp-free1-1"
+            elif docker ps --format '{{.Names}}' | grep -qx 'beonmeet-chrome-cdp-1'; then
+              SOURCE_CHROME="beonmeet-chrome-cdp-1"
+            fi
+            if [ -n "$SOURCE_CHROME" ]; then
               rm -rf /opt/beonmeet/chrome-profile/*
-              docker cp beonmeet-chrome-cdp-1:/tmp/chrome-profile/. /opt/beonmeet/chrome-profile/ || true
+              docker cp "$SOURCE_CHROME":/tmp/chrome-profile/. /opt/beonmeet/chrome-profile/ || true
             fi
             rm -f /opt/beonmeet/chrome-profile/SingletonLock /opt/beonmeet/chrome-profile/SingletonSocket /opt/beonmeet/chrome-profile/SingletonCookie || true
             chown -R 1001:1001 /opt/beonmeet/chrome-profile
             chmod 700 /opt/beonmeet/chrome-profile
 
+            # Each recorder worker gets an isolated Chrome profile. Clone the known
+            # signed-in master only the first time; never overwrite an active worker
+            # profile during normal deploys.
+            for PROFILE in chrome-profile-free2 chrome-profile-premium1; do
+              if [ ! -d "/opt/beonmeet/$PROFILE/Default" ]; then
+                rm -rf "/opt/beonmeet/$PROFILE"
+                mkdir -p "/opt/beonmeet/$PROFILE"
+                cp -a /opt/beonmeet/chrome-profile/. "/opt/beonmeet/$PROFILE/"
+              fi
+              rm -f "/opt/beonmeet/$PROFILE/SingletonLock" "/opt/beonmeet/$PROFILE/SingletonSocket" "/opt/beonmeet/$PROFILE/SingletonCookie" || true
+              chown -R 1001:1001 "/opt/beonmeet/$PROFILE"
+              chmod 700 "/opt/beonmeet/$PROFILE"
+            done
+
             mkdir -p /dev/shm/beonmeet
             chmod 777 /dev/shm/beonmeet
             if ! docker compose up -d --build --remove-orphans; then
               docker compose ps -a || true
-              docker compose logs --tail=250 controller meeting-bot chrome-cdp caddy redis || true
+              docker compose logs --tail=250 controller postgres redis meeting-bot-free1 meeting-bot-free2 meeting-bot-premium1 chrome-cdp-free1 chrome-cdp-free2 chrome-cdp-premium1 caddy || true
               exit 1
             fi
             docker compose up -d --force-recreate caddy
@@ -142,5 +170,5 @@ jobs:
             done
 
             echo "Controller health check failed"
-            docker compose logs --tail=200 controller meeting-bot chrome-cdp caddy
+            docker compose logs --tail=200 controller postgres redis meeting-bot-free1 meeting-bot-free2 meeting-bot-premium1 chrome-cdp-free1 chrome-cdp-free2 chrome-cdp-premium1 caddy
             exit 1
