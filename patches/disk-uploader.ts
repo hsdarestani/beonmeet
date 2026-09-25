@@ -100,28 +100,49 @@ class DiskUploader implements IUploader {
       const stat = await fs.promises.stat(filePath);
       if (!stat.size) throw new Error('Recording is empty');
 
-      const controllerUrl = process.env.CONTROLLER_UPLOAD_URL;
+      const streamControllerUrl = process.env.CONTROLLER_STREAM_UPLOAD_URL;
+      const legacyControllerUrl = process.env.CONTROLLER_UPLOAD_URL;
       const secret = process.env.INTERNAL_SECRET;
-      if (!controllerUrl || !secret) {
+      if ((!streamControllerUrl && !legacyControllerUrl) || !secret) {
         throw new Error('Controller upload configuration is missing');
       }
 
-      const response = await fetch(controllerUrl, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-beonmeet-secret': secret,
-        },
-        body: JSON.stringify({
-          userId: this.userId,
-          botId: this.botId,
-          meetingLink: this.meetingLink,
-          duration: this.recordingDuration,
-          filePath,
-          filename: `BeOnMeet-${new Date().toISOString().replace(/[:.]/g, '-')}${this.extension}`,
-          size: stat.size,
-        }),
-      });
+      const metadata = {
+        userId: this.userId,
+        botId: this.botId,
+        meetingLink: this.meetingLink,
+        duration: this.recordingDuration,
+        filename: `BeOnMeet-${new Date().toISOString().replace(/[:.]/g, '-')}${this.extension}`,
+        size: stat.size,
+      };
+
+      let response: Response;
+      if (streamControllerUrl) {
+        const encodedMeta = Buffer.from(JSON.stringify(metadata), 'utf8').toString('base64url');
+        response = await fetch(streamControllerUrl, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/octet-stream',
+            'content-length': String(stat.size),
+            'x-beonmeet-secret': secret,
+            'x-beonmeet-meta': encodedMeta,
+          },
+          body: fs.createReadStream(filePath) as any,
+          duplex: 'half',
+        } as any);
+      } else {
+        response = await fetch(legacyControllerUrl!, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-beonmeet-secret': secret,
+          },
+          body: JSON.stringify({
+            ...metadata,
+            filePath,
+          }),
+        });
+      }
 
       if (!response.ok) {
         const body = await response.text();
