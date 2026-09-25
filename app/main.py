@@ -88,13 +88,16 @@ MEET_RE = re.compile(r"(?:https?://)?(?:www\.)?meet\.google\.com/[a-z]{3}-[a-z]{
 SCOPES = ["https://www.googleapis.com/auth/calendar.events.readonly"]
 
 state_lock = asyncio.Lock()
+queue_mutation_lock = asyncio.Lock()
 worker_health_cache: dict[str, bool] = {}
+remote_worker_cache: dict[str, dict[str, Any]] = {}
 _whisper_model = None
 state: dict[str, Any] = {
     "telegram_offset": 0,
     "requests": {},
     "launched_events": {},
     "join_queue": [],
+    "remote_claims": {},
     "oauth_state": None,
 }
 
@@ -107,6 +110,7 @@ def load_state() -> None:
     state.setdefault("join_queue", [])
     state.setdefault("requests", {})
     state.setdefault("launched_events", {})
+    state.setdefault("remote_claims", {})
     state.setdefault("telegram_offset", 0)
     state.setdefault("oauth_state", None)
     print(f"controller state loaded from {source}", flush=True)
@@ -573,6 +577,30 @@ async def worker_health_loop() -> None:
 async def queue_loop() -> None:
     while True:
         try:
+            # A remote worker claim is a short lease. If a worker disappears before
+            # acknowledging the job, put it safely back in the queue.
+            now_utc = datetime.now(timezone.utc)
+            expired_claims: list[str] = []
+            for claim_id, claim in list(state.setdefault("remote_claims", {}).items()):
+                claimed_at_raw = str(claim.get("claimed_at") or "")
+                try:
+                    claimed_at = isoparse(claimed_at_raw) if claimed_at_raw else now_utc
+                except Exception:
+                    claimed_at = now_utc
+                if now_utc - claimed_at > timedelta(seconds=90):
+                    item = claim.get("item") or {}
+                    event_id = str(item.get("event_id") or "")
+                    launched = state.get("launched_events", {}).get(event_id) or {}
+                    if launched.get("status") == "remote_claimed":
+                        state["launched_events"].pop(event_id, None)
+                    if event_id and not _is_queued(event_id):
+                        state.setdefault("join_queue", []).append(item)
+                    expired_claims.append(claim_id)
+            if expired_claims:
+                for claim_id in expired_claims:
+                    state["remote_claims"].pop(claim_id, None)
+                await save_state()
+
             queue = state.setdefault("join_queue", [])
             if queue:
                 ordered = sorted(
@@ -584,6 +612,8 @@ async def queue_loop() -> None:
                 )
                 for item in ordered:
                     event_id = str(item.get("event_id") or "")
+                    if event_id and not _is_queued(event_id):
+                        continue
                     event = item.get("event") or {}
                     req = item.get("req") or {}
                     meet_url = str(item.get("meet_url") or "")
@@ -1055,6 +1085,178 @@ async def billing_payment_return(payment: str = "", receipt: str = "", intent: s
     return "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;background:#0b0e17;color:white;display:grid;place-items:center;min-height:100vh;margin:0'><div style='text-align:center'><h2>پرداخت موفق بود ✅</h2><p>پلن ویژه فعال شد. می‌تونی این صفحه رو ببندی و برگردی تلگرام.</p></div></body></html>"
 
 
+def _remote_worker_alive(entry: dict[str, Any]) -> bool:
+    try:
+        last_seen = isoparse(str(entry.get("last_seen") or ""))
+        return datetime.now(timezone.utc) - last_seen <= timedelta(seconds=30)
+    except Exception:
+        return False
+
+
+@app.post("/internal/worker/heartbeat")
+async def remote_worker_heartbeat(
+    request: Request,
+    x_beonmeet_secret: str = Header(...),
+) -> dict[str, Any]:
+    if x_beonmeet_secret != INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    data = await request.json()
+    worker_id = str(data.get("worker_id") or "").strip()
+    pool = str(data.get("pool") or "free").strip().lower()
+    slots = max(1, min(32, int(data.get("slots") or 1)))
+    if not worker_id or pool not in {"free", "premium"}:
+        raise HTTPException(status_code=400, detail="Invalid worker")
+    remote_worker_cache[worker_id] = {
+        "pool": pool,
+        "slots": slots,
+        "last_seen": datetime.now(timezone.utc).isoformat(),
+    }
+    return {"ok": True}
+
+
+@app.post("/internal/worker/claim")
+async def remote_worker_claim(
+    request: Request,
+    x_beonmeet_secret: str = Header(...),
+) -> dict[str, Any]:
+    if x_beonmeet_secret != INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    data = await request.json()
+    worker_id = str(data.get("worker_id") or "").strip()
+    pool = str(data.get("pool") or "free").strip().lower()
+    slots = max(1, min(32, int(data.get("slots") or 1)))
+    if not worker_id or pool not in {"free", "premium"}:
+        raise HTTPException(status_code=400, detail="Invalid worker")
+
+    remote_worker_cache[worker_id] = {
+        "pool": pool,
+        "slots": slots,
+        "last_seen": datetime.now(timezone.utc).isoformat(),
+    }
+
+    chosen: dict[str, Any] | None = None
+    claim_id = ""
+    async with queue_mutation_lock:
+        queue = state.setdefault("join_queue", [])
+        candidates = sorted(
+            list(queue),
+            key=lambda item: (
+                0 if bool(item.get("premium")) else 1,
+                str(item.get("queued_at") or ""),
+            ),
+        )
+        for item in candidates:
+            premium = bool(item.get("premium"))
+            # Reserved Premium workers only serve Premium. General workers may
+            # take Premium overflow first, then free jobs.
+            if pool == "premium" and not premium:
+                continue
+            event_id = str(item.get("event_id") or "")
+            if not event_id or not _is_queued(event_id):
+                continue
+            chosen = item
+            state["join_queue"] = [
+                q for q in state.get("join_queue", [])
+                if str(q.get("event_id") or "") != event_id
+            ]
+            claim_id = uuid.uuid4().hex
+            state.setdefault("remote_claims", {})[claim_id] = {
+                "item": item,
+                "worker_id": worker_id,
+                "pool": pool,
+                "claimed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            req = item.get("req") or {}
+            state.setdefault("launched_events", {})[event_id] = {
+                "meet_url": item.get("meet_url"),
+                "chat_id": str(req.get("chat_id") or ""),
+                "launched_at": datetime.now(timezone.utc).isoformat(),
+                "status": "remote_claimed",
+                "premium": premium,
+                "pool": f"remote:{worker_id}",
+            }
+            break
+
+    if not chosen:
+        return {"ok": True, "job": None}
+
+    await save_state()
+    req = chosen.get("req") or {}
+    event_id = str(chosen.get("event_id") or "")
+    premium = bool(chosen.get("premium"))
+    return {
+        "ok": True,
+        "claim_id": claim_id,
+        "job": {
+            "bearerToken": "beonmeet-remote",
+            "url": str(chosen.get("meet_url") or ""),
+            "name": BOT_DISPLAY_NAME,
+            "teamId": "beonmeet-premium" if premium else "beonmeet-free",
+            "timezone": "UTC",
+            "userId": str(req.get("chat_id") or ""),
+            "eventId": event_id,
+            "botId": event_id,
+        },
+    }
+
+
+@app.post("/internal/worker/accepted")
+async def remote_worker_accepted(
+    request: Request,
+    x_beonmeet_secret: str = Header(...),
+) -> dict[str, Any]:
+    if x_beonmeet_secret != INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    data = await request.json()
+    claim_id = str(data.get("claim_id") or "").strip()
+    claim = state.setdefault("remote_claims", {}).pop(claim_id, None)
+    if not claim:
+        return {"ok": True, "already_handled": True}
+
+    item = claim.get("item") or {}
+    event_id = str(item.get("event_id") or "")
+    req = item.get("req") or {}
+    chat_id = str(req.get("chat_id") or "")
+    if event_id:
+        launched = state.setdefault("launched_events", {}).setdefault(event_id, {})
+        launched["status"] = "joining"
+        launched["launched_at"] = datetime.now(timezone.utc).isoformat()
+    await save_state()
+
+    if chat_id:
+        if bool(item.get("premium")):
+            await tg_text(chat_id, "⚡ ورکر ویژه آماده شد. دارم وارد جلسه می‌شم…")
+        else:
+            await tg_text(chat_id, "✅ نوبتت رسید. دارم وارد جلسه می‌شم…")
+    return {"ok": True}
+
+
+@app.post("/internal/worker/requeue")
+async def remote_worker_requeue(
+    request: Request,
+    x_beonmeet_secret: str = Header(...),
+) -> dict[str, Any]:
+    if x_beonmeet_secret != INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    data = await request.json()
+    claim_id = str(data.get("claim_id") or "").strip()
+    claim = state.setdefault("remote_claims", {}).pop(claim_id, None)
+    if not claim:
+        return {"ok": True, "already_handled": True}
+
+    item = claim.get("item") or {}
+    event_id = str(item.get("event_id") or "")
+    if event_id:
+        launched = state.setdefault("launched_events", {}).get(event_id) or {}
+        if launched.get("status") in {"remote_claimed", "joining"}:
+            state["launched_events"].pop(event_id, None)
+        if not _is_queued(event_id):
+            item["queued_at"] = datetime.now(timezone.utc).isoformat()
+            state.setdefault("join_queue", []).append(item)
+    await save_state()
+    return {"ok": True}
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     return {
@@ -1074,6 +1276,17 @@ async def health() -> dict[str, Any]:
         "free_queue": sum(1 for item in state.get("join_queue", []) if not bool(item.get("premium"))),
         "premium_queue": sum(1 for item in state.get("join_queue", []) if bool(item.get("premium"))),
         "transcription_concurrency": int(os.environ.get("TRANSCRIPTION_CONCURRENCY", "1")),
+        "remote_workers": sum(1 for entry in remote_worker_cache.values() if _remote_worker_alive(entry)),
+        "remote_free_slots": sum(
+            int(entry.get("slots") or 0)
+            for entry in remote_worker_cache.values()
+            if _remote_worker_alive(entry) and entry.get("pool") == "free"
+        ),
+        "remote_premium_slots": sum(
+            int(entry.get("slots") or 0)
+            for entry in remote_worker_cache.values()
+            if _remote_worker_alive(entry) and entry.get("pool") == "premium"
+        ),
     }
 
 
