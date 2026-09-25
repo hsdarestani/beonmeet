@@ -23,7 +23,7 @@ from googleapiclient.discovery import build
 
 from state_store import DurableStateStore
 from db_compat import is_postgres
-from hetzner_autoscaler import router as autoscaler_router, autoscale_loop
+from hetzner_autoscaler import router as autoscaler_router, autoscale_loop, enabled as autoscaler_enabled
 
 from admin_panel import (
     PLANS,
@@ -643,15 +643,23 @@ async def queue_loop() -> None:
                         )
                         continue
 
-                    launched, busy, pool_name = await _dispatch_meeting(
-                        event, req, meet_url, premium
-                    )
+                    # Serialize local queue dispatch with remote worker claims.
+                    # Without this lock, a remote worker and the local pool could
+                    # pick the same meeting at exactly the same moment.
+                    async with queue_mutation_lock:
+                        if event_id and not _is_queued(event_id):
+                            continue
+                        launched, busy, pool_name = await _dispatch_meeting(
+                            event, req, meet_url, premium
+                        )
+                        if launched:
+                            state["join_queue"] = [
+                                q for q in state.get("join_queue", [])
+                                if str(q.get("event_id") or "") != event_id
+                            ]
+                            await save_state()
+
                     if launched:
-                        state["join_queue"] = [
-                            q for q in state.get("join_queue", [])
-                            if str(q.get("event_id") or "") != event_id
-                        ]
-                        await save_state()
                         if premium:
                             await tg_text(
                                 chat_id,
@@ -1373,6 +1381,7 @@ async def health() -> dict[str, Any]:
         "remote_premium_slots": remote_premium_slots,
         "remote_free_available_slots": remote_free_available_slots,
         "remote_premium_available_slots": remote_premium_available_slots,
+        "autoscaler_enabled": autoscaler_enabled(),
     }
 
 
