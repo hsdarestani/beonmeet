@@ -24,6 +24,7 @@ from googleapiclient.discovery import build
 from state_store import DurableStateStore
 from db_compat import is_postgres
 from hetzner_autoscaler import router as autoscaler_router, autoscale_loop, enabled as autoscaler_enabled
+from scaling_policy import order_queue
 
 from admin_panel import (
     PLANS,
@@ -380,13 +381,7 @@ def _is_queued(event_id: str) -> bool:
 
 def _queue_position(event_id: str, premium: bool) -> int:
     queue = state.get("join_queue", [])
-    ordered = sorted(
-        queue,
-        key=lambda item: (
-            0 if bool(item.get("premium")) else 1,
-            str(item.get("queued_at") or ""),
-        ),
-    )
+    ordered = order_queue(queue)
     matching = [
         item for item in ordered
         if bool(item.get("premium")) == bool(premium)
@@ -605,13 +600,7 @@ async def queue_loop() -> None:
 
             queue = state.setdefault("join_queue", [])
             if queue:
-                ordered = sorted(
-                    list(queue),
-                    key=lambda item: (
-                        0 if bool(item.get("premium")) else 1,
-                        str(item.get("queued_at") or ""),
-                    ),
-                )
+                ordered = order_queue(queue)
                 for item in ordered:
                     event_id = str(item.get("event_id") or "")
                     if event_id and not _is_queued(event_id):
@@ -1214,13 +1203,7 @@ async def remote_worker_claim(
     claim_id = ""
     async with queue_mutation_lock:
         queue = state.setdefault("join_queue", [])
-        candidates = sorted(
-            list(queue),
-            key=lambda item: (
-                0 if bool(item.get("premium")) else 1,
-                str(item.get("queued_at") or ""),
-            ),
-        )
+        candidates = order_queue(queue)
         for item in candidates:
             premium = bool(item.get("premium"))
             # Reserved Premium workers only serve Premium. General workers may
