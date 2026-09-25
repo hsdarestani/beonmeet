@@ -134,17 +134,22 @@ jobs:
             sed -i 's/npx playwright install$/npx playwright install chromium/' upstream/Dockerfile.production
             sed -i 's/RUN npm run build/RUN NODE_OPTIONS=--max-old-space-size=2048 npm run build/' upstream/Dockerfile.production
 
-            # Preserve the signed-in Chrome profile before any container recreation.
+            # Chrome profiles are bind-mounted. Never clear the host directory
+            # before docker cp, because that would delete the live source as well.
+            # Recover the primary profile from an isolated worker copy if an older
+            # deploy already emptied it.
             mkdir -p /opt/beonmeet/chrome-profile
-            SOURCE_CHROME=""
-            if docker ps --format '{{.Names}}' | grep -qx 'beonmeet-chrome-cdp-free1-1'; then
-              SOURCE_CHROME="beonmeet-chrome-cdp-free1-1"
-            elif docker ps --format '{{.Names}}' | grep -qx 'beonmeet-chrome-cdp-1'; then
-              SOURCE_CHROME="beonmeet-chrome-cdp-1"
-            fi
-            if [ -n "$SOURCE_CHROME" ]; then
-              rm -rf /opt/beonmeet/chrome-profile/*
-              docker cp "$SOURCE_CHROME":/tmp/chrome-profile/. /opt/beonmeet/chrome-profile/ || true
+            profile_has_data() {
+              [ -f "$1/Local State" ] || find "$1" -maxdepth 2 -name Preferences -type f -print -quit 2>/dev/null | grep -q .
+            }
+            if ! profile_has_data /opt/beonmeet/chrome-profile; then
+              for CANDIDATE in /opt/beonmeet/chrome-profile-free2 /opt/beonmeet/chrome-profile-premium1; do
+                if [ -d "$CANDIDATE" ] && profile_has_data "$CANDIDATE"; then
+                  echo "Recovering primary Chrome profile from $CANDIDATE"
+                  cp -a "$CANDIDATE"/. /opt/beonmeet/chrome-profile/
+                  break
+                fi
+              done
             fi
             rm -f /opt/beonmeet/chrome-profile/SingletonLock /opt/beonmeet/chrome-profile/SingletonSocket /opt/beonmeet/chrome-profile/SingletonCookie || true
             chown -R 1001:1001 /opt/beonmeet/chrome-profile
