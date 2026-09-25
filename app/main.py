@@ -23,6 +23,7 @@ from googleapiclient.discovery import build
 
 from state_store import DurableStateStore
 from db_compat import is_postgres
+from hetzner_autoscaler import router as autoscaler_router, autoscale_loop
 
 from admin_panel import (
     PLANS,
@@ -42,6 +43,7 @@ from admin_panel import (
 
 app = FastAPI(title="BeOnMeet Controller")
 app.include_router(admin_router)
+app.include_router(autoscaler_router)
 
 DATA_DIR = Path("/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1065,6 +1067,7 @@ async def startup() -> None:
     asyncio.create_task(queue_loop())
     asyncio.create_task(worker_health_loop())
     asyncio.create_task(state_cleanup_loop())
+    asyncio.create_task(autoscale_loop())
 
 
 @app.get("/api/billing/payment-intent")
@@ -1152,11 +1155,26 @@ async def remote_worker_heartbeat(
     slots = max(1, min(32, int(data.get("slots") or 1)))
     if not worker_id or pool not in {"free", "premium"}:
         raise HTTPException(status_code=400, detail="Invalid worker")
-    remote_worker_cache[worker_id] = {
+    active_jobs = max(0, int(data.get("active_jobs") or 0))
+    max_jobs = max(1, int(data.get("max_jobs") or slots))
+    available_slots = max(0, int(data.get("available_slots") or (max_jobs - active_jobs)))
+    worker_state = {
         "pool": pool,
         "slots": slots,
+        "active_jobs": active_jobs,
+        "max_jobs": max_jobs,
+        "available_slots": available_slots,
         "last_seen": datetime.now(timezone.utc).isoformat(),
     }
+    remote_worker_cache[worker_id] = worker_state
+    try:
+        STATE_STORE.redis.setex(
+            f"beonmeet:worker:{worker_id}",
+            60,
+            json.dumps(worker_state, ensure_ascii=False, separators=(",", ":")),
+        )
+    except Exception as exc:
+        print("remote worker heartbeat Redis error:", repr(exc), flush=True)
     return {"ok": True}
 
 
@@ -1174,9 +1192,13 @@ async def remote_worker_claim(
     if not worker_id or pool not in {"free", "premium"}:
         raise HTTPException(status_code=400, detail="Invalid worker")
 
+    existing_worker = remote_worker_cache.get(worker_id) or {}
     remote_worker_cache[worker_id] = {
         "pool": pool,
         "slots": slots,
+        "active_jobs": int(existing_worker.get("active_jobs") or 0),
+        "max_jobs": int(existing_worker.get("max_jobs") or slots),
+        "available_slots": int(existing_worker.get("available_slots") or slots),
         "last_seen": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1315,6 +1337,16 @@ async def health() -> dict[str, Any]:
         for entry in remote_worker_cache.values()
         if _remote_worker_alive(entry) and entry.get("pool") == "premium"
     )
+    remote_free_available_slots = sum(
+        int(entry.get("available_slots") or 0)
+        for entry in remote_worker_cache.values()
+        if _remote_worker_alive(entry) and entry.get("pool") == "free"
+    )
+    remote_premium_available_slots = sum(
+        int(entry.get("available_slots") or 0)
+        for entry in remote_worker_cache.values()
+        if _remote_worker_alive(entry) and entry.get("pool") == "premium"
+    )
     total_free_slots = FREE_MEETING_SLOTS + remote_free_slots
     total_premium_slots = PREMIUM_MEETING_SLOTS + remote_premium_slots
     return {
@@ -1339,6 +1371,8 @@ async def health() -> dict[str, Any]:
         "remote_workers": sum(1 for entry in remote_worker_cache.values() if _remote_worker_alive(entry)),
         "remote_free_slots": remote_free_slots,
         "remote_premium_slots": remote_premium_slots,
+        "remote_free_available_slots": remote_free_available_slots,
+        "remote_premium_available_slots": remote_premium_available_slots,
     }
 
 
