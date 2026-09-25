@@ -23,7 +23,7 @@ from googleapiclient.discovery import build
 
 from state_store import DurableStateStore
 from db_compat import is_postgres
-from hetzner_autoscaler import router as autoscaler_router, autoscale_loop, enabled as autoscaler_enabled
+from hetzner_autoscaler import router as autoscaler_router, autoscale_loop, enabled as autoscaler_enabled, profile_status
 from scaling_policy import order_queue
 
 from admin_panel import (
@@ -1155,12 +1155,14 @@ async def remote_worker_heartbeat(
     active_jobs = max(0, int(data.get("active_jobs") or 0))
     max_jobs = max(1, int(data.get("max_jobs") or slots))
     available_slots = max(0, int(data.get("available_slots") or (max_jobs - active_jobs)))
+    account_id = str(data.get("account_id") or "primary")
     worker_state = {
         "pool": pool,
         "slots": slots,
         "active_jobs": active_jobs,
         "max_jobs": max_jobs,
         "available_slots": available_slots,
+        "account_id": account_id,
         "last_seen": datetime.now(timezone.utc).isoformat(),
     }
     remote_worker_cache[worker_id] = worker_state
@@ -1190,12 +1192,14 @@ async def remote_worker_claim(
         raise HTTPException(status_code=400, detail="Invalid worker")
 
     existing_worker = remote_worker_cache.get(worker_id) or {}
+    account_id = str(data.get("account_id") or existing_worker.get("account_id") or "primary")
     remote_worker_cache[worker_id] = {
         "pool": pool,
         "slots": slots,
         "active_jobs": int(existing_worker.get("active_jobs") or 0),
         "max_jobs": int(existing_worker.get("max_jobs") or slots),
         "available_slots": int(existing_worker.get("available_slots") or slots),
+        "account_id": account_id,
         "last_seen": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1340,6 +1344,12 @@ async def health() -> dict[str, Any]:
     )
     total_free_slots = FREE_MEETING_SLOTS + remote_free_slots
     total_premium_slots = PREMIUM_MEETING_SLOTS + remote_premium_slots
+    recorder_profiles = profile_status()
+    active_account_ids = sorted({
+        str(entry.get("account_id") or "primary")
+        for entry in remote_worker_cache.values()
+        if _remote_worker_alive(entry)
+    })
     return {
         "ok": True,
         "calendar_connected": TOKEN_FILE.exists(),
@@ -1365,6 +1375,9 @@ async def health() -> dict[str, Any]:
         "remote_free_available_slots": remote_free_available_slots,
         "remote_premium_available_slots": remote_premium_available_slots,
         "autoscaler_enabled": autoscaler_enabled(),
+        "recorder_account_profiles": int(recorder_profiles.get("count") or 0),
+        "recorder_account_ids": recorder_profiles.get("ids") or [],
+        "active_remote_account_ids": active_account_ids,
     }
 
 
