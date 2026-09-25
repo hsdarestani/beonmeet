@@ -267,3 +267,27 @@ source = source.replace(old_start, new_start, 1)
 
 path.write_text(source)
 print("BeOnMeet upstream Google Meet fixes applied")
+
+
+# Add exact recorder capacity endpoint for remote worker agents/autoscaler.
+index_path = Path("upstream/src/app/index.ts")
+index_source = index_path.read_text()
+
+capacity_anchor = """app.get('/health', async (req, res) => {
+  // Simple health check endpoint for Docker
+"""
+capacity_route = """app.get('/capacity', async (req, res) => {
+  const stats = globalJobStore.getStats();
+  return res.status(200).json({ success: true, data: stats });
+});
+
+// CAPACITY_ENDPOINT_PATCH
+app.get('/health', async (req, res) => {
+  // Simple health check endpoint for Docker
+"""
+if "CAPACITY_ENDPOINT_PATCH" not in index_source:
+    if capacity_anchor not in index_source:
+        raise SystemExit("CAPACITY_ENDPOINT_PATCH_MARKER_NOT_FOUND")
+    index_source = index_source.replace(capacity_anchor, capacity_route, 1)
+    index_path.write_text(index_source)
+    print("BeOnMeet recorder capacity endpoint applied")
