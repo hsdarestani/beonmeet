@@ -11,6 +11,7 @@ MEETING_BOT = os.environ.get("MEETING_BOT_URL", "http://meeting-bot:3000").rstri
 WORKER_ID = os.environ.get("WORKER_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:6]}"
 WORKER_POOL = os.environ.get("WORKER_POOL", "free").strip().lower()
 WORKER_SLOTS = max(1, int(os.environ.get("WORKER_SLOTS", "4")))
+RECORDER_ACCOUNT_ID = os.environ.get("RECORDER_ACCOUNT_ID", "primary").strip() or "primary"
 
 HEADERS = {"x-beonmeet-secret": SECRET}
 
@@ -44,6 +45,7 @@ async def heartbeat(client: httpx.AsyncClient, capacity: dict) -> None:
             "active_jobs": int(capacity.get("running_jobs") or 0),
             "max_jobs": int(capacity.get("max_jobs") or WORKER_SLOTS),
             "available_slots": int(capacity.get("available_slots") or 0),
+            "account_id": RECORDER_ACCOUNT_ID,
         },
     )
 
@@ -56,6 +58,7 @@ async def claim(client: httpx.AsyncClient) -> dict | None:
             "worker_id": WORKER_ID,
             "pool": WORKER_POOL,
             "slots": WORKER_SLOTS,
+            "account_id": RECORDER_ACCOUNT_ID,
         },
     )
     response.raise_for_status()
@@ -93,7 +96,7 @@ async def run() -> None:
     async with httpx.AsyncClient(timeout=timeout) as client:
         print(
             f"BeOnMeet worker agent started: id={WORKER_ID} "
-            f"pool={WORKER_POOL} slots={WORKER_SLOTS}",
+            f"pool={WORKER_POOL} slots={WORKER_SLOTS} account={RECORDER_ACCOUNT_ID}",
             flush=True,
         )
         heartbeat_due = 0.0
