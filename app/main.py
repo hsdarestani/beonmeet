@@ -668,6 +668,51 @@ async def queue_loop() -> None:
         await asyncio.sleep(3)
 
 
+async def state_cleanup_loop() -> None:
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            changed = False
+
+            # Telegram request mappings are only needed for nearby meetings and
+            # recording metadata. Keeping 30 days is generous and prevents
+            # unbounded controller-state growth as the user base grows.
+            requests = state.setdefault("requests", {})
+            for meet_url, req in list(requests.items()):
+                raw = str((req or {}).get("requested_at") or "")
+                try:
+                    created = isoparse(raw) if raw else now
+                except Exception:
+                    created = now
+                if now - created > timedelta(days=30):
+                    requests.pop(meet_url, None)
+                    changed = True
+
+            # Finished/stale launch records have no purpose after two days.
+            launched_events = state.setdefault("launched_events", {})
+            for event_id, launched in list(launched_events.items()):
+                raw = str(
+                    launched.get("recording_started_at")
+                    or launched.get("waiting_since")
+                    or launched.get("launched_at")
+                    or ""
+                )
+                try:
+                    created = isoparse(raw) if raw else now
+                except Exception:
+                    created = now
+                if now - created > timedelta(days=2):
+                    launched_events.pop(event_id, None)
+                    changed = True
+
+            if changed:
+                await save_state()
+        except Exception as exc:
+            print("state cleanup loop error:", repr(exc), flush=True)
+
+        await asyncio.sleep(600)
+
+
 async def calendar_loop() -> None:
     while True:
         try:
@@ -1019,6 +1064,7 @@ async def startup() -> None:
     asyncio.create_task(calendar_loop())
     asyncio.create_task(queue_loop())
     asyncio.create_task(worker_health_loop())
+    asyncio.create_task(state_cleanup_loop())
 
 
 @app.get("/api/billing/payment-intent")
@@ -1259,14 +1305,28 @@ async def remote_worker_requeue(
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    remote_free_slots = sum(
+        int(entry.get("slots") or 0)
+        for entry in remote_worker_cache.values()
+        if _remote_worker_alive(entry) and entry.get("pool") == "free"
+    )
+    remote_premium_slots = sum(
+        int(entry.get("slots") or 0)
+        for entry in remote_worker_cache.values()
+        if _remote_worker_alive(entry) and entry.get("pool") == "premium"
+    )
+    total_free_slots = FREE_MEETING_SLOTS + remote_free_slots
+    total_premium_slots = PREMIUM_MEETING_SLOTS + remote_premium_slots
     return {
         "ok": True,
         "calendar_connected": TOKEN_FILE.exists(),
         "bot_email": BOT_EMAIL,
         "admin_recipient_configured": bool(ADMINUSER),
-        "max_concurrent_meetings": FREE_MEETING_SLOTS + PREMIUM_MEETING_SLOTS,
-        "free_meeting_slots": FREE_MEETING_SLOTS,
-        "premium_reserved_slots": PREMIUM_MEETING_SLOTS,
+        "max_concurrent_meetings": total_free_slots + total_premium_slots,
+        "free_meeting_slots": total_free_slots,
+        "premium_reserved_slots": total_premium_slots,
+        "local_free_meeting_slots": FREE_MEETING_SLOTS,
+        "local_premium_reserved_slots": PREMIUM_MEETING_SLOTS,
         "free_worker_endpoints": len(FREE_WORKER_URLS),
         "premium_worker_endpoints": len(PREMIUM_WORKER_URLS),
         "redis_state": STATE_STORE.ping(),
@@ -1277,16 +1337,8 @@ async def health() -> dict[str, Any]:
         "premium_queue": sum(1 for item in state.get("join_queue", []) if bool(item.get("premium"))),
         "transcription_concurrency": int(os.environ.get("TRANSCRIPTION_CONCURRENCY", "1")),
         "remote_workers": sum(1 for entry in remote_worker_cache.values() if _remote_worker_alive(entry)),
-        "remote_free_slots": sum(
-            int(entry.get("slots") or 0)
-            for entry in remote_worker_cache.values()
-            if _remote_worker_alive(entry) and entry.get("pool") == "free"
-        ),
-        "remote_premium_slots": sum(
-            int(entry.get("slots") or 0)
-            for entry in remote_worker_cache.values()
-            if _remote_worker_alive(entry) and entry.get("pool") == "premium"
-        ),
+        "remote_free_slots": remote_free_slots,
+        "remote_premium_slots": remote_premium_slots,
     }
 
 
@@ -1510,6 +1562,12 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
         if free_path:
             free_path.unlink(missing_ok=True)
         raw_path.unlink(missing_ok=True)
+
+        completed_event_id = str(data.get("botId") or data.get("eventId") or "").strip()
+        if completed_event_id:
+            state.setdefault("launched_events", {}).pop(completed_event_id, None)
+            await save_state()
+
         return {"ok": True, "admin_copy": bool(ADMINUSER), "premium": premium_active}
     except Exception as exc:
         await tg_text(chat_id, "⚠️ ضبط تموم شده ولی ارسالش به تلگرام خطا خورد. فایل فعلاً فقط توی حافظه موقت نگه داشته شده تا بتونم دوباره بفرستم.")
