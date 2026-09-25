@@ -58,6 +58,16 @@ TELEGRAM_API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.or
 MEETING_BOT_URL = os.environ.get("MEETING_BOT_URL", "http://meeting-bot:3000").rstrip("/")
 FREE_MEETING_BOT_URL = os.environ.get("FREE_MEETING_BOT_URL", MEETING_BOT_URL).rstrip("/")
 PREMIUM_MEETING_BOT_URL = os.environ.get("PREMIUM_MEETING_BOT_URL", FREE_MEETING_BOT_URL).rstrip("/")
+
+
+def _worker_urls(env_name: str, fallback: str) -> list[str]:
+    raw = os.environ.get(env_name, "").strip()
+    values = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+    return values or [fallback]
+
+
+FREE_WORKER_URLS = _worker_urls("FREE_WORKER_URLS", FREE_MEETING_BOT_URL)
+PREMIUM_WORKER_URLS = _worker_urls("PREMIUM_WORKER_URLS", PREMIUM_MEETING_BOT_URL)
 FREE_MEETING_SLOTS = int(os.environ.get("FREE_MEETING_SLOTS", "5"))
 PREMIUM_MEETING_SLOTS = int(os.environ.get("PREMIUM_MEETING_SLOTS", "3"))
 INTERNAL_SECRET = os.environ["INTERNAL_SECRET"]
@@ -443,11 +453,14 @@ async def _dispatch_meeting(
     # never consume the reserved Premium pool.
     targets: list[tuple[str, str]] = []
     if premium:
-        targets.append(("premium", PREMIUM_MEETING_BOT_URL))
-        if FREE_MEETING_BOT_URL != PREMIUM_MEETING_BOT_URL:
-            targets.append(("free-overflow", FREE_MEETING_BOT_URL))
+        for idx, url in enumerate(PREMIUM_WORKER_URLS, 1):
+            targets.append((f"premium-{idx}", url))
+        for idx, url in enumerate(FREE_WORKER_URLS, 1):
+            if url not in PREMIUM_WORKER_URLS:
+                targets.append((f"free-overflow-{idx}", url))
     else:
-        targets.append(("free", FREE_MEETING_BOT_URL))
+        for idx, url in enumerate(FREE_WORKER_URLS, 1):
+            targets.append((f"free-{idx}", url))
 
     saw_busy = False
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -501,7 +514,7 @@ async def launch_meeting(
     )
     if launched:
         if notify_start:
-            if premium and pool_name == "premium":
+            if premium and pool_name.startswith("premium-"):
                 await tg_text(
                     chat_id,
                     f"⚡ ورکر اختصاصی پلن ویژه رزرو شد. دارم وارد جلسه می‌شم…\n{meet_url}"
@@ -1024,6 +1037,9 @@ async def health() -> dict[str, Any]:
         "max_concurrent_meetings": FREE_MEETING_SLOTS + PREMIUM_MEETING_SLOTS,
         "free_meeting_slots": FREE_MEETING_SLOTS,
         "premium_reserved_slots": PREMIUM_MEETING_SLOTS,
+        "free_worker_endpoints": len(FREE_WORKER_URLS),
+        "premium_worker_endpoints": len(PREMIUM_WORKER_URLS),
+        "redis_state": STATE_STORE.ping(),
         "free_queue": sum(1 for item in state.get("join_queue", []) if not bool(item.get("premium"))),
         "premium_queue": sum(1 for item in state.get("join_queue", []) if bool(item.get("premium"))),
         "transcription_concurrency": int(os.environ.get("TRANSCRIPTION_CONCURRENCY", "1")),
