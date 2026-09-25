@@ -1,0 +1,4 @@
+Production readiness smoke trigger.
+
+This file exists only to provide an auditable commit that runs the one-time
+production readiness workflow after the production deploy completes.
