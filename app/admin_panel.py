@@ -756,6 +756,9 @@ async def system_page(request: Request):
     healthy_premium = int(health.get("healthy_premium_workers") or 0)
     free_queue = int(health.get("free_queue") or 0)
     premium_queue = int(health.get("premium_queue") or 0)
+    remote_workers = int(health.get("remote_workers") or 0)
+    remote_free_slots = int(health.get("remote_free_slots") or 0)
+    remote_premium_slots = int(health.get("remote_premium_slots") or 0)
     db_backend = _esc(health.get("database_backend") or "نامشخص")
     redis_ok = bool(health.get("redis_state"))
 
@@ -783,7 +786,8 @@ async def system_page(request: Request):
         <div class="section-head"><h2>معماری فعلی</h2><span class="pill">Scale ready</span></div>
         <div class="feature"><span class="dot"></span><div><b>Controller</b><div class="muted">Telegram، Calendar، Queue، پرداخت و مدیریت</div></div></div>
         <div class="feature"><span class="dot"></span><div><b>Free Pool</b><div class="muted">{free_workers} ورکر مستقل با {free_slots} اسلات</div></div></div>
-        <div class="feature"><span class="dot"></span><div><b>Premium Pool</b><div class="muted">{premium_workers} ورکر مستقل با {premium_slots} اسلات رزرو</div></div></div>
+        <div class="feature"><span class="dot"></span><div><b>Premium Pool</b><div class="muted">{premium_workers} ورکر محلی با {premium_slots} اسلات رزرو</div></div></div>
+        <div class="feature"><span class="dot"></span><div><b>Remote Workers</b><div class="muted">{remote_workers} آنلاین · {remote_free_slots} عمومی · {remote_premium_slots} ویژه</div></div></div>
         <div class="feature"><span class="dot"></span><div><b>Transcription</b><div class="muted">{health.get('transcription_concurrency', 1)} پردازش همزمان برای محافظت از ضبط‌ها</div></div></div>
       </div>
     </div>
