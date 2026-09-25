@@ -40,5 +40,5 @@ chmod 777 /dev/shm/beonmeet
 chown -R 1001:1001 chrome-profile
 rm -f chrome-profile/SingletonLock chrome-profile/SingletonSocket chrome-profile/SingletonCookie || true
 
-docker compose -f worker/docker-compose.yml up -d --build --remove-orphans
-docker compose -f worker/docker-compose.yml ps
+docker compose --env-file worker.env -f worker/docker-compose.yml up -d --build --remove-orphans
+docker compose --env-file worker.env -f worker/docker-compose.yml ps
