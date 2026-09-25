@@ -20,6 +20,8 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
+from state_store import DurableStateStore
+
 from admin_panel import (
     PLANS,
     activate_subscription,
@@ -43,6 +45,7 @@ DATA_DIR = Path("/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "state.json"
 TOKEN_FILE = DATA_DIR / "google-token.json"
+STATE_STORE = DurableStateStore(STATE_FILE)
 
 BOT_EMAIL = os.environ.get("BOT_EMAIL", "meetrecorderbot@gmail.com")
 DOMAIN = os.environ.get("DOMAIN", "beonmeet.smarbiz.sbs")
@@ -85,22 +88,19 @@ state: dict[str, Any] = {
 
 def load_state() -> None:
     global state
-    if STATE_FILE.exists():
-        try:
-            loaded = json.loads(STATE_FILE.read_text())
-            if isinstance(loaded, dict):
-                state.update(loaded)
-                state.setdefault("join_queue", [])
-                state.setdefault("requests", {})
-                state.setdefault("launched_events", {})
-        except Exception:
-            pass
+    loaded, source = STATE_STORE.load()
+    if isinstance(loaded, dict):
+        state.update(loaded)
+    state.setdefault("join_queue", [])
+    state.setdefault("requests", {})
+    state.setdefault("launched_events", {})
+    state.setdefault("telegram_offset", 0)
+    state.setdefault("oauth_state", None)
+    print(f"controller state loaded from {source}", flush=True)
 
 
 def save_state_sync() -> None:
-    tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2))
-    tmp.replace(STATE_FILE)
+    STATE_STORE.save(state)
 
 
 async def save_state() -> None:
