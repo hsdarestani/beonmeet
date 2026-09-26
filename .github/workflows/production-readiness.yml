@@ -84,7 +84,13 @@ jobs:
         run: |
           set -euo pipefail
           export SSHPASS="$PASS"
-          sshpass -e ssh -o StrictHostKeyChecking=no root@"$HOST"             'cd /opt/beonmeet && docker compose exec -T -e AUTOSCALER_SMOKE_TIMEOUT_SECONDS=900 controller python /app/autoscaler_smoke.py'
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=20 \
+            -o ServerAliveCountMax=60 \
+            -o TCPKeepAlive=yes \
+            root@"$HOST" \
+            'cd /opt/beonmeet && docker compose exec -T -e AUTOSCALER_SMOKE_TIMEOUT_SECONDS=900 controller python /app/autoscaler_smoke.py'
 
       - name: Final production health
         run: |
