@@ -1095,7 +1095,7 @@ async def send_recording_to_recipients(
         # container duration. The output bitrate below is fixed, so a four-minute
         # segment stays comfortably below Telegram's cloud Bot API upload limit
         # without needing input duration metadata.
-        target_seconds = 240
+        target_seconds = 300
 
     part_pattern = str(path.parent / f"{path.stem}_part_%03d.mp4")
     for stale_part in path.parent.glob(f"{path.stem}_part_*.mp4"):
@@ -1758,21 +1758,25 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
         free_path: Path | None = None
 
         if not premium_active:
-            free_path = raw_path.with_name(f"{raw_path.stem}_standard.mp4")
-            subprocess.run(
-                [
-                    "ffmpeg", "-y", "-i", str(raw_path),
-                    "-vf", "scale='min(1280,iw)':-2",
-                    "-c:v", "libx264", "-preset", "veryfast", "-b:v", "1200k",
-                    "-c:a", "aac", "-b:a", "96k",
-                    str(free_path),
-                ],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            delivery_path = free_path
-            delivery_filename = f"{Path(filename).stem}.mp4"
+            # Large recordings are already transcoded into Telegram-safe MP4 parts
+            # by send_recording_to_recipients(). Avoid a wasteful full-file encode
+            # followed by a second segmented encode.
+            if raw_path.stat().st_size <= 49 * 1024 * 1024:
+                free_path = raw_path.with_name(f"{raw_path.stem}_standard.mp4")
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-i", str(raw_path),
+                        "-vf", "scale='min(1280,iw)':-2",
+                        "-c:v", "libx264", "-preset", "veryfast", "-b:v", "1200k",
+                        "-c:a", "aac", "-b:a", "96k",
+                        str(free_path),
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                delivery_path = free_path
+                delivery_filename = f"{Path(filename).stem}.mp4"
 
         await tg_text(chat_id, t(chat_id, "recording_finished"))
         await send_recording_to_recipients(recipients, delivery_path, delivery_filename)
