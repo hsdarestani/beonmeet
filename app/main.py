@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import uuid
@@ -15,7 +16,7 @@ from urllib.parse import quote
 import httpx
 from dateutil.parser import isoparse
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -86,6 +87,9 @@ FREE_MEETING_SLOTS = int(os.environ.get("FREE_MEETING_SLOTS", "5"))
 PREMIUM_MEETING_SLOTS = int(os.environ.get("PREMIUM_MEETING_SLOTS", "3"))
 INTERNAL_SECRET = os.environ["INTERNAL_SECRET"]
 RECORDING_ROOT = Path(os.environ.get("RECORDING_TMP_DIR", "/recordings")).resolve()
+DOWNLOAD_ROOT = DATA_DIR / "recording-downloads"
+DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_TTL_HOURS = max(1, int(os.environ.get("DOWNLOAD_TTL_HOURS", "24")))
 BOT_DISPLAY_NAME = os.environ.get("BOT_DISPLAY_NAME", "BeOnMeet Recorder")
 CALENDAR_POLL_SECONDS = int(os.environ.get("CALENDAR_POLL_SECONDS", "30"))
 PAYMENT_STATUS_URL = os.environ.get(
@@ -114,6 +118,7 @@ state: dict[str, Any] = {
     "oauth_state": None,
     "user_languages": {},
     "pending_deliveries": {},
+    "recording_downloads": {},
 }
 
 
@@ -130,6 +135,7 @@ def load_state() -> None:
     state.setdefault("oauth_state", None)
     state.setdefault("user_languages", {})
     state.setdefault("pending_deliveries", {})
+    state.setdefault("recording_downloads", {})
     print(f"controller state loaded from {source}", flush=True)
 
 
@@ -741,6 +747,23 @@ async def state_cleanup_loop() -> None:
                     requests.pop(meet_url, None)
                     changed = True
 
+            downloads = state.setdefault("recording_downloads", {})
+            for token, item in list(downloads.items()):
+                expires_raw = str((item or {}).get("expires_at") or "")
+                try:
+                    expires_at = isoparse(expires_raw) if expires_raw else now
+                except Exception:
+                    expires_at = now
+                if now >= expires_at:
+                    file_path = Path(str((item or {}).get("file_path") or ""))
+                    try:
+                        file_path.relative_to(DOWNLOAD_ROOT)
+                        file_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    downloads.pop(token, None)
+                    changed = True
+
             # Finished/stale launch records have no purpose after two days.
             launched_events = state.setdefault("launched_events", {})
             for event_id, launched in list(launched_events.items()):
@@ -1056,6 +1079,22 @@ async def telegram_loop() -> None:
             await asyncio.sleep(5)
 
 
+async def create_recording_download(path: Path, filename: str) -> str:
+    token = secrets.token_urlsafe(32)
+    suffix = path.suffix.lower() if path.suffix else ".webm"
+    stored_path = (DOWNLOAD_ROOT / f"{token}{suffix}").resolve()
+    stored_path.relative_to(DOWNLOAD_ROOT)
+    await asyncio.to_thread(shutil.copy2, path, stored_path)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=DOWNLOAD_TTL_HOURS)
+    state.setdefault("recording_downloads", {})[token] = {
+        "file_path": str(stored_path),
+        "filename": filename,
+        "expires_at": expires_at.isoformat(),
+    }
+    await save_state()
+    return f"https://{DOMAIN}/download/{token}"
+
+
 async def send_recording_to_recipients(
     recipients: list[dict[str, str]],
     path: Path,
@@ -1078,59 +1117,20 @@ async def send_recording_to_recipients(
             await send_one_file(target, path, filename, target["caption"], mime)
         return
 
-    # Cloud Bot API has a small upload limit. Create playable compressed parts in RAM once,
-    # then deliver every part to the requester and the admin.
-    probe = await asyncio.to_thread(
-        subprocess.run,
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    raw_duration = (probe.stdout or "").strip()
-    try:
-        duration = float(raw_duration)
-        if not duration > 0:
-            raise ValueError("non-positive duration")
-        target_seconds = max(90, min(300, int(duration * (42 * 1024 * 1024) / size)))
-    except (TypeError, ValueError):
-        # WebM files produced by MediaRecorder can legitimately report N/A for
-        # container duration. The output bitrate below is fixed, so a four-minute
-        # segment stays comfortably below Telegram's cloud Bot API upload limit
-        # without needing input duration metadata.
-        target_seconds = 300
-
-    part_pattern = str(path.parent / f"{path.stem}_part_%03d.mp4")
-    for stale_part in path.parent.glob(f"{path.stem}_part_*.mp4"):
-        stale_part.unlink(missing_ok=True)
-    await asyncio.to_thread(
-        subprocess.run,
-        [
-            "ffmpeg", "-y", "-i", str(path),
-            "-vf", "scale=min(1280\\,iw):-2",
-            "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "600k",
-            "-c:a", "aac", "-b:a", "64k",
-            "-f", "segment", "-segment_time", str(target_seconds),
-            "-reset_timestamps", "1", part_pattern,
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    parts = sorted(path.parent.glob(f"{path.stem}_part_*.mp4"))
+    # The official Telegram Bot API caps uploaded files at 50 MB.
+    # For larger recordings, avoid chat spam and provide one expiring full-file download.
+    download_url = await create_recording_download(path, filename)
+    expires_hours = DOWNLOAD_TTL_HOURS
     for target in recipients:
         await tg_text(
             target["chat_id"],
-            t(target["chat_id"], "large_video", count=len(parts)),
+            t(
+                target["chat_id"],
+                "large_video_download",
+                url=download_url,
+                hours=expires_hours,
+            ),
         )
-        for idx, part in enumerate(parts, 1):
-            caption = (
-                f"{target['caption']}\n\n"
-                + t(target["chat_id"], "video_part", index=idx, count=len(parts))
-            )
-            await send_one_file(target, part, part.name, caption, "video/mp4")
-    for part in parts:
-        part.unlink(missing_ok=True)
 
 
 def _normalize_transcript_text(value: str) -> str:
@@ -1577,6 +1577,33 @@ async def remote_worker_requeue(
     return {"ok": True}
 
 
+@app.get("/download/{token}")
+async def download_recording(token: str):
+    item = state.setdefault("recording_downloads", {}).get(token)
+    if not item:
+        raise HTTPException(status_code=404, detail="Download not found or expired")
+    expires_raw = str(item.get("expires_at") or "")
+    try:
+        expires_at = isoparse(expires_raw)
+    except Exception:
+        expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    if datetime.now(timezone.utc) >= expires_at:
+        raise HTTPException(status_code=410, detail="Download expired")
+    file_path = Path(str(item.get("file_path") or "")).resolve()
+    try:
+        file_path.relative_to(DOWNLOAD_ROOT)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Download not found")
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Download file missing")
+    filename = str(item.get("filename") or file_path.name)
+    return FileResponse(
+        path=str(file_path),
+        filename=filename,
+        media_type="application/octet-stream",
+    )
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     remote_free_slots = sum(
@@ -1797,6 +1824,20 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                 pending_state["video_delivered_at"] = datetime.now(timezone.utc).isoformat()
                 pending_state["updated_at"] = datetime.now(timezone.utc).isoformat()
                 await save_state()
+        elif (
+            pending_state is not None
+            and event_id == "manual-99a88a85-53f5-467b-908c-25b5c98aa78f"
+            and not pending_state.get("full_file_link_sent")
+            and raw_path.exists()
+        ):
+            download_url = await create_recording_download(raw_path, filename)
+            await tg_text(
+                chat_id,
+                t(chat_id, "large_video_download", url=download_url, hours=DOWNLOAD_TTL_HOURS),
+            )
+            pending_state["full_file_link_sent"] = True
+            pending_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+            await save_state()
 
         await asyncio.to_thread(
             record_recording,
