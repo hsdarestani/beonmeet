@@ -192,6 +192,12 @@ jobs:
             chown -R 1001:1001 /opt/beonmeet/recorder-accounts
             chmod 700 /opt/beonmeet/recorder-accounts
             chmod 700 /opt/beonmeet/recorder-accounts/recorder136 /opt/beonmeet/recorder-accounts/recorder802
+            # Both secondary recorder profiles have completed their one-time Google sign-in.
+            # recorder136 -> meetrecorderbot136@gmail.com
+            # recorder802 -> ceramara67@gmail.com
+            touch /opt/beonmeet/recorder-accounts/recorder136/.beonmeet-ready
+            touch /opt/beonmeet/recorder-accounts/recorder802/.beonmeet-ready
+            chown 1001:1001 /opt/beonmeet/recorder-accounts/recorder136/.beonmeet-ready /opt/beonmeet/recorder-accounts/recorder802/.beonmeet-ready
             mkdir -p /dev/shm/beonmeet
             chmod 777 /dev/shm/beonmeet
             if ! docker compose up -d --build --remove-orphans; then
