@@ -16,6 +16,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate Python before production
+        run: |
+          python3 -m py_compile app/main.py app/i18n.py app/hetzner_autoscaler.py app/autoscaler_smoke.py
+
       - name: Copy application files
         uses: appleboy/scp-action@v0.1.7
         with:
