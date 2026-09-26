@@ -19,6 +19,7 @@ jobs:
       - name: Validate Python before production
         run: |
           python3 -m py_compile app/main.py app/i18n.py app/hetzner_autoscaler.py app/autoscaler_smoke.py
+          python3 tests/cloud_init_render_test.py
 
       - name: Copy application files
         uses: appleboy/scp-action@v0.1.7
@@ -42,7 +43,7 @@ jobs:
           host: ${{ secrets.HOST }}
           username: root
           password: ${{ secrets.PASS }}
-          command_timeout: 30m
+          command_timeout: 2h15m
           envs: GOOGLE_CLIENT_ID,GOOGLE_CLIENT_SECRET,TELEGRAM_BOT_TOKEN,ADMINUSER,HETZNER_API_TOKEN
           script: |
             set -euo pipefail
@@ -57,6 +58,45 @@ jobs:
             fi
 
             cd /opt/beonmeet
+
+            active_recordings() {
+              docker compose exec -T controller python - <<'PY'
+import json
+import urllib.request
+
+urls = [
+    "http://meeting-bot-free1:3000/capacity",
+    "http://meeting-bot-free2:3000/capacity",
+    "http://meeting-bot-premium1:3000/capacity",
+]
+total = 0
+for url in urls:
+    payload = json.loads(urllib.request.urlopen(url, timeout=5).read().decode())
+    total += int(payload["data"].get("runningJobs") or 0)
+print(total)
+PY
+            }
+
+            ACTIVE_RECORDINGS="unknown"
+            for _ in $(seq 1 360); do
+              ACTIVE_RECORDINGS="$(active_recordings 2>/dev/null || true)"
+              if [[ "$ACTIVE_RECORDINGS" =~ ^[0-9]+$ ]]; then
+                if [ "$ACTIVE_RECORDINGS" -eq 0 ]; then
+                  echo "No active recordings; production deploy may proceed"
+                  break
+                fi
+                echo "Active recordings detected: $ACTIVE_RECORDINGS. Holding deploy without restarting production."
+              else
+                echo "Unable to verify active recorder count; refusing unsafe deploy"
+                exit 1
+              fi
+              sleep 20
+            done
+
+            if [ "$ACTIVE_RECORDINGS" != "0" ]; then
+              echo "Active recordings did not drain within the safe deploy window"
+              exit 1
+            fi
 
             echo "Server resources:"
             free -h || true
