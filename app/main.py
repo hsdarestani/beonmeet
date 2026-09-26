@@ -104,6 +104,7 @@ queue_mutation_lock = asyncio.Lock()
 worker_health_cache: dict[str, bool] = {}
 remote_worker_cache: dict[str, dict[str, Any]] = {}
 _whisper_model = None
+active_delivery_jobs = 0
 state: dict[str, Any] = {
     "telegram_offset": 0,
     "requests": {},
@@ -112,6 +113,7 @@ state: dict[str, Any] = {
     "remote_claims": {},
     "oauth_state": None,
     "user_languages": {},
+    "pending_deliveries": {},
 }
 
 
@@ -127,6 +129,7 @@ def load_state() -> None:
     state.setdefault("telegram_offset", 0)
     state.setdefault("oauth_state", None)
     state.setdefault("user_languages", {})
+    state.setdefault("pending_deliveries", {})
     print(f"controller state loaded from {source}", flush=True)
 
 
@@ -1294,6 +1297,7 @@ async def startup() -> None:
     asyncio.create_task(queue_loop())
     asyncio.create_task(worker_health_loop())
     asyncio.create_task(state_cleanup_loop())
+    asyncio.create_task(delivery_recovery_loop())
     asyncio.create_task(autoscale_loop())
 
 
@@ -1603,6 +1607,9 @@ async def health() -> dict[str, Any]:
         "free_queue": sum(1 for item in state.get("join_queue", []) if not bool(item.get("premium"))),
         "premium_queue": sum(1 for item in state.get("join_queue", []) if bool(item.get("premium"))),
         "transcription_concurrency": int(os.environ.get("TRANSCRIPTION_CONCURRENCY", "1")),
+        "active_delivery_jobs": int(active_delivery_jobs),
+        "pending_delivery_jobs": len(state.get("pending_deliveries", {})),
+        "delivery_pipeline_busy": bool(active_delivery_jobs or state.get("pending_deliveries")),
         "remote_workers": sum(1 for entry in remote_worker_cache.values() if _remote_worker_alive(entry)),
         "remote_free_slots": remote_free_slots,
         "remote_premium_slots": remote_premium_slots,
@@ -1701,7 +1708,7 @@ async def recording_started(
     return {"ok": True}
 
 
-async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, Any]:
+async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict[str, Any]:
     try:
         raw_path.relative_to(RECORDING_ROOT)
     except ValueError:
@@ -1846,8 +1853,162 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
 
         return {"ok": True, "admin_copy": bool(ADMINUSER), "premium": premium_active}
     except Exception as exc:
-        await tg_text(chat_id, t(chat_id, "delivery_error"))
+        if not bool(data.get("_silent_retry")):
+            await tg_text(chat_id, t(chat_id, "delivery_error"))
         raise HTTPException(status_code=502, detail=str(exc))
+
+
+async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, Any]:
+    global active_delivery_jobs
+
+    chat_id = str(data.get("userId") or "").strip()
+    event_id = str(data.get("botId") or data.get("eventId") or "").strip()
+    pending_id = event_id or f"{chat_id}:{raw_path.name}"
+    pending = state.setdefault("pending_deliveries", {}).get(pending_id) or {}
+    attempts = int(pending.get("attempts") or 0) + 1
+    state["pending_deliveries"][pending_id] = {
+        "event_id": event_id,
+        "chat_id": chat_id,
+        "file_path": str(raw_path),
+        "filename": str(data.get("filename") or raw_path.name),
+        "meeting_link": str(data.get("meetingLink") or ""),
+        "duration": int(data.get("duration") or 0),
+        "attempts": attempts,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "last_error": "",
+    }
+    if event_id:
+        launched = state.setdefault("launched_events", {}).setdefault(event_id, {})
+        launched["status"] = "delivering"
+        launched["delivery_started_at"] = datetime.now(timezone.utc).isoformat()
+    await save_state()
+
+    active_delivery_jobs += 1
+    try:
+        result = await _process_recording_inner(data, raw_path)
+        state.setdefault("pending_deliveries", {}).pop(pending_id, None)
+        await save_state()
+        return result
+    except Exception as exc:
+        current = state.setdefault("pending_deliveries", {}).get(pending_id)
+        if current is not None:
+            current["last_error"] = repr(exc)[:1000]
+            current["updated_at"] = datetime.now(timezone.utc).isoformat()
+            await save_state()
+        raise
+    finally:
+        active_delivery_jobs = max(0, active_delivery_jobs - 1)
+
+
+def _legacy_orphan_candidate() -> tuple[str, dict[str, Any], Path] | None:
+    if state.get("pending_deliveries"):
+        return None
+
+    launched = [
+        (str(event_id), item)
+        for event_id, item in state.get("launched_events", {}).items()
+        if str((item or {}).get("status") or "") in {"recording", "delivering"}
+        and str((item or {}).get("chat_id") or "").strip()
+    ]
+    if len(launched) != 1:
+        return None
+
+    cutoff = datetime.now(timezone.utc).timestamp() - 6 * 3600
+    candidates = []
+    for path in RECORDING_ROOT.glob("*"):
+        if not path.is_file():
+            continue
+        name = path.name
+        if path.suffix.lower() not in {".webm", ".mp4"}:
+            continue
+        if "_standard" in name or "_part_" in name or name.endswith("_transcript.mp4"):
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if stat.st_size < 1024 * 1024 or stat.st_mtime < cutoff:
+            continue
+        candidates.append(path)
+
+    if len(candidates) != 1:
+        return None
+    event_id, item = launched[0]
+    return event_id, item, candidates[0]
+
+
+async def delivery_recovery_loop() -> None:
+    await asyncio.sleep(15)
+    while True:
+        try:
+            if active_delivery_jobs:
+                await asyncio.sleep(15)
+                continue
+
+            pending_items = list(state.setdefault("pending_deliveries", {}).items())
+            if not pending_items:
+                legacy = _legacy_orphan_candidate()
+                if legacy:
+                    event_id, launched, raw_path = legacy
+                    recovery_data = {
+                        "userId": str(launched.get("chat_id") or ""),
+                        "eventId": event_id,
+                        "botId": event_id,
+                        "meetingLink": str(launched.get("meet_url") or ""),
+                        "filename": raw_path.name,
+                        "duration": 0,
+                        "_silent_retry": True,
+                    }
+                    print(
+                        f"recovering legacy orphan recording event={event_id} file={raw_path.name}",
+                        flush=True,
+                    )
+                    try:
+                        await _process_recording(recovery_data, raw_path)
+                    except Exception as exc:
+                        print("legacy delivery recovery error:", repr(exc), flush=True)
+                await asyncio.sleep(30)
+                continue
+
+            for pending_id, pending in pending_items:
+                if active_delivery_jobs:
+                    break
+                attempts = int((pending or {}).get("attempts") or 0)
+                if attempts >= 4:
+                    continue
+                raw_path = Path(str((pending or {}).get("file_path") or "")).resolve()
+                try:
+                    raw_path.relative_to(RECORDING_ROOT)
+                except ValueError:
+                    continue
+                if not raw_path.exists() or not raw_path.is_file():
+                    continue
+                updated_raw = str((pending or {}).get("updated_at") or "")
+                try:
+                    updated = isoparse(updated_raw) if updated_raw else datetime.now(timezone.utc) - timedelta(minutes=10)
+                except Exception:
+                    updated = datetime.now(timezone.utc) - timedelta(minutes=10)
+                if datetime.now(timezone.utc) - updated < timedelta(minutes=2):
+                    continue
+
+                recovery_data = {
+                    "userId": str((pending or {}).get("chat_id") or ""),
+                    "eventId": str((pending or {}).get("event_id") or ""),
+                    "botId": str((pending or {}).get("event_id") or ""),
+                    "meetingLink": str((pending or {}).get("meeting_link") or ""),
+                    "filename": str((pending or {}).get("filename") or raw_path.name),
+                    "duration": int((pending or {}).get("duration") or 0),
+                    "_silent_retry": True,
+                }
+                print(f"retrying pending delivery {pending_id} attempt={attempts + 1}", flush=True)
+                try:
+                    await _process_recording(recovery_data, raw_path)
+                except Exception as exc:
+                    print("pending delivery recovery error:", repr(exc), flush=True)
+        except Exception as exc:
+            print("delivery recovery loop error:", repr(exc), flush=True)
+
+        await asyncio.sleep(30)
 
 
 @app.post("/internal/recording-ready")
