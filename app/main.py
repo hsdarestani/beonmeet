@@ -438,11 +438,11 @@ def fmt_event_time(event: dict[str, Any]) -> str:
     start = event_start(event)
     end = event_end(event)
     if not start:
-        return "زمان نامشخص"
+        return "—"
     tz_name = _event_timezone_name(event, "start")
     tz_label = f" ({tz_name})" if tz_name else ""
     if end:
-        return f"{start.strftime('%Y-%m-%d %H:%M')} تا {end.strftime('%H:%M')}{tz_label}"
+        return f"{start.strftime('%Y-%m-%d %H:%M')} – {end.strftime('%H:%M')}{tz_label}"
     return f"{start.strftime('%Y-%m-%d %H:%M')}{tz_label}"
 
 
@@ -494,18 +494,9 @@ async def enqueue_meeting(
     chat_id = str(req["chat_id"])
     position = _queue_position(event_id, premium)
     if premium:
-        await tg_text(
-            chat_id,
-            "⚡ ظرفیت اختصاصی پلن ویژه و ظرفیت اضافه فعلاً همزمان پر شدن. "
-            f"درخواستت با اولویت ویژه ثبت شد و نفر {position} صف ویژه‌ای. "
-            "به محض آزاد شدن اولین ورکر، مستقیم وارد می‌شم."
-        )
+        await tg_text(chat_id, t(chat_id, "queue_premium", position=position))
     else:
-        await tg_text(
-            chat_id,
-            f"⏳ رکوردرهای رایگان الان پرن. درخواستت تو صف ثبت شد و نفر {position} صفی. "
-            "به محض آزاد شدن ظرفیت، خودکار وارد جلسه می‌شم."
-        )
+        await tg_text(chat_id, t(chat_id, "queue_free", position=position))
 
 
 async def _dispatch_meeting(
@@ -594,20 +585,11 @@ async def launch_meeting(
     if launched:
         if notify_start:
             if premium and pool_name.startswith("premium-"):
-                await tg_text(
-                    chat_id,
-                    f"⚡ ورکر اختصاصی پلن ویژه رزرو شد. دارم وارد جلسه می‌شم…\n{meet_url}"
-                )
+                await tg_text(chat_id, t(chat_id, "launch_premium", meet_url=meet_url))
             elif premium:
-                await tg_text(
-                    chat_id,
-                    f"⚡ با اولویت ویژه از ظرفیت آزاد وارد صف اجرا شدم. دارم وارد جلسه می‌شم…\n{meet_url}"
-                )
+                await tg_text(chat_id, t(chat_id, "launch_priority", meet_url=meet_url))
             else:
-                await tg_text(
-                    chat_id,
-                    f"⏳ درخواست ورود به جلسه ارسال شد. دارم وارد می‌شم…\n{meet_url}"
-                )
+                await tg_text(chat_id, t(chat_id, "launch_free", meet_url=meet_url))
         return True
 
     if busy and queue_if_busy:
@@ -615,10 +597,7 @@ async def launch_meeting(
         return False
 
     if not busy and notify_start:
-        await tg_text(
-            chat_id,
-            f"⚠️ فعلاً نتونستم درخواست ورود رو به رکوردر برسونم. خودم دوباره امتحان می‌کنم.\n{meet_url}"
-        )
+        await tg_text(chat_id, t(chat_id, "dispatch_retry", meet_url=meet_url))
     return False
 
 
@@ -701,10 +680,7 @@ async def queue_loop() -> None:
                             if str(q.get("event_id") or "") != event_id
                         ]
                         await save_state()
-                        await tg_text(
-                            chat_id,
-                            "⌛ نوبت رکوردر قبل از پایان جلسه آزاد نشد و این درخواست از صف خارج شد."
-                        )
+                        await tg_text(chat_id, t(chat_id, "queue_expired"))
                         continue
 
                     # Serialize local queue dispatch with remote worker claims.
@@ -725,15 +701,9 @@ async def queue_loop() -> None:
 
                     if launched:
                         if premium:
-                            await tg_text(
-                                chat_id,
-                                f"⚡ ظرفیت ویژه آزاد شد و الان دارم وارد جلسه می‌شم…\n{meet_url}"
-                            )
+                            await tg_text(chat_id, t(chat_id, "premium_ready", meet_url=meet_url))
                         else:
-                            await tg_text(
-                                chat_id,
-                                f"✅ نوبتت از صف رسید. الان دارم وارد جلسه می‌شم…\n{meet_url}"
-                            )
+                            await tg_text(chat_id, t(chat_id, "queue_ready", meet_url=meet_url))
                     elif not busy:
                         # Transient dispatch/network error. Keep the queue item and retry.
                         continue
