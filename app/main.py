@@ -1785,8 +1785,18 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                 delivery_path = free_path
                 delivery_filename = f"{Path(filename).stem}.mp4"
 
-        await tg_text(chat_id, t(chat_id, "recording_finished"))
-        await send_recording_to_recipients(recipients, delivery_path, delivery_filename)
+        pending_id = str(data.get("_pending_id") or "")
+        pending_state = state.setdefault("pending_deliveries", {}).get(pending_id) if pending_id else None
+        video_already_delivered = bool((pending_state or {}).get("video_delivered"))
+
+        if not video_already_delivered:
+            await tg_text(chat_id, t(chat_id, "recording_finished"))
+            await send_recording_to_recipients(recipients, delivery_path, delivery_filename)
+            if pending_state is not None:
+                pending_state["video_delivered"] = True
+                pending_state["video_delivered_at"] = datetime.now(timezone.utc).isoformat()
+                pending_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+                await save_state()
 
         await asyncio.to_thread(
             record_recording,
@@ -1892,6 +1902,7 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
     pending = state.setdefault("pending_deliveries", {}).get(pending_id) or {}
     attempts = int(pending.get("attempts") or 0) + 1
     state["pending_deliveries"][pending_id] = {
+        **pending,
         "event_id": event_id,
         "chat_id": chat_id,
         "file_path": str(raw_path),
@@ -1902,6 +1913,14 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "last_error": "",
     }
+    # One-time recovery guard for the retained session that was already fully
+    # delivered once before the old recovery loop retried downstream work.
+    if (
+        event_id == "manual-99a88a85-53f5-467b-908c-25b5c98aa78f"
+        and attempts >= 2
+        and "video_delivered" not in state["pending_deliveries"][pending_id]
+    ):
+        state["pending_deliveries"][pending_id]["video_delivered"] = True
     if event_id:
         launched = state.setdefault("launched_events", {}).setdefault(event_id, {})
         launched["status"] = "delivering"
@@ -1910,6 +1929,7 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
 
     active_delivery_jobs += 1
     try:
+        data = {**data, "_pending_id": pending_id}
         result = await _process_recording_inner(data, raw_path)
         state.setdefault("pending_deliveries", {}).pop(pending_id, None)
         await save_state()
