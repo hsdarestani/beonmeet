@@ -86,7 +86,11 @@ def available_account_profiles() -> dict[str, Path]:
         profiles["primary"] = PROFILE_DIR
     if ACCOUNT_PROFILE_ROOT.exists():
         for path in sorted(ACCOUNT_PROFILE_ROOT.iterdir()):
-            if _looks_like_chrome_profile(path):
+            # Account-pool profiles are only eligible after the operator has
+            # completed the one-time Google sign-in and explicitly activated them.
+            # This prevents a freshly-created but anonymous Chrome profile from
+            # being assigned to an autoscaled recorder worker.
+            if (path / ".beonmeet-ready").exists() and _looks_like_chrome_profile(path):
                 profiles[path.name] = path
     return profiles
 
