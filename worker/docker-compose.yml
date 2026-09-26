@@ -1,8 +1,6 @@
 services:
   agent:
-    build:
-      context: ..
-      dockerfile: worker/Dockerfile
+    image: beonmeet-worker-agent:latest
     restart: unless-stopped
     env_file: ../worker.env
     environment:
@@ -21,11 +19,8 @@ services:
       - "6379"
 
   meeting-bot:
-    image: beonmeet-remote-meeting-bot:latest
+    image: beonmeet-meeting-bot:latest
     platform: linux/amd64
-    build:
-      context: ../upstream
-      dockerfile: Dockerfile.production
     restart: unless-stopped
     env_file: ../worker.env
     environment:
@@ -55,11 +50,8 @@ services:
       - "3000"
 
   chrome-cdp:
-    image: beonmeet-remote-chrome:latest
+    image: beonmeet-chrome-cdp:latest
     platform: linux/amd64
-    build:
-      context: ../upstream
-      dockerfile: Dockerfile.chrome-cdp
     restart: unless-stopped
     shm_size: "6gb"
     environment:
