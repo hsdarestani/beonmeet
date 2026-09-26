@@ -11,6 +11,7 @@ from hetzner_autoscaler import (
     _delete_server,
     _list_servers,
     _runtime,
+    _bootstrap_status,
     _server_worker_id,
     enabled,
 )
@@ -50,8 +51,10 @@ async def run() -> int:
 
         try:
             last_progress = 0.0
+            last_stage = None
             while time.monotonic() < deadline:
                 runtime = _runtime(worker_id)
+                bootstrap = _bootstrap_status(worker_id)
                 if runtime:
                     available = int(runtime.get("available_slots") or 0)
                     max_jobs = int(runtime.get("max_jobs") or runtime.get("slots") or 0)
@@ -74,6 +77,21 @@ async def run() -> int:
                 # Emit progress so CI/SSH transports never treat this long-running
                 # bootstrap check as an idle connection.
                 elapsed = time.monotonic() - started
+                current_stage = (bootstrap or {}).get("stage")
+                if current_stage and current_stage != last_stage:
+                    print(
+                        "AUTOSCALER_SMOKE_STAGE "
+                        + json.dumps(
+                            {
+                                "worker_id": worker_id,
+                                "elapsed_seconds": int(elapsed),
+                                "bootstrap": bootstrap,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                    last_stage = current_stage
                 if elapsed - last_progress >= 20:
                     print(
                         "AUTOSCALER_SMOKE_WAIT "
@@ -82,6 +100,7 @@ async def run() -> int:
                                 "worker_id": worker_id,
                                 "elapsed_seconds": int(elapsed),
                                 "runtime_seen": bool(runtime),
+                                "bootstrap": bootstrap,
                             },
                             ensure_ascii=False,
                         ),
