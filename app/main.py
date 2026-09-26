@@ -1080,9 +1080,12 @@ async def send_recording_to_recipients(
 
     # Cloud Bot API has a small upload limit. Create playable compressed parts in RAM once,
     # then deliver every part to the requester and the admin.
-    probe = subprocess.run(
+    probe = await asyncio.to_thread(
+        subprocess.run,
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     raw_duration = (probe.stdout or "").strip()
     try:
@@ -1100,16 +1103,19 @@ async def send_recording_to_recipients(
     part_pattern = str(path.parent / f"{path.stem}_part_%03d.mp4")
     for stale_part in path.parent.glob(f"{path.stem}_part_*.mp4"):
         stale_part.unlink(missing_ok=True)
-    subprocess.run(
+    await asyncio.to_thread(
+        subprocess.run,
         [
             "ffmpeg", "-y", "-i", str(path),
             "-vf", "scale=min(1280\\,iw):-2",
-            "-c:v", "libx264", "-preset", "veryfast", "-b:v", "650k",
+            "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "600k",
             "-c:a", "aac", "-b:a", "64k",
             "-f", "segment", "-segment_time", str(target_seconds),
             "-reset_timestamps", "1", part_pattern,
         ],
         check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     parts = sorted(path.parent.glob(f"{path.stem}_part_*.mp4"))
     for target in recipients:
@@ -1763,7 +1769,8 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
             # followed by a second segmented encode.
             if raw_path.stat().st_size <= 49 * 1024 * 1024:
                 free_path = raw_path.with_name(f"{raw_path.stem}_standard.mp4")
-                subprocess.run(
+                await asyncio.to_thread(
+                    subprocess.run,
                     [
                         "ffmpeg", "-y", "-i", str(raw_path),
                         "-vf", "scale='min(1280,iw)':-2",
@@ -1793,7 +1800,8 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
         if premium_active:
             audio_path = raw_path.with_suffix(".mp3")
             try:
-                subprocess.run(
+                await asyncio.to_thread(
+                    subprocess.run,
                     ["ffmpeg", "-y", "-i", str(raw_path), "-vn", "-c:a", "libmp3lame", "-b:a", "160k", str(audio_path)],
                     check=True,
                     stdout=subprocess.DEVNULL,
