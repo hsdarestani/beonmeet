@@ -241,6 +241,38 @@ services:
       timeout: 3s
       retries: 30
 
+  recorder-setup-136:
+    image: beonmeet-chrome-cdp:latest
+    platform: linux/amd64
+    profiles: ["recorder-setup"]
+    restart: unless-stopped
+    shm_size: "2gb"
+    environment:
+      CHROME_WINDOW_SIZE: "1440,900"
+      CHROME_URL: "https://accounts.google.com/"
+    volumes:
+      - ./recorder-accounts/recorder136:/tmp/chrome-profile
+    ports:
+      - "127.0.0.1:6081:6080"
+    expose:
+      - "9223"
+
+  recorder-setup-802:
+    image: beonmeet-chrome-cdp:latest
+    platform: linux/amd64
+    profiles: ["recorder-setup"]
+    restart: unless-stopped
+    shm_size: "2gb"
+    environment:
+      CHROME_WINDOW_SIZE: "1440,900"
+      CHROME_URL: "https://accounts.google.com/"
+    volumes:
+      - ./recorder-accounts/recorder802:/tmp/chrome-profile
+    ports:
+      - "127.0.0.1:6082:6080"
+    expose:
+      - "9223"
+
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
