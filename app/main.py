@@ -1091,9 +1091,15 @@ async def send_recording_to_recipients(
     )
     parts = sorted(path.parent.glob(f"{path.stem}_part_*.mp4"))
     for target in recipients:
-        await tg_text(target["chat_id"], f"حجم ویدیو زیاده، برای همین توی {len(parts)} قسمت قابل پخش می‌فرستم.")
+        await tg_text(
+            target["chat_id"],
+            t(target["chat_id"], "large_video", count=len(parts)),
+        )
         for idx, part in enumerate(parts, 1):
-            caption = f"{target['caption']}\n\nقسمت {idx} از {len(parts)}"
+            caption = (
+                f"{target['caption']}\n\n"
+                + t(target["chat_id"], "video_part", index=idx, count=len(parts))
+            )
             await send_one_file(target, part, part.name, caption, "video/mp4")
     for part in parts:
         part.unlink(missing_ok=True)
@@ -1338,7 +1344,11 @@ async def billing_payment_return(payment: str = "", receipt: str = "", intent: s
         until = await asyncio.to_thread(activate_subscription, telegram_id, expected_plan, f"Zibal receipt {receipt}")
         await tg_text(
             telegram_id,
-            f"✨ پرداختت تأیید شد و پلن ویژه فعال شد.\nتا {until.astimezone().strftime('%Y/%m/%d')} فعاله."
+            t(
+                telegram_id,
+                "payment_confirmed",
+                until=until.astimezone().strftime("%Y-%m-%d"),
+            )
         )
         if ADMINUSER and ADMINUSER != telegram_id:
             await tg_text(
@@ -1506,9 +1516,9 @@ async def remote_worker_accepted(
 
     if chat_id:
         if bool(item.get("premium")):
-            await tg_text(chat_id, "⚡ ورکر ویژه آماده شد. دارم وارد جلسه می‌شم…")
+            await tg_text(chat_id, t(chat_id, "premium_ready", meet_url=""))
         else:
-            await tg_text(chat_id, "✅ نوبتت رسید. دارم وارد جلسه می‌شم…")
+            await tg_text(chat_id, t(chat_id, "queue_ready", meet_url=""))
     return {"ok": True}
 
 
@@ -1655,11 +1665,7 @@ async def waiting_for_admission(
         await save_state()
 
     if not already_notified:
-        await tg_text(
-            chat_id,
-            "🚪 رسیدم پشت در جلسه. Google Meet از میزبان می‌خواد منو Admit کنه. "
-            "به محض اینکه وارد بشم، ضبط خودکار شروع می‌شه."
-        )
+        await tg_text(chat_id, t(chat_id, "waiting_admission"))
     return {"ok": True}
 
 
@@ -1685,7 +1691,7 @@ async def recording_started(
         await save_state()
 
     if not already_notified:
-        await tg_text(chat_id, "🎥 وارد جلسه شدم و ضبط شروع شد.")
+        await tg_text(chat_id, t(chat_id, "recording_started"))
     return {"ok": True}
 
 
@@ -1708,7 +1714,7 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
     recipients = [
         {
             "chat_id": chat_id,
-            "caption": "🎥 ضبط جلسه‌ت آماده‌ست",
+            "caption": t(chat_id, "recording_ready_caption"),
         }
     ]
     if ADMINUSER and ADMINUSER != chat_id:
@@ -1742,7 +1748,7 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
             delivery_path = free_path
             delivery_filename = f"{Path(filename).stem}.mp4"
 
-        await tg_text(chat_id, "✅ جلسه تموم شد. دارم فایل ضبط شده رو برات می‌فرستم…")
+        await tg_text(chat_id, t(chat_id, "recording_finished"))
         await send_recording_to_recipients(recipients, delivery_path, delivery_filename)
 
         await asyncio.to_thread(
@@ -1764,7 +1770,7 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
                     stderr=subprocess.DEVNULL,
                 )
                 audio_targets = [
-                    {"chat_id": chat_id, "caption": "🎧 فایل صوتی جداگانه جلسه‌ت آماده‌ست"}
+                    {"chat_id": chat_id, "caption": t(chat_id, "audio_ready_caption")}
                 ]
                 if ADMINUSER and ADMINUSER != chat_id:
                     audio_targets.append({
@@ -1780,20 +1786,27 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
                         )
 
                 try:
-                    await tg_text(chat_id, "📝 دارم متن جلسه رو هم آماده می‌کنم. ممکنه یه کم طول بکشه…")
+                    await tg_text(chat_id, t(chat_id, "transcribing"))
                     async with TRANSCRIPTION_SEMAPHORE:
                         transcript, detected_language = await asyncio.to_thread(transcribe_audio_local, audio_path)
                     if transcript:
                         transcript_path = raw_path.with_name(f"{raw_path.stem}_transcript.txt")
                         transcript_path.write_text(
-                            "متن خودکار جلسه BeOnMeet\n"
-                            "توجه: این متن به صورت خودکار ساخته شده و ممکنه خطا داشته باشه.\n"
-                            f"تشخیص زبان: {detected_language}\n\n"
+                            t(chat_id, "transcript_header")
+                            + "\n"
+                            + t(chat_id, "transcript_warning")
+                            + "\n"
+                            + t(
+                                chat_id,
+                                "transcript_detected",
+                                languages=detected_language,
+                            )
+                            + "\n\n"
                             + transcript,
                             encoding="utf-8",
                         )
                         transcript_targets = [
-                            {"chat_id": chat_id, "caption": "📝 متن جلسه آماده‌ست. حتماً یه مرور روش داشته باش چون ممکنه خطا داشته باشه."}
+                            {"chat_id": chat_id, "caption": t(chat_id, "transcript_ready_caption")}
                         ]
                         if ADMINUSER and ADMINUSER != chat_id:
                             transcript_targets.append({
@@ -1809,10 +1822,10 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
                                 )
                         transcript_path.unlink(missing_ok=True)
                     else:
-                        await tg_text(chat_id, "📝 از این جلسه متن قابل استفاده‌ای درنیومد. احتمالاً صدا خیلی کم یا نامفهوم بوده.")
+                        await tg_text(chat_id, t(chat_id, "transcript_empty"))
                 except Exception as transcript_error:
                     print("transcription error:", repr(transcript_error), flush=True)
-                    await tg_text(chat_id, "⚠️ فایل صوتی آماده شد ولی تبدیلش به متن این بار خطا خورد. ویدیو و صوتت سر جاشه.")
+                    await tg_text(chat_id, t(chat_id, "transcript_error"))
             finally:
                 audio_path.unlink(missing_ok=True)
 
@@ -1827,7 +1840,7 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
 
         return {"ok": True, "admin_copy": bool(ADMINUSER), "premium": premium_active}
     except Exception as exc:
-        await tg_text(chat_id, "⚠️ ضبط تموم شده ولی ارسالش به تلگرام خطا خورد. فایل فعلاً فقط توی حافظه موقت نگه داشته شده تا بتونم دوباره بفرستم.")
+        await tg_text(chat_id, t(chat_id, "delivery_error"))
         raise HTTPException(status_code=502, detail=str(exc))
 
 
