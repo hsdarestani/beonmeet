@@ -59,17 +59,8 @@ jobs:
 
             cd /opt/beonmeet
 
-            echo "=== TEMP DELIVERY DIAGNOSTIC ==="
-            docker compose exec -T controller python -c 'import json,urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=5).read().decode())' || true
-            echo "=== RETAINED RECORDING FILES ==="
-            find /dev/shm/beonmeet -type f \( -name '*.webm' -o -name '*.mp4' \) -printf '%TY-%Tm-%TdT%TH:%TM:%TSZ %s %p\n' 2>/dev/null | sort | tail -30 || true
-            echo "=== CONTROLLER DELIVERY LOGS ==="
-            docker compose logs --since=20m controller 2>&1 | grep -E 'recovering retained recorder file|legacy delivery recovery error|pending delivery recovery error|delivery recovery loop error|delivery_error|Recording finished|telegram|HTTPException|sendDocument' | tail -200 || true
-            echo "=== END TEMP DELIVERY DIAGNOSTIC ==="
-            exit 1
-
             pipeline_busy_count() {
-              docker compose exec -T controller python -c 'import json,urllib.request; urls=["http://meeting-bot-free1:3000/capacity","http://meeting-bot-free2:3000/capacity","http://meeting-bot-premium1:3000/capacity"]; running=sum(int(json.loads(urllib.request.urlopen(u,timeout=5).read().decode())["data"].get("runningJobs") or 0) for u in urls); h=json.loads(urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=5).read().decode()); print(running+int(h.get("active_delivery_jobs") or 0)+int(h.get("pending_delivery_jobs") or 0))'
+              docker compose exec -T controller python -c 'import json,urllib.request; urls=["http://meeting-bot-free1:3000/capacity","http://meeting-bot-free2:3000/capacity","http://meeting-bot-premium1:3000/capacity"]; running=sum(int(json.loads(urllib.request.urlopen(u,timeout=5).read().decode())["data"].get("runningJobs") or 0) for u in urls); h=json.loads(urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=5).read().decode()); print(running+int(h.get("active_delivery_jobs") or 0))'
             }
 
             PIPELINE_BUSY="unknown"
@@ -277,11 +268,6 @@ jobs:
 
             for i in $(seq 1 30); do
               if docker compose exec -T controller python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read().decode())"; then
-                sleep 25
-                echo "Retained recorder source files:"
-                find /dev/shm/beonmeet -mindepth 2 -maxdepth 2 -type f \( -name '*.webm' -o -name '*.mp4' \) -printf '%s %p\n' 2>/dev/null | tail -20 || true
-                echo "Recent controller recovery logs:"
-                docker compose logs --since=2m controller 2>&1 | grep -E 'recovering retained recorder file|legacy delivery recovery error|pending delivery recovery error|delivery recovery loop error' || true
                 exit 0
               fi
               sleep 5
