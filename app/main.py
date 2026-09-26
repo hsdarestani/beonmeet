@@ -25,6 +25,15 @@ from state_store import DurableStateStore
 from db_compat import is_postgres
 from hetzner_autoscaler import router as autoscaler_router, autoscale_loop, enabled as autoscaler_enabled, profile_status
 from scaling_policy import order_queue
+from i18n import (
+    BUTTON_ACTIONS,
+    LANGUAGE_BUTTONS,
+    SUPPORTED_LANGUAGES,
+    menu as i18n_menu,
+    normalize_language,
+    profile as i18n_profile,
+    tr as i18n_tr,
+)
 
 from admin_panel import (
     PLANS,
@@ -102,6 +111,7 @@ state: dict[str, Any] = {
     "join_queue": [],
     "remote_claims": {},
     "oauth_state": None,
+    "user_languages": {},
 }
 
 
@@ -116,6 +126,7 @@ def load_state() -> None:
     state.setdefault("remote_claims", {})
     state.setdefault("telegram_offset", 0)
     state.setdefault("oauth_state", None)
+    state.setdefault("user_languages", {})
     print(f"controller state loaded from {source}", flush=True)
 
 
@@ -151,63 +162,127 @@ async def telegram(method: str, data: dict[str, Any] | None = None, files: dict[
         return payload
 
 
+def user_language(chat_id: int | str) -> str:
+    return normalize_language(
+        str(state.setdefault("user_languages", {}).get(str(chat_id)) or ""),
+        default="en",
+    )
+
+
+async def set_user_language(chat_id: int | str, language: str) -> str:
+    lang = normalize_language(language)
+    state.setdefault("user_languages", {})[str(chat_id)] = lang
+    await save_state()
+    return lang
+
+
+def t(chat_id: int | str, key: str, **kwargs: Any) -> str:
+    return i18n_tr(user_language(chat_id), key, **kwargs)
+
+
 def telegram_reply_keyboard(chat_id: int | str) -> dict[str, Any]:
+    labels = i18n_menu(user_language(chat_id))
     rows = [
-        [{"text": "🎬 ضبط جلسه جدید"}, {"text": "✨ پلن ویژه"}],
-        [{"text": "⚡ ورود فوری"}, {"text": "❓ راهنما"}],
+        [{"text": labels["new"]}, {"text": labels["premium"]}],
+        [{"text": labels["now"]}, {"text": labels["help"]}],
+        [{"text": labels["language"]}],
     ]
     if ADMINUSER and str(chat_id) == ADMINUSER:
-        rows.append([{"text": "⚙️ پنل مدیریت"}])
+        rows.append([{"text": labels["admin"]}])
     return {
         "keyboard": rows,
         "resize_keyboard": True,
         "is_persistent": True,
-        "input_field_placeholder": "لینک Google Meet رو بفرست…",
+        "input_field_placeholder": labels["placeholder"],
     }
 
 
-async def tg_text(chat_id: int | str, text: str, with_menu: bool = False) -> None:
+def telegram_language_keyboard() -> dict[str, Any]:
+    return {
+        "keyboard": [[
+            {"text": LANGUAGE_BUTTONS["fa"]},
+            {"text": LANGUAGE_BUTTONS["en"]},
+            {"text": LANGUAGE_BUTTONS["de"]},
+        ]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+
+
+async def tg_text(
+    chat_id: int | str,
+    text: str,
+    with_menu: bool = False,
+    reply_markup: dict[str, Any] | None = None,
+) -> None:
     data: dict[str, Any] = {
         "chat_id": str(chat_id),
         "text": text,
         "disable_web_page_preview": "true",
     }
-    if with_menu:
+    if reply_markup is not None:
+        data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    elif with_menu:
         data["reply_markup"] = json.dumps(telegram_reply_keyboard(chat_id), ensure_ascii=False)
     await telegram("sendMessage", data)
 
 
 async def setup_telegram_profile() -> None:
     try:
-        await telegram("setMyDescription", {
-            "description": "لینک Google Meet رو بفرست. سر وقت وارد جلسه می‌شم، ضبطش می‌کنم و آخرش فایل رو همینجا برات می‌فرستم."
-        })
-        await telegram("setMyShortDescription", {
-            "short_description": "ضبط خودکار Google Meet و ارسال مستقیم توی تلگرام"
-        })
-        public_commands = [
-            {"command": "start", "description": "راهنمای استفاده"},
-            {"command": "plans", "description": "پلن ویژه و خرید اشتراک"},
-            {"command": "now", "description": "ورود فوری به جلسه"},
-        ]
+        for lang in SUPPORTED_LANGUAGES:
+            profile = i18n_profile(lang)
+            language_payload = {"language_code": lang}
+            await telegram("setMyDescription", {
+                **language_payload,
+                "description": profile["description"],
+            })
+            await telegram("setMyShortDescription", {
+                **language_payload,
+                "short_description": profile["short"],
+            })
+            public_commands = [
+                {"command": "start", "description": profile["commands"]["start"]},
+                {"command": "plans", "description": profile["commands"]["plans"]},
+                {"command": "now", "description": profile["commands"]["now"]},
+                {"command": "language", "description": profile["commands"]["language"]},
+            ]
+            await telegram("setMyCommands", {
+                "scope": json.dumps({"type": "all_private_chats"}),
+                "language_code": lang,
+                "commands": json.dumps(public_commands, ensure_ascii=False),
+            })
 
-        # Show Telegram's native command menu next to the chat input.
+        # English is the neutral default when Telegram does not provide a language.
+        default_profile = i18n_profile("en")
+        default_commands = [
+            {"command": "start", "description": default_profile["commands"]["start"]},
+            {"command": "plans", "description": default_profile["commands"]["plans"]},
+            {"command": "now", "description": default_profile["commands"]["now"]},
+            {"command": "language", "description": default_profile["commands"]["language"]},
+        ]
         await telegram("setMyCommands", {
             "scope": json.dumps({"type": "all_private_chats"}),
-            "commands": json.dumps(public_commands, ensure_ascii=False),
+            "commands": json.dumps(default_commands, ensure_ascii=False),
         })
         await telegram("setChatMenuButton", {
             "menu_button": json.dumps({"type": "commands"})
         })
 
         if ADMINUSER:
-            admin_commands = public_commands + [
-                {"command": "admin", "description": "پنل مدیریت"}
-            ]
-            await telegram("setMyCommands", {
-                "scope": json.dumps({"type": "chat", "chat_id": int(ADMINUSER)}),
-                "commands": json.dumps(admin_commands, ensure_ascii=False),
-            })
+            for lang in SUPPORTED_LANGUAGES:
+                profile = i18n_profile(lang)
+                admin_commands = [
+                    {"command": "start", "description": profile["commands"]["start"]},
+                    {"command": "plans", "description": profile["commands"]["plans"]},
+                    {"command": "now", "description": profile["commands"]["now"]},
+                    {"command": "language", "description": profile["commands"]["language"]},
+                    {"command": "admin", "description": profile["commands"]["admin"]},
+                ]
+                await telegram("setMyCommands", {
+                    "scope": json.dumps({"type": "chat", "chat_id": int(ADMINUSER)}),
+                    "language_code": lang,
+                    "commands": json.dumps(admin_commands, ensure_ascii=False),
+                })
             await telegram("setChatMenuButton", {
                 "chat_id": int(ADMINUSER),
                 "menu_button": json.dumps({"type": "commands"}),
