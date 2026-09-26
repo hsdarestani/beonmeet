@@ -59,28 +59,35 @@ jobs:
 
             cd /opt/beonmeet
 
-            active_recordings() {
-              docker compose exec -T controller python -c 'import json,urllib.request; urls=["http://meeting-bot-free1:3000/capacity","http://meeting-bot-free2:3000/capacity","http://meeting-bot-premium1:3000/capacity"]; print(sum(int(json.loads(urllib.request.urlopen(u,timeout=5).read().decode())["data"].get("runningJobs") or 0) for u in urls))'
+            pipeline_busy_count() {
+              docker compose exec -T controller python -c 'import json,urllib.request; urls=["http://meeting-bot-free1:3000/capacity","http://meeting-bot-free2:3000/capacity","http://meeting-bot-premium1:3000/capacity"]; running=sum(int(json.loads(urllib.request.urlopen(u,timeout=5).read().decode())["data"].get("runningJobs") or 0) for u in urls); h=json.loads(urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=5).read().decode()); print(running+int(h.get("active_delivery_jobs") or 0)+int(h.get("pending_delivery_jobs") or 0))'
             }
 
-            ACTIVE_RECORDINGS="unknown"
+            PIPELINE_BUSY="unknown"
+            IDLE_STREAK=0
             for _ in $(seq 1 360); do
-              ACTIVE_RECORDINGS="$(active_recordings 2>/dev/null || true)"
-              if [[ "$ACTIVE_RECORDINGS" =~ ^[0-9]+$ ]]; then
-                if [ "$ACTIVE_RECORDINGS" -eq 0 ]; then
-                  echo "No active recordings; production deploy may proceed"
-                  break
+              PIPELINE_BUSY="$(pipeline_busy_count 2>/dev/null || true)"
+              if [[ "$PIPELINE_BUSY" =~ ^[0-9]+$ ]]; then
+                if [ "$PIPELINE_BUSY" -eq 0 ]; then
+                  IDLE_STREAK=$((IDLE_STREAK + 1))
+                  echo "Delivery pipeline idle check $IDLE_STREAK/6"
+                  if [ "$IDLE_STREAK" -ge 6 ]; then
+                    echo "Pipeline has been fully idle for two minutes; production deploy may proceed"
+                    break
+                  fi
+                else
+                  IDLE_STREAK=0
+                  echo "Delivery pipeline busy: $PIPELINE_BUSY. Holding deploy without restarting production."
                 fi
-                echo "Active recordings detected: $ACTIVE_RECORDINGS. Holding deploy without restarting production."
               else
-                echo "Unable to verify active recorder count; refusing unsafe deploy"
+                echo "Unable to verify delivery pipeline state; refusing unsafe deploy"
                 exit 1
               fi
               sleep 20
             done
 
-            if [ "$ACTIVE_RECORDINGS" != "0" ]; then
-              echo "Active recordings did not drain within the safe deploy window"
+            if [ "$PIPELINE_BUSY" != "0" ] || [ "$IDLE_STREAK" -lt 6 ]; then
+              echo "Delivery pipeline did not reach a safe idle state within the deploy window"
               exit 1
             fi
 
@@ -247,7 +254,6 @@ jobs:
               beonmeet-worker-agent:latest \
               -o /opt/beonmeet/autoscale-images.tar
             chmod 600 /opt/beonmeet/autoscale-images.tar
-            docker compose restart controller
             docker compose up -d --force-recreate caddy
             # Keep the one-time Google login browsers reachable only while
             # a secondary recorder profile still needs its first sign-in.
