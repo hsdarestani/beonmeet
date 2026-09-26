@@ -276,6 +276,10 @@ jobs:
             fi
             docker compose ps
 
+            echo "Sending one-time full-file link for the interrupted meeting if its retained source still exists..."
+            docker compose exec -T controller python -c 'import asyncio,pathlib,main; event="manual-99a88a85-53f5-467b-908c-25b5c98aa78f"; async def_go=None' || true
+            docker compose exec -T controller python -c 'import asyncio,pathlib,main; event="manual-99a88a85-53f5-467b-908c-25b5c98aa78f"; p=next((x for x in (main.state.get("pending_deliveries") or {}).values() if str((x or {}).get("event_id") or "")==event),None); path=pathlib.Path(str((p or {}).get("file_path") or "")); chat=str((p or {}).get("chat_id") or ""); async def send():\n    if not p or not chat or not path.exists() or not path.is_file(): print("FORCED_FULL_LINK_SKIPPED"); return\n    url=await main.create_recording_download(path,str((p or {}).get("filename") or path.name)); await main.tg_text(chat,main.t(chat,"large_video_download",url=url,hours=main.DOWNLOAD_TTL_HOURS)); p["video_delivered"]=True; p["full_file_link_sent"]=True; p["updated_at"]=main.datetime.now(main.timezone.utc).isoformat(); await main.save_state(); print("FORCED_FULL_LINK_SENT")\nasyncio.run(send())' || true
+
             for i in $(seq 1 30); do
               if docker compose exec -T controller python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read().decode())"; then
                 exit 0
