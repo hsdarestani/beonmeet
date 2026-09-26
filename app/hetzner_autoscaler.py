@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 import redis
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 from scaling_policy import bounded_scale_up
