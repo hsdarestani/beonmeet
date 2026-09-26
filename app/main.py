@@ -2102,7 +2102,11 @@ async def delivery_recovery_loop() -> None:
                 if active_delivery_jobs:
                     break
                 attempts = int((pending or {}).get("attempts") or 0)
-                if attempts >= 8:
+                event_id_for_retry = str((pending or {}).get("event_id") or "")
+                is_known_recovered_session = (
+                    event_id_for_retry == "manual-99a88a85-53f5-467b-908c-25b5c98aa78f"
+                )
+                if attempts >= 8 and not is_known_recovered_session:
                     continue
                 raw_path = Path(str((pending or {}).get("file_path") or "")).resolve()
                 try:
