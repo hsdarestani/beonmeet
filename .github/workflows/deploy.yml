@@ -60,21 +60,7 @@ jobs:
             cd /opt/beonmeet
 
             active_recordings() {
-              docker compose exec -T controller python - <<'PY'
-import json
-import urllib.request
-
-urls = [
-    "http://meeting-bot-free1:3000/capacity",
-    "http://meeting-bot-free2:3000/capacity",
-    "http://meeting-bot-premium1:3000/capacity",
-]
-total = 0
-for url in urls:
-    payload = json.loads(urllib.request.urlopen(url, timeout=5).read().decode())
-    total += int(payload["data"].get("runningJobs") or 0)
-print(total)
-PY
+              docker compose exec -T controller python -c 'import json,urllib.request; urls=["http://meeting-bot-free1:3000/capacity","http://meeting-bot-free2:3000/capacity","http://meeting-bot-premium1:3000/capacity"]; print(sum(int(json.loads(urllib.request.urlopen(u,timeout=5).read().decode())["data"].get("runningJobs") or 0) for u in urls))'
             }
 
             ACTIVE_RECORDINGS="unknown"
