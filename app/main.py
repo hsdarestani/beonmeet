@@ -1082,11 +1082,24 @@ async def send_recording_to_recipients(
     # then deliver every part to the requester and the admin.
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=False,
     )
-    duration = max(float(probe.stdout.strip() or "0"), 1.0)
-    target_seconds = max(90, min(300, int(duration * (42 * 1024 * 1024) / size)))
+    raw_duration = (probe.stdout or "").strip()
+    try:
+        duration = float(raw_duration)
+        if not duration > 0:
+            raise ValueError("non-positive duration")
+        target_seconds = max(90, min(300, int(duration * (42 * 1024 * 1024) / size)))
+    except (TypeError, ValueError):
+        # WebM files produced by MediaRecorder can legitimately report N/A for
+        # container duration. The output bitrate below is fixed, so a four-minute
+        # segment stays comfortably below Telegram's cloud Bot API upload limit
+        # without needing input duration metadata.
+        target_seconds = 240
+
     part_pattern = str(path.parent / f"{path.stem}_part_%03d.mp4")
+    for stale_part in path.parent.glob(f"{path.stem}_part_*.mp4"):
+        stale_part.unlink(missing_ok=True)
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", str(path),
@@ -2016,7 +2029,7 @@ async def delivery_recovery_loop() -> None:
                 if active_delivery_jobs:
                     break
                 attempts = int((pending or {}).get("attempts") or 0)
-                if attempts >= 4:
+                if attempts >= 8:
                     continue
                 raw_path = Path(str((pending or {}).get("file_path") or "")).resolve()
                 try:
@@ -2030,7 +2043,7 @@ async def delivery_recovery_loop() -> None:
                     updated = isoparse(updated_raw) if updated_raw else datetime.now(timezone.utc) - timedelta(minutes=10)
                 except Exception:
                     updated = datetime.now(timezone.utc) - timedelta(minutes=10)
-                if datetime.now(timezone.utc) - updated < timedelta(minutes=2):
+                if datetime.now(timezone.utc) - updated < timedelta(seconds=30):
                     continue
 
                 recovery_data = {
