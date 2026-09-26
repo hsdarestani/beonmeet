@@ -48,7 +48,7 @@ shell = "\n".join(
 )
 subprocess.run(["bash", "-n"], input=shell, text=True, check=True)
 
-assert 'detail="${2:-}"' in shell
+assert '"detail=${2:-}"' in shell
 assert "report cloud_init_started" in shell
 assert "report prerequisites_ready" in shell
 assert "report bootstrap_finished" in shell
