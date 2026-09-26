@@ -12,3 +12,5 @@ Retry to diagnose Hetzner 422: 2026-09-25T18:44+03:30
 Retry after Hetzner location fallback fix: 2026-09-25T18:46+03:30
 
 Validate three recorder profiles after secondary logins: 2026-09-26T16:56+03:30
+
+Validate multilingual bot, large-v3 transcription and real autoscaler: 2026-09-26T17:10+03:30
