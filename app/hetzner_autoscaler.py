@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 import redis
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 from scaling_policy import bounded_scale_up
 
@@ -40,6 +40,7 @@ PROFILE_ROOT = Path(os.environ.get("AUTOSCALE_PROFILE_ROOT", "/bootstrap"))
 PROFILE_DIR = PROFILE_ROOT / "chrome-profile"
 ACCOUNT_PROFILE_ROOT = PROFILE_ROOT / "accounts"
 MAX_WORKERS_PER_ACCOUNT = max(1, int(os.environ.get("AUTOSCALE_MAX_WORKERS_PER_ACCOUNT", "3")))
+IMAGE_BUNDLE_PATH = Path(os.environ.get("AUTOSCALE_IMAGE_BUNDLE", "/bootstrap/autoscale-images.tar"))
 
 redis_client = redis.Redis.from_url(
     REDIS_URL,
@@ -155,6 +156,18 @@ async def bootstrap_env(token: str) -> PlainTextResponse:
     )
 
 
+@router.get("/internal/autoscale/images/{token}")
+async def bootstrap_images(token: str) -> FileResponse:
+    _load_bootstrap(token)
+    if not IMAGE_BUNDLE_PATH.exists() or IMAGE_BUNDLE_PATH.stat().st_size < 1024:
+        raise HTTPException(status_code=503, detail="Autoscale image bundle is unavailable")
+    return FileResponse(
+        path=str(IMAGE_BUNDLE_PATH),
+        media_type="application/x-tar",
+        filename="beonmeet-autoscale-images.tar",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
 @router.get("/internal/autoscale/profile/{token}")
 async def bootstrap_profile(token: str) -> StreamingResponse:
     entry = _load_bootstrap(token)
@@ -250,6 +263,9 @@ runcmd:
       curl -fsS --retry 8 --retry-delay 5 \
         {CONTROLLER_PUBLIC_URL}/internal/autoscale/profile/{token} \
         -o /tmp/beonmeet-profile.tar.gz
+      curl -fsS --retry 8 --retry-delay 5 \
+        {CONTROLLER_PUBLIC_URL}/internal/autoscale/images/{token} \
+        -o /opt/beonmeet-worker/prebuilt-images.tar
       tar -xzf /tmp/beonmeet-profile.tar.gz -C /opt/beonmeet-worker
       rm -f /tmp/beonmeet-profile.tar.gz
       chmod 600 worker.env
