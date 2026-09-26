@@ -836,9 +836,17 @@ async def telegram_loop() -> None:
             offset = int(state.get("telegram_offset") or 0)
             url = f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
             async with httpx.AsyncClient(timeout=httpx.Timeout(40.0, connect=20.0)) as client:
-                r = await client.post(url, data={"timeout": 30, "offset": offset, "allowed_updates": json.dumps(["message"])})
+                r = await client.post(
+                    url,
+                    data={
+                        "timeout": 30,
+                        "offset": offset,
+                        "allowed_updates": json.dumps(["message"]),
+                    },
+                )
                 r.raise_for_status()
                 updates = r.json().get("result", [])
+
             for upd in updates:
                 state["telegram_offset"] = upd["update_id"] + 1
                 msg = upd.get("message") or {}
@@ -857,43 +865,57 @@ async def telegram_loop() -> None:
                     str(from_user.get("last_name") or chat.get("last_name") or ""),
                 )
 
-                if text == "⚙️ پنل مدیریت":
-                    text = "/admin"
-                elif text == "✨ پلن ویژه":
-                    text = "/plans"
-                elif text == "⚡ ورود فوری":
-                    text = "/now"
-                elif text == "❓ راهنما":
-                    text = "/start"
-                elif text == "🎬 ضبط جلسه جدید":
+                # Choose an initial UI language from Telegram once, then persist the
+                # user's explicit choice independently from meeting/transcript language.
+                user_languages = state.setdefault("user_languages", {})
+                if str(chat_id) not in user_languages:
+                    user_languages[str(chat_id)] = normalize_language(
+                        str(from_user.get("language_code") or ""),
+                        default="en",
+                    )
+                    await save_state()
+
+                mapped_action = BUTTON_ACTIONS.get(text)
+                if mapped_action:
+                    text = mapped_action
+
+                if text.startswith("/setlanguage"):
+                    parts = text.split(maxsplit=1)
+                    requested = parts[1] if len(parts) > 1 else "en"
+                    await set_user_language(chat_id, requested)
+                    await tg_text(chat_id, t(chat_id, "language_changed"), with_menu=True)
+                    continue
+
+                if text.startswith("/language"):
                     await tg_text(
                         chat_id,
-                        "لینک Google Meet رو همینجا بفرست. اگه جلسه توی کلندر باشه سر وقت وارد می‌شم؛ اگه همین الان شروع شده می‌تونی از «⚡ ورود فوری» استفاده کنی.",
-                        with_menu=True,
+                        t(chat_id, "language_choose"),
+                        reply_markup=telegram_language_keyboard(),
                     )
+                    continue
+
+                if text.startswith("/new"):
+                    await tg_text(chat_id, t(chat_id, "new_prompt"), with_menu=True)
                     continue
 
                 if text.startswith("/admin"):
                     if ADMINUSER and str(chat_id) == ADMINUSER:
-                        await tg_text(chat_id, f"پنل مدیریت آماده‌ست 👇\n{make_admin_login_url()}\n\nاین لینک ۱۵ دقیقه اعتبار داره.")
+                        await tg_text(
+                            chat_id,
+                            t(chat_id, "admin_ready", url=make_admin_login_url()),
+                        )
                     else:
-                        await tg_text(chat_id, "این بخش فقط برای مدیر رباته 🙂")
+                        await tg_text(chat_id, t(chat_id, "admin_only"))
                     continue
 
                 if text.startswith("/plans") or text.startswith("/premium"):
                     info = await asyncio.to_thread(subscription_info, str(chat_id))
                     if info.get("premium"):
                         until = info.get("until")
-                        until_text = until.astimezone().strftime("%Y/%m/%d") if until else ""
+                        until_text = until.astimezone().strftime("%Y-%m-%d") if until else ""
                         await tg_text(
                             chat_id,
-                            f"✨ پلن ویژه‌ت فعاله تا {until_text}.\n\n"
-                            "قابلیت‌های ویژه:\n"
-                            "• کیفیت بالاتر ضبط\n"
-                            "• فایل صوتی جداگانه\n"
-                            "• متن جلسه\n"
-                            "• پیش نویس صورتجلسه\n"
-                            "• ظرفیت اختصاصی و اولویت ورود؛ پشت صف کاربران رایگان نمی‌مونی",
+                            t(chat_id, "premium_active", until=until_text),
                             with_menu=True,
                         )
                     else:
@@ -902,18 +924,19 @@ async def telegram_loop() -> None:
                             intents[plan_code] = await asyncio.to_thread(
                                 create_payment_intent, str(chat_id), plan_code
                             )
+                        lang = user_language(chat_id)
                         keyboard = {
                             "inline_keyboard": [
                                 [{
-                                    "text": "۱ ماهه · ۱۹۸ هزار تومان",
+                                    "text": i18n_tr(lang, "plan_monthly"),
                                     "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['monthly']['intent']}",
                                 }],
                                 [{
-                                    "text": "۳ ماهه · ۴۹۹ هزار تومان",
+                                    "text": i18n_tr(lang, "plan_quarterly"),
                                     "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['quarterly']['intent']}",
                                 }],
                                 [{
-                                    "text": "۶ ماهه · ۷۹۹ هزار تومان",
+                                    "text": i18n_tr(lang, "plan_halfyear"),
                                     "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['halfyear']['intent']}",
                                 }],
                             ]
@@ -922,37 +945,37 @@ async def telegram_loop() -> None:
                             "sendMessage",
                             {
                                 "chat_id": str(chat_id),
-                                "text": (
-                                    "✨ پلن ویژه BeOnMeet\n\n"
-                                    "قابلیت‌ها:\n"
-                                    "• کیفیت بالاتر ضبط\n"
-                                    "• فایل صوتی جداگانه\n"
-                                    "• متن جلسه\n"
-                                    "• پیش نویس صورتجلسه\n"
-                                    "• ظرفیت اختصاصی و اولویت ورود؛ پشت صف کاربران رایگان نمی‌مونی\n\n"
-                                    "یکی از پلن‌ها رو انتخاب کن:"
-                                ),
+                                "text": t(chat_id, "premium_offer"),
                                 "reply_markup": json.dumps(keyboard, ensure_ascii=False),
                             },
                         )
                     continue
 
                 if text.startswith("/start"):
-                    auth_status = "✅ کلندر وصله" if TOKEN_FILE.exists() else f"⚠️ کلندر هنوز وصل نیست\nhttps://{DOMAIN}/auth/google"
+                    if TOKEN_FILE.exists():
+                        auth_status = t(chat_id, "calendar_connected")
+                    else:
+                        auth_status = t(
+                            chat_id,
+                            "calendar_disconnected",
+                            url=f"https://{DOMAIN}/auth/google",
+                        )
                     await tg_text(
                         chat_id,
-                        "سلام 👋 من BeOnMeet هستم.\n\n"
-                        "لینک Google Meet رو برام بفرست. "
-                        f"فقط یادت باشه {BOT_EMAIL} رو هم به همون ایونت کلندر دعوت کنی. "
-                        "سر وقت خودم وارد میت می‌شم، ضبطش می‌کنم و آخرش فایل رو همینجا برات می‌فرستم.\n\n"
-                        + auth_status,
+                        t(
+                            chat_id,
+                            "start",
+                            bot_email=BOT_EMAIL,
+                            auth_status=auth_status,
+                        ),
                         with_menu=True,
                     )
                     continue
+
                 if text.strip().lower() == "/now":
                     state.setdefault("pending_now", {})[str(chat_id)] = True
                     await save_state()
-                    await tg_text(chat_id, "باشه. حالا لینک Google Meet رو بفرست تا همین الان واردش بشم.", with_menu=True)
+                    await tg_text(chat_id, t(chat_id, "now_prompt"), with_menu=True)
                     continue
 
                 force_now = text.strip().lower().startswith("/now") or bool(
@@ -966,52 +989,89 @@ async def telegram_loop() -> None:
                         "first_name": from_user.get("first_name") or chat.get("first_name") or "",
                         "last_name": from_user.get("last_name") or chat.get("last_name") or "",
                         "username": from_user.get("username") or chat.get("username") or "",
+                        "ui_language": user_language(chat_id),
                         "requested_at": datetime.now(timezone.utc).isoformat(),
                     }
                     await save_state()
-                    await asyncio.to_thread(record_request, str(chat_id), meet_url, "now" if force_now else "calendar")
+                    await asyncio.to_thread(
+                        record_request,
+                        str(chat_id),
+                        meet_url,
+                        "now" if force_now else "calendar",
+                    )
 
                     if force_now:
                         synthetic_event = {
                             "id": f"manual-{uuid.uuid4()}",
                             "start": {"dateTime": datetime.now(timezone.utc).isoformat()},
-                            "end": {"dateTime": (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()},
+                            "end": {
+                                "dateTime": (
+                                    datetime.now(timezone.utc) + timedelta(hours=3)
+                                ).isoformat()
+                            },
                         }
-                        await launch_meeting(synthetic_event, state["requests"][meet_url], meet_url)
+                        await launch_meeting(
+                            synthetic_event,
+                            state["requests"][meet_url],
+                            meet_url,
+                        )
                         continue
 
                     try:
-                        matched_event = await asyncio.to_thread(find_calendar_event_for_meet, meet_url)
-                    except Exception as exc:
-                        print("calendar lookup error after Telegram request:", repr(exc), flush=True)
-                        await tg_text(
-                            chat_id,
-                            "⚠️ درخواستت ذخیره شد ولی الان نتونستم کلندر گوگل رو بخونم. یه کوچولو بعد دوباره لینک رو بفرست.",
+                        matched_event = await asyncio.to_thread(
+                            find_calendar_event_for_meet,
+                            meet_url,
                         )
+                    except Exception as exc:
+                        print(
+                            "calendar lookup error after Telegram request:",
+                            repr(exc),
+                            flush=True,
+                        )
+                        await tg_text(chat_id, t(chat_id, "calendar_error"))
                         continue
 
                     if matched_event:
                         when = fmt_event_time(matched_event)
                         await tg_text(
                             chat_id,
-                            f"✅ گرفتمش. ایونت کلندر هم پیدا شد.\n{meet_url}\n🕒 {when}",
+                            t(
+                                chat_id,
+                                "event_found",
+                                meet_url=meet_url,
+                                when=when,
+                            ),
                         )
                         now = datetime.now(timezone.utc)
-                        start = event_start(matched_event)
-                        end = event_end(matched_event)
-                        live_until = (end + timedelta(minutes=5)) if end else ((start + timedelta(hours=3)) if start else now)
-                        if start and start <= now <= live_until:
-                            await launch_meeting(matched_event, state["requests"][meet_url], meet_url)
+                        start_at = event_start(matched_event)
+                        end_at = event_end(matched_event)
+                        live_until = (
+                            end_at + timedelta(minutes=5)
+                            if end_at
+                            else (
+                                start_at + timedelta(hours=3)
+                                if start_at
+                                else now
+                            )
+                        )
+                        if start_at and start_at <= now <= live_until:
+                            await launch_meeting(
+                                matched_event,
+                                state["requests"][meet_url],
+                                meet_url,
+                            )
                     else:
                         await tg_text(
                             chat_id,
-                            f"⚠️ لینکت رو ذخیره کردم، ولی هنوز این جلسه رو توی کلندر {BOT_EMAIL} نمی‌بینم.\n\n"
-                            f"اول {BOT_EMAIL} رو به ایونت دعوت کن. اگه قبلاً دعوتش کردی، توی تنظیمات Google Calendar همین اکانت گزینه «Add invitations to my calendar» رو روی «From everyone» بذار یا دعوت فعلی رو قبول کن. بعد لینک رو دوباره برام بفرست.\n\n"
-                            "اگه جلسه همین الان شروع شده و می‌خوای بدون منتظر موندن وارد بشم، اینو بفرست:\n"
-                            f"/now {meet_url}",
+                            t(
+                                chat_id,
+                                "event_missing",
+                                bot_email=BOT_EMAIL,
+                                meet_url=meet_url,
+                            ),
                         )
                 else:
-                    await tg_text(chat_id, "یه لینک Google Meet برام بفرست، مثلاً:\nhttps://meet.google.com/abc-defg-hij")
+                    await tg_text(chat_id, t(chat_id, "send_link"))
         except Exception as exc:
             print("telegram loop error:", repr(exc), flush=True)
             await asyncio.sleep(5)
