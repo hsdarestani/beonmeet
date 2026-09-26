@@ -287,12 +287,12 @@ runcmd:
       rm -rf /opt/beonmeet-worker
       git clone --depth 1 {repo} /opt/beonmeet-worker
       cd /opt/beonmeet-worker
-      report() {
+      report() {{
         curl -fsS -X POST \
           -H 'content-type: application/json' \
-          --data "{\"stage\":\"$1\",\"detail\":\"\${2:-}\"}" \
+          --data "{{\"stage\":\"$1\",\"detail\":\"\${{2:-}}\"}}" \
           {CONTROLLER_PUBLIC_URL}/internal/autoscale/status/{token} >/dev/null 2>&1 || true
-      }
+      }}
       report cloud_init_started
       curl -fsS --retry 8 --retry-delay 5 \
         {CONTROLLER_PUBLIC_URL}/internal/autoscale/env/{token} \
