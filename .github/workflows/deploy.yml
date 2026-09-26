@@ -22,7 +22,7 @@ jobs:
           host: ${{ secrets.HOST }}
           username: root
           password: ${{ secrets.PASS }}
-          source: "app,patches,docker-compose.yml,Caddyfile,.env.example,README.md"
+          source: "app,worker,patches,docker-compose.yml,Caddyfile,.env.example,README.md"
           target: "/opt/beonmeet"
           overwrite: true
 
@@ -200,11 +200,24 @@ jobs:
             chown 1001:1001 /opt/beonmeet/recorder-accounts/recorder136/.beonmeet-ready /opt/beonmeet/recorder-accounts/recorder802/.beonmeet-ready
             mkdir -p /dev/shm/beonmeet
             chmod 777 /dev/shm/beonmeet
+            # Keep a valid bind target for the controller while the runtime
+            # image bundle is rebuilt below.
+            touch /opt/beonmeet/autoscale-images.tar
             if ! docker compose up -d --build --remove-orphans; then
               docker compose ps -a || true
               docker compose logs --tail=250 controller postgres redis meeting-bot-free1 meeting-bot-free2 meeting-bot-premium1 chrome-cdp-free1 chrome-cdp-free2 chrome-cdp-premium1 caddy || true
               exit 1
             fi
+            # Package already-built production images for fresh Hetzner workers.
+            # This avoids compiling Chromium/Playwright/TypeScript on every scale-up.
+            docker build -t beonmeet-worker-agent:latest -f worker/Dockerfile .
+            docker save \
+              beonmeet-meeting-bot:latest \
+              beonmeet-chrome-cdp:latest \
+              beonmeet-worker-agent:latest \
+              -o /opt/beonmeet/autoscale-images.tar
+            chmod 600 /opt/beonmeet/autoscale-images.tar
+            docker compose restart controller
             docker compose up -d --force-recreate caddy
             # Keep the one-time Google login browsers reachable only while
             # a secondary recorder profile still needs its first sign-in.
