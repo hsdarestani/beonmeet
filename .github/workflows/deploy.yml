@@ -187,9 +187,11 @@ jobs:
               chmod 700 "/opt/beonmeet/$PROFILE"
             done
 
-            mkdir -p /opt/beonmeet/recorder-accounts
+            mkdir -p /opt/beonmeet/recorder-accounts/recorder136
+            mkdir -p /opt/beonmeet/recorder-accounts/recorder802
             chown -R 1001:1001 /opt/beonmeet/recorder-accounts
             chmod 700 /opt/beonmeet/recorder-accounts
+            chmod 700 /opt/beonmeet/recorder-accounts/recorder136 /opt/beonmeet/recorder-accounts/recorder802
             mkdir -p /dev/shm/beonmeet
             chmod 777 /dev/shm/beonmeet
             if ! docker compose up -d --build --remove-orphans; then
@@ -198,6 +200,10 @@ jobs:
               exit 1
             fi
             docker compose up -d --force-recreate caddy
+            # Keep the two one-time Google login browsers reachable only on
+            # server loopback. The operator reaches them through an SSH tunnel;
+            # they are never published on the public interface.
+            docker compose --profile recorder-setup up -d recorder-setup-136 recorder-setup-802
             docker compose ps
 
             for i in $(seq 1 30); do
