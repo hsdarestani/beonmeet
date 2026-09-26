@@ -2114,6 +2114,14 @@ async def delivery_recovery_loop() -> None:
                 except ValueError:
                     continue
                 if not raw_path.exists() or not raw_path.is_file():
+                    state.setdefault("pending_deliveries", {}).pop(pending_id, None)
+                    missing_event_id = str((pending or {}).get("event_id") or "")
+                    if missing_event_id:
+                        launched = state.setdefault("launched_events", {}).get(missing_event_id) or {}
+                        if str(launched.get("status") or "") == "delivering":
+                            state["launched_events"].pop(missing_event_id, None)
+                    await save_state()
+                    print(f"dropped stale pending delivery {pending_id}: source file is gone", flush=True)
                     continue
                 updated_raw = str((pending or {}).get("updated_at") or "")
                 try:
