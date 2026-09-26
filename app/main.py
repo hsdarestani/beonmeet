@@ -1099,47 +1099,160 @@ async def send_recording_to_recipients(
         part.unlink(missing_ok=True)
 
 
+def _normalize_transcript_text(value: str) -> str:
+    text_value = re.sub(r"\s+", " ", (value or "").strip())
+    # Normalize common Arabic code points to Persian forms without translating
+    # or otherwise changing the original language of the meeting.
+    return (
+        text_value
+        .replace("ي", "ی")
+        .replace("ى", "ی")
+        .replace("ك", "ک")
+    )
+
+
+def _audio_duration_seconds(audio_path: Path) -> float:
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=nw=1:nk=1",
+                str(audio_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return max(0.0, float(probe.stdout.strip() or "0"))
+    except Exception:
+        return 0.0
+
+
 def transcribe_audio_local(audio_path: Path) -> tuple[str, str]:
     global _whisper_model
     from faster_whisper import WhisperModel
 
     if _whisper_model is None:
-        # Medium is much more reliable for Persian and multilingual meetings than
-        # the previous base model. With 16 vCPU / 32 GB RAM and transcription
-        # concurrency=1 it is a safe quality/performance tradeoff.
-        model_name = os.environ.get("WHISPER_MODEL", "medium")
+        # large-v3 materially improves Persian and non-English accuracy. Keeping
+        # concurrency at one protects the 16-vCPU production host from CPU spikes.
+        model_name = os.environ.get("WHISPER_MODEL", "large-v3")
         _whisper_model = WhisperModel(
             model_name,
             device="cpu",
-            compute_type="int8",
-            cpu_threads=max(4, min(12, (os.cpu_count() or 8) - 2)),
+            compute_type=os.environ.get("WHISPER_COMPUTE_TYPE", "int8"),
+            cpu_threads=max(6, min(14, (os.cpu_count() or 8) - 2)),
+            num_workers=1,
             download_root=str(DATA_DIR / "whisper-models"),
         )
 
-    segments, info = _whisper_model.transcribe(
-        str(audio_path),
-        beam_size=5,
-        best_of=5,
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 350},
-        condition_on_previous_text=True,
-        multilingual=True,
-        language_detection_threshold=0.70,
-        language_detection_segments=5,
-    )
+    duration = _audio_duration_seconds(audio_path)
+    chunk_seconds = max(45, int(os.environ.get("TRANSCRIPTION_CHUNK_SECONDS", "120")))
+    chunks: list[tuple[float, Path, bool]] = []
 
-    lines = []
-    for segment in segments:
-        text_value = (segment.text or "").strip()
-        if not text_value:
-            continue
-        minutes = int(segment.start // 60)
-        seconds = int(segment.start % 60)
-        lines.append(f"[{minutes:02d}:{seconds:02d}] {text_value}")
+    if duration <= 0 or duration <= chunk_seconds * 1.25:
+        chunks.append((0.0, audio_path, False))
+    else:
+        start_at = 0.0
+        index = 0
+        while start_at < duration:
+            length = min(float(chunk_seconds), duration - start_at)
+            chunk_path = audio_path.with_name(
+                f".{audio_path.stem}_transcribe_{index:04d}.wav"
+            )
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-ss",
+                    f"{start_at:.3f}",
+                    "-t",
+                    f"{length:.3f}",
+                    "-i",
+                    str(audio_path),
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(chunk_path),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            chunks.append((start_at, chunk_path, True))
+            start_at += length
+            index += 1
 
-    language = getattr(info, "language", None) or "unknown"
-    probability = float(getattr(info, "language_probability", 0.0) or 0.0)
-    language_label = f"{language} ({probability * 100:.0f}٪) · تشخیص چندزبانه فعاله"
+    lines: list[str] = []
+    previous_text = ""
+    language_stats: dict[str, list[float]] = {}
+
+    try:
+        for offset_seconds, chunk_path, _temporary in chunks:
+            segments, info = _whisper_model.transcribe(
+                str(chunk_path),
+                task="transcribe",
+                language=None,
+                beam_size=7,
+                best_of=5,
+                patience=1.2,
+                temperature=0.0,
+                vad_filter=True,
+                vad_parameters={
+                    "min_silence_duration_ms": 250,
+                    "speech_pad_ms": 350,
+                    "min_speech_duration_ms": 200,
+                },
+                condition_on_previous_text=True,
+                multilingual=True,
+                language_detection_threshold=0.45,
+                language_detection_segments=10,
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.4,
+                log_prob_threshold=-1.0,
+            )
+
+            language = str(getattr(info, "language", None) or "unknown")
+            probability = float(
+                getattr(info, "language_probability", 0.0) or 0.0
+            )
+            language_stats.setdefault(language, []).append(probability)
+
+            for segment in segments:
+                text_value = _normalize_transcript_text(segment.text or "")
+                if not text_value:
+                    continue
+                # Whisper occasionally repeats the same sentence at a chunk
+                # boundary. Suppress exact consecutive duplicates only.
+                if text_value == previous_text:
+                    continue
+                previous_text = text_value
+                absolute_start = offset_seconds + float(segment.start or 0.0)
+                minutes = int(absolute_start // 60)
+                seconds = int(absolute_start % 60)
+                lines.append(f"[{minutes:02d}:{seconds:02d}] {text_value}")
+    finally:
+        for _offset, chunk_path, temporary in chunks:
+            if temporary:
+                chunk_path.unlink(missing_ok=True)
+
+    detected = []
+    for language, probabilities in sorted(
+        language_stats.items(),
+        key=lambda item: (-len(item[1]), item[0]),
+    ):
+        average = sum(probabilities) / max(1, len(probabilities))
+        detected.append(f"{language} ({average * 100:.0f}%)")
+
+    language_label = ", ".join(detected) if detected else "auto"
     return "\n".join(lines).strip(), language_label
 
 
