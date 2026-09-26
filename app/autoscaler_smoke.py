@@ -49,6 +49,7 @@ async def run() -> int:
         deadline = started + int(os.environ.get("AUTOSCALER_SMOKE_TIMEOUT_SECONDS", "900"))
 
         try:
+            last_progress = 0.0
             while time.monotonic() < deadline:
                 runtime = _runtime(worker_id)
                 if runtime:
@@ -69,6 +70,24 @@ async def run() -> int:
                             flush=True,
                         )
                         return 0
+
+                # Emit progress so CI/SSH transports never treat this long-running
+                # bootstrap check as an idle connection.
+                elapsed = time.monotonic() - started
+                if elapsed - last_progress >= 20:
+                    print(
+                        "AUTOSCALER_SMOKE_WAIT "
+                        + json.dumps(
+                            {
+                                "worker_id": worker_id,
+                                "elapsed_seconds": int(elapsed),
+                                "runtime_seen": bool(runtime),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                    last_progress = elapsed
                 await asyncio.sleep(10)
 
             print(
