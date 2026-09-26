@@ -67,6 +67,10 @@ def _worker_key(worker_id: str) -> str:
     return f"beonmeet:worker:{worker_id}"
 
 
+def _bootstrap_status_key(worker_id: str) -> str:
+    return f"beonmeet:autoscale:status:{worker_id}"
+
+
 def _looks_like_chrome_profile(path: Path) -> bool:
     if not path.exists() or not path.is_dir():
         return False
@@ -137,6 +141,32 @@ def _load_bootstrap(token: str) -> dict[str, Any]:
     except Exception:
         raise HTTPException(status_code=500, detail="Invalid bootstrap state")
 
+
+@router.post("/internal/autoscale/status/{token}")
+async def bootstrap_status(token: str, request: Request) -> dict[str, Any]:
+    entry = _load_bootstrap(token)
+    worker_id = str(entry.get("worker_id") or "")
+    if not worker_id:
+        raise HTTPException(status_code=400, detail="Missing worker id")
+    payload = await request.json()
+    stage = str(payload.get("stage") or "unknown")[:120]
+    detail = str(payload.get("detail") or "")[:1000]
+    status = {"stage": stage, "detail": detail, "updated_at": time.time()}
+    redis_client.setex(
+        _bootstrap_status_key(worker_id),
+        3600,
+        json.dumps(status, separators=(",", ":")),
+    )
+    print(f"autoscale bootstrap {worker_id}: {stage} {detail}", flush=True)
+    return {"ok": True}
+
+
+def _bootstrap_status(worker_id: str) -> dict[str, Any] | None:
+    try:
+        raw = redis_client.get(_bootstrap_status_key(worker_id))
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
 
 @router.get("/internal/autoscale/env/{token}", response_class=PlainTextResponse)
 async def bootstrap_env(token: str) -> PlainTextResponse:
@@ -257,20 +287,38 @@ runcmd:
       rm -rf /opt/beonmeet-worker
       git clone --depth 1 {repo} /opt/beonmeet-worker
       cd /opt/beonmeet-worker
+      report() {
+        curl -fsS -X POST \
+          -H 'content-type: application/json' \
+          --data "{\"stage\":\"$1\",\"detail\":\"\${2:-}\"}" \
+          {CONTROLLER_PUBLIC_URL}/internal/autoscale/status/{token} >/dev/null 2>&1 || true
+      }
+      report cloud_init_started
       curl -fsS --retry 8 --retry-delay 5 \
         {CONTROLLER_PUBLIC_URL}/internal/autoscale/env/{token} \
         -o worker.env
+      report env_downloaded
       curl -fsS --retry 8 --retry-delay 5 \
         {CONTROLLER_PUBLIC_URL}/internal/autoscale/profile/{token} \
         -o /tmp/beonmeet-profile.tar.gz
+      report profile_downloaded "$(du -h /tmp/beonmeet-profile.tar.gz | cut -f1)"
       curl -fsS --retry 8 --retry-delay 5 \
         {CONTROLLER_PUBLIC_URL}/internal/autoscale/images/{token} \
         -o /opt/beonmeet-worker/prebuilt-images.tar
+      report images_downloaded "$(du -h /opt/beonmeet-worker/prebuilt-images.tar | cut -f1)"
       tar -xzf /tmp/beonmeet-profile.tar.gz -C /opt/beonmeet-worker
       rm -f /tmp/beonmeet-profile.tar.gz
+      report profile_extracted
       chmod 600 worker.env
       chmod +x worker/bootstrap.sh
-      ./worker/bootstrap.sh /opt/beonmeet-worker
+      report bootstrap_starting
+      if ./worker/bootstrap.sh /opt/beonmeet-worker > /tmp/beonmeet-bootstrap.log 2>&1; then
+        report bootstrap_finished
+      else
+        tail -c 900 /tmp/beonmeet-bootstrap.log | tr '\n' ' ' > /tmp/beonmeet-bootstrap-tail.txt
+        report bootstrap_failed "$(cat /tmp/beonmeet-bootstrap-tail.txt)"
+        exit 1
+      fi
       sed -ri 's/^#?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config || true
       systemctl reload ssh || systemctl reload sshd || true
 """
