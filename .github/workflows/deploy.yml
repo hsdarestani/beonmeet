@@ -206,10 +206,15 @@ jobs:
               exit 1
             fi
             docker compose up -d --force-recreate caddy
-            # Keep the two one-time Google login browsers reachable only on
-            # server loopback. The operator reaches them through an SSH tunnel;
-            # they are never published on the public interface.
-            docker compose --profile recorder-setup up -d recorder-setup-136 recorder-setup-802
+            # Keep the one-time Google login browsers reachable only while
+            # a secondary recorder profile still needs its first sign-in.
+            # Once both profiles are activated, stop the setup browsers so they
+            # do not consume production CPU/RAM.
+            if [ ! -f /opt/beonmeet/recorder-accounts/recorder136/.beonmeet-ready ] || [ ! -f /opt/beonmeet/recorder-accounts/recorder802/.beonmeet-ready ]; then
+              docker compose --profile recorder-setup up -d recorder-setup-136 recorder-setup-802
+            else
+              docker compose --profile recorder-setup stop recorder-setup-136 recorder-setup-802 || true
+            fi
             docker compose ps
 
             for i in $(seq 1 30); do
