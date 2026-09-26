@@ -2078,7 +2078,42 @@ async def _recover_legacy_orphan(event_id: str, launched: dict[str, Any], raw_pa
 
 
 async def delivery_recovery_loop() -> None:
-    await asyncio.sleep(15)
+    await asyncio.sleep(5)
+
+    # One-time force recovery for the retained session that was interrupted by
+    # the production deploy. The delivery path is idempotent: it will not resend
+    # video parts when video_delivered is already true; it only emits the full-file
+    # download link if the retained source still exists.
+    try:
+        target_event = "manual-99a88a85-53f5-467b-908c-25b5c98aa78f"
+        for pending_id, pending in list(state.setdefault("pending_deliveries", {}).items()):
+            if str((pending or {}).get("event_id") or "") != target_event:
+                continue
+            raw_path = Path(str((pending or {}).get("file_path") or "")).resolve()
+            try:
+                raw_path.relative_to(RECORDING_ROOT)
+            except ValueError:
+                continue
+            if not raw_path.exists() or not raw_path.is_file():
+                continue
+            recovery_data = {
+                "userId": str((pending or {}).get("chat_id") or ""),
+                "eventId": target_event,
+                "botId": target_event,
+                "meetingLink": str((pending or {}).get("meeting_link") or ""),
+                "filename": str((pending or {}).get("filename") or raw_path.name),
+                "duration": int((pending or {}).get("duration") or 0),
+                "_silent_retry": True,
+            }
+            print(f"forcing one-time full-file link recovery for {target_event}", flush=True)
+            try:
+                await _process_recording(recovery_data, raw_path)
+            except Exception as exc:
+                print("forced full-file link recovery error:", repr(exc), flush=True)
+            break
+    except Exception as exc:
+        print("forced recovery bootstrap error:", repr(exc), flush=True)
+
     while True:
         try:
             if active_delivery_jobs:
