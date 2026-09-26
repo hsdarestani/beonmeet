@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 import redis
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 from scaling_policy import bounded_scale_up
@@ -143,14 +143,17 @@ def _load_bootstrap(token: str) -> dict[str, Any]:
 
 
 @router.post("/internal/autoscale/status/{token}")
-async def bootstrap_status(token: str, request: Request) -> dict[str, Any]:
+async def bootstrap_status(
+    token: str,
+    stage: str = "unknown",
+    detail: str = "",
+) -> dict[str, Any]:
     entry = _load_bootstrap(token)
     worker_id = str(entry.get("worker_id") or "")
     if not worker_id:
         raise HTTPException(status_code=400, detail="Missing worker id")
-    payload = await request.json()
-    stage = str(payload.get("stage") or "unknown")[:120]
-    detail = str(payload.get("detail") or "")[:1000]
+    stage = str(stage or "unknown")[:120]
+    detail = str(detail or "")[:1000]
     status = {"stage": stage, "detail": detail, "updated_at": time.time()}
     redis_client.setex(
         _bootstrap_status_key(worker_id),
@@ -274,51 +277,51 @@ async def _delete_server(client: httpx.AsyncClient, server_id: int) -> None:
 def _cloud_init(token: str) -> str:
     repo = "https://github.com/hsdarestani/beonmeet.git"
     return f"""#cloud-config
-package_update: true
-packages:
-  - git
-  - curl
-  - ca-certificates
-  - tar
-  - python3
 runcmd:
   - |
       set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+
+      report() {{
+        curl -fsS -X POST -G --data-urlencode "stage=$1" --data-urlencode "detail=${{2:-}}" {CONTROLLER_PUBLIC_URL}/internal/autoscale/status/{token} >/dev/null 2>&1 || true
+      }}
+
+      report cloud_init_started
+      if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        apt-get update
+        apt-get install -y git curl ca-certificates tar python3
+      fi
+      report prerequisites_ready
+
       rm -rf /opt/beonmeet-worker
       git clone --depth 1 {repo} /opt/beonmeet-worker
       cd /opt/beonmeet-worker
-      report() {{
-        curl -fsS -X POST \
-          -H 'content-type: application/json' \
-          --data "{{\"stage\":\"$1\",\"detail\":\"\${{2:-}}\"}}" \
-          {CONTROLLER_PUBLIC_URL}/internal/autoscale/status/{token} >/dev/null 2>&1 || true
-      }}
-      report cloud_init_started
-      curl -fsS --retry 8 --retry-delay 5 \
-        {CONTROLLER_PUBLIC_URL}/internal/autoscale/env/{token} \
-        -o worker.env
+      report repo_cloned
+
+      curl -fsS --retry 8 --retry-delay 5 {CONTROLLER_PUBLIC_URL}/internal/autoscale/env/{token} -o worker.env
       report env_downloaded
-      curl -fsS --retry 8 --retry-delay 5 \
-        {CONTROLLER_PUBLIC_URL}/internal/autoscale/profile/{token} \
-        -o /tmp/beonmeet-profile.tar.gz
+
+      curl -fsS --retry 8 --retry-delay 5 {CONTROLLER_PUBLIC_URL}/internal/autoscale/profile/{token} -o /tmp/beonmeet-profile.tar.gz
       report profile_downloaded "$(du -h /tmp/beonmeet-profile.tar.gz | cut -f1)"
-      curl -fsS --retry 8 --retry-delay 5 \
-        {CONTROLLER_PUBLIC_URL}/internal/autoscale/images/{token} \
-        -o /opt/beonmeet-worker/prebuilt-images.tar
+
+      curl -fsS --retry 8 --retry-delay 5 {CONTROLLER_PUBLIC_URL}/internal/autoscale/images/{token} -o /opt/beonmeet-worker/prebuilt-images.tar
       report images_downloaded "$(du -h /opt/beonmeet-worker/prebuilt-images.tar | cut -f1)"
+
       tar -xzf /tmp/beonmeet-profile.tar.gz -C /opt/beonmeet-worker
       rm -f /tmp/beonmeet-profile.tar.gz
       report profile_extracted
+
       chmod 600 worker.env
       chmod +x worker/bootstrap.sh
       report bootstrap_starting
       if ./worker/bootstrap.sh /opt/beonmeet-worker > /tmp/beonmeet-bootstrap.log 2>&1; then
         report bootstrap_finished
       else
-        tail -c 900 /tmp/beonmeet-bootstrap.log | tr '\n' ' ' > /tmp/beonmeet-bootstrap-tail.txt
-        report bootstrap_failed "$(cat /tmp/beonmeet-bootstrap-tail.txt)"
+        detail="$(tail -c 700 /tmp/beonmeet-bootstrap.log | base64 -w0 || true)"
+        report bootstrap_failed "$detail"
         exit 1
       fi
+
       sed -ri 's/^#?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config || true
       systemctl reload ssh || systemctl reload sshd || true
 """
