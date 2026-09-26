@@ -1900,28 +1900,42 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
         active_delivery_jobs = max(0, active_delivery_jobs - 1)
 
 
-def _legacy_orphan_candidate() -> tuple[str, dict[str, Any], Path] | None:
+def _legacy_orphan_candidates() -> list[tuple[str, dict[str, Any], Path]]:
     if state.get("pending_deliveries"):
-        return None
+        return []
 
-    launched = [
-        (str(event_id), item)
-        for event_id, item in state.get("launched_events", {}).items()
-        if str((item or {}).get("status") or "") in {"recording", "delivering"}
-        and str((item or {}).get("chat_id") or "").strip()
-    ]
-    if len(launched) != 1:
-        return None
+    now = datetime.now(timezone.utc)
+    launched_items = []
+    for event_id, item in state.get("launched_events", {}).items():
+        item = item or {}
+        chat_id = str(item.get("chat_id") or "").strip()
+        if not chat_id:
+            continue
+        raw_ts = str(
+            item.get("delivery_started_at")
+            or item.get("recording_started_at")
+            or item.get("waiting_since")
+            or item.get("launched_at")
+            or ""
+        )
+        try:
+            event_ts = isoparse(raw_ts) if raw_ts else now - timedelta(hours=12)
+        except Exception:
+            event_ts = now - timedelta(hours=12)
+        if now - event_ts > timedelta(hours=12):
+            continue
+        launched_items.append((str(event_id), item, event_ts))
 
-    cutoff = datetime.now(timezone.utc).timestamp() - 6 * 3600
-    candidates = []
-    for path in RECORDING_ROOT.glob("*"):
+    results: list[tuple[str, dict[str, Any], Path]] = []
+    cutoff = now.timestamp() - 12 * 3600
+
+    # Local recorder source files are stored as:
+    # /recordings/<telegram_user_id>/<tempFileId>.webm
+    # The worker intentionally keeps them when controller delivery fails.
+    for path in RECORDING_ROOT.glob("*/*"):
         if not path.is_file():
             continue
-        name = path.name
         if path.suffix.lower() not in {".webm", ".mp4"}:
-            continue
-        if "_standard" in name or "_part_" in name or name.endswith("_transcript.mp4"):
             continue
         try:
             stat = path.stat()
@@ -1929,12 +1943,52 @@ def _legacy_orphan_candidate() -> tuple[str, dict[str, Any], Path] | None:
             continue
         if stat.st_size < 1024 * 1024 or stat.st_mtime < cutoff:
             continue
-        candidates.append(path)
 
-    if len(candidates) != 1:
-        return None
-    event_id, item = launched[0]
-    return event_id, item, candidates[0]
+        chat_id = path.parent.name.strip()
+        if not chat_id:
+            continue
+
+        matching = [
+            (event_id, item, event_ts)
+            for event_id, item, event_ts in launched_items
+            if str(item.get("chat_id") or "").strip() == chat_id
+        ]
+        if matching:
+            matching.sort(key=lambda entry: entry[2], reverse=True)
+            event_id, item, _event_ts = matching[0]
+        else:
+            # The Telegram id is encoded in the directory name by the recorder.
+            # A matching launch record is helpful for meeting metadata but not
+            # required to safely return the retained file to its owner.
+            event_id = ""
+            item = {"chat_id": chat_id, "meet_url": ""}
+
+        results.append((event_id, item, path))
+
+    return sorted(
+        results,
+        key=lambda entry: entry[2].stat().st_mtime if entry[2].exists() else 0,
+    )
+
+
+async def _recover_legacy_orphan(event_id: str, launched: dict[str, Any], raw_path: Path) -> None:
+    chat_id = str(launched.get("chat_id") or raw_path.parent.name).strip()
+    if not chat_id:
+        return
+    recovery_data = {
+        "userId": chat_id,
+        "eventId": event_id,
+        "botId": event_id,
+        "meetingLink": str(launched.get("meet_url") or ""),
+        "filename": f"BeOnMeet-recovered-{raw_path.name}",
+        "duration": 0,
+        "_silent_retry": True,
+    }
+    print(
+        f"recovering retained recorder file chat={chat_id} event={event_id or 'unknown'} file={raw_path}",
+        flush=True,
+    )
+    await _process_recording(recovery_data, raw_path)
 
 
 async def delivery_recovery_loop() -> None:
@@ -1947,24 +2001,12 @@ async def delivery_recovery_loop() -> None:
 
             pending_items = list(state.setdefault("pending_deliveries", {}).items())
             if not pending_items:
-                legacy = _legacy_orphan_candidate()
-                if legacy:
-                    event_id, launched, raw_path = legacy
-                    recovery_data = {
-                        "userId": str(launched.get("chat_id") or ""),
-                        "eventId": event_id,
-                        "botId": event_id,
-                        "meetingLink": str(launched.get("meet_url") or ""),
-                        "filename": raw_path.name,
-                        "duration": 0,
-                        "_silent_retry": True,
-                    }
-                    print(
-                        f"recovering legacy orphan recording event={event_id} file={raw_path.name}",
-                        flush=True,
-                    )
+                legacy_items = _legacy_orphan_candidates()
+                for event_id, launched, raw_path in legacy_items:
+                    if active_delivery_jobs:
+                        break
                     try:
-                        await _process_recording(recovery_data, raw_path)
+                        await _recover_legacy_orphan(event_id, launched, raw_path)
                     except Exception as exc:
                         print("legacy delivery recovery error:", repr(exc), flush=True)
                 await asyncio.sleep(30)
