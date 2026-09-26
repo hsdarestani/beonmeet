@@ -254,6 +254,12 @@ async def setup_telegram_profile() -> None:
 
         # English is the neutral default when Telegram does not provide a language.
         default_profile = i18n_profile("en")
+        await telegram("setMyDescription", {
+            "description": default_profile["description"],
+        })
+        await telegram("setMyShortDescription", {
+            "short_description": default_profile["short"],
+        })
         default_commands = [
             {"command": "start", "description": default_profile["commands"]["start"]},
             {"command": "plans", "description": default_profile["commands"]["plans"]},
