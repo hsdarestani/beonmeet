@@ -59,25 +59,35 @@ jobs:
 
             cd /opt/beonmeet
 
-            pipeline_busy_count() {
-              docker compose exec -T controller python -c 'import json,urllib.request; urls=["http://meeting-bot-free1:3000/capacity","http://meeting-bot-free2:3000/capacity","http://meeting-bot-premium1:3000/capacity"]; running=sum(int(json.loads(urllib.request.urlopen(u,timeout=5).read().decode())["data"].get("runningJobs") or 0) for u in urls); h=json.loads(urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=5).read().decode()); print(running+int(h.get("active_delivery_jobs") or 0))'
+            pipeline_state() {
+              docker compose exec -T controller python -c 'import json,os,urllib.request,redis; urls=["http://meeting-bot-free1:3000/capacity","http://meeting-bot-free2:3000/capacity","http://meeting-bot-premium1:3000/capacity"]; running=sum(int(json.loads(urllib.request.urlopen(u,timeout=5).read().decode())["data"].get("runningJobs") or 0) for u in urls); r=redis.Redis.from_url(os.environ.get("REDIS_URL","redis://redis:6379/0"),decode_responses=True); raw=r.get(os.environ.get("REDIS_STATE_KEY","beonmeet:controller:state")) or "{}"; st=json.loads(raw); p=list((st.get("pending_deliveries") or {}).values()); print(f"{running}:{len(p)}:{max([int(x.get(chr(97)+chr(116)+chr(116)+chr(101)+chr(109)+chr(112)+chr(116)+chr(115)) or 0) for x in p]+[0])}")'
             }
 
-            PIPELINE_BUSY="unknown"
             IDLE_STREAK=0
+            PIPELINE_SAFE=0
             for _ in $(seq 1 360); do
-              PIPELINE_BUSY="$(pipeline_busy_count 2>/dev/null || true)"
-              if [[ "$PIPELINE_BUSY" =~ ^[0-9]+$ ]]; then
-                if [ "$PIPELINE_BUSY" -eq 0 ]; then
+              PIPELINE_STATE="$(pipeline_state 2>/dev/null || true)"
+              IFS=':' read -r RUNNING_JOBS PENDING_DELIVERIES MAX_ATTEMPTS <<< "$PIPELINE_STATE"
+
+              if [[ "$RUNNING_JOBS" =~ ^[0-9]+$ ]] && [[ "$PENDING_DELIVERIES" =~ ^[0-9]+$ ]] && [[ "$MAX_ATTEMPTS" =~ ^[0-9]+$ ]]; then
+                if [ "$RUNNING_JOBS" -gt 0 ]; then
+                  IDLE_STREAK=0
+                  echo "Active recordings detected: $RUNNING_JOBS. Holding deploy."
+                elif [ "$PENDING_DELIVERIES" -gt 0 ] && [ "$MAX_ATTEMPTS" -ge 2 ]; then
+                  echo "Retry storm detected with no active recording; allowing controller restart to load idempotent delivery fix."
+                  PIPELINE_SAFE=1
+                  break
+                elif [ "$PENDING_DELIVERIES" -gt 0 ]; then
+                  IDLE_STREAK=0
+                  echo "A first-attempt delivery is still pending. Holding deploy."
+                else
                   IDLE_STREAK=$((IDLE_STREAK + 1))
                   echo "Delivery pipeline idle check $IDLE_STREAK/6"
                   if [ "$IDLE_STREAK" -ge 6 ]; then
                     echo "Pipeline has been fully idle for two minutes; production deploy may proceed"
+                    PIPELINE_SAFE=1
                     break
                   fi
-                else
-                  IDLE_STREAK=0
-                  echo "Delivery pipeline busy: $PIPELINE_BUSY. Holding deploy without restarting production."
                 fi
               else
                 echo "Unable to verify delivery pipeline state; refusing unsafe deploy"
@@ -86,8 +96,8 @@ jobs:
               sleep 20
             done
 
-            if [ "$PIPELINE_BUSY" != "0" ] || [ "$IDLE_STREAK" -lt 6 ]; then
-              echo "Delivery pipeline did not reach a safe idle state within the deploy window"
+            if [ "$PIPELINE_SAFE" != "1" ]; then
+              echo "Delivery pipeline did not reach a safe state within the deploy window"
               exit 1
             fi
 
