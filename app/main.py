@@ -109,6 +109,7 @@ worker_health_cache: dict[str, bool] = {}
 remote_worker_cache: dict[str, dict[str, Any]] = {}
 _whisper_model = None
 active_delivery_jobs = 0
+delivery_locks: dict[str, asyncio.Lock] = {}
 state: dict[str, Any] = {
     "telegram_offset": 0,
     "requests": {},
@@ -2075,7 +2076,7 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
         raise HTTPException(status_code=502, detail=str(exc))
 
 
-async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, Any]:
+async def _process_recording_locked(data: dict[str, Any], raw_path: Path) -> dict[str, Any]:
     global active_delivery_jobs
 
     chat_id = str(data.get("userId") or "").strip()
@@ -2095,14 +2096,6 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "last_error": "",
     }
-    # One-time recovery guard for the retained session that was already fully
-    # delivered once before the old recovery loop retried downstream work.
-    if (
-        event_id == "manual-99a88a85-53f5-467b-908c-25b5c98aa78f"
-        and attempts >= 2
-        and "video_delivered" not in state["pending_deliveries"][pending_id]
-    ):
-        state["pending_deliveries"][pending_id]["video_delivered"] = True
     if event_id:
         launched = state.setdefault("launched_events", {}).setdefault(event_id, {})
         launched["status"] = "delivering"
@@ -2125,6 +2118,22 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
         raise
     finally:
         active_delivery_jobs = max(0, active_delivery_jobs - 1)
+
+
+async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, Any]:
+    """Serialize delivery per meeting so endpoint retries and recovery cannot race."""
+    chat_id = str(data.get("userId") or "").strip()
+    event_id = str(data.get("botId") or data.get("eventId") or "").strip()
+    pending_id = event_id or f"{chat_id}:{raw_path.name}"
+    lock = delivery_locks.setdefault(pending_id, asyncio.Lock())
+
+    async with lock:
+        # A duplicate retry can arrive after the first delivery already completed
+        # and removed the source file. Treat it as idempotent success.
+        if not raw_path.exists() and pending_id not in state.setdefault("pending_deliveries", {}):
+            return {"ok": True, "duplicate": True, "pending_id": pending_id}
+        return await _process_recording_locked(data, raw_path)
+
 
 
 def _legacy_orphan_candidates() -> list[tuple[str, dict[str, Any], Path]]:
@@ -2221,38 +2230,9 @@ async def _recover_legacy_orphan(event_id: str, launched: dict[str, Any], raw_pa
 async def delivery_recovery_loop() -> None:
     await asyncio.sleep(5)
 
-    # One-time recovery for the retained session that was interrupted by an
-    # earlier delivery failure. The delivery path is idempotent: if video was
-    # already delivered, recovery resumes with Premium audio/transcript work.
-    try:
-        target_event = "manual-99a88a85-53f5-467b-908c-25b5c98aa78f"
-        for pending_id, pending in list(state.setdefault("pending_deliveries", {}).items()):
-            if str((pending or {}).get("event_id") or "") != target_event:
-                continue
-            raw_path = Path(str((pending or {}).get("file_path") or "")).resolve()
-            try:
-                raw_path.relative_to(RECORDING_ROOT)
-            except ValueError:
-                continue
-            if not raw_path.exists() or not raw_path.is_file():
-                continue
-            recovery_data = {
-                "userId": str((pending or {}).get("chat_id") or ""),
-                "eventId": target_event,
-                "botId": target_event,
-                "meetingLink": str((pending or {}).get("meeting_link") or ""),
-                "filename": str((pending or {}).get("filename") or raw_path.name),
-                "duration": int((pending or {}).get("duration") or 0),
-                "_silent_retry": True,
-            }
-            print(f"forcing one-time pending delivery recovery for {target_event}", flush=True)
-            try:
-                await _process_recording(recovery_data, raw_path)
-            except Exception as exc:
-                print("forced pending delivery recovery error:", repr(exc), flush=True)
-            break
-    except Exception as exc:
-        print("forced recovery bootstrap error:", repr(exc), flush=True)
+    # Pending deliveries are retried by the generic idempotent loop below.
+    # Per-meeting locks prevent endpoint/recovery races and per-stage flags
+    # resume only the missing Premium deliverables.
 
     while True:
         try:
@@ -2277,11 +2257,7 @@ async def delivery_recovery_loop() -> None:
                 if active_delivery_jobs:
                     break
                 attempts = int((pending or {}).get("attempts") or 0)
-                event_id_for_retry = str((pending or {}).get("event_id") or "")
-                is_known_recovered_session = (
-                    event_id_for_retry == "manual-99a88a85-53f5-467b-908c-25b5c98aa78f"
-                )
-                if attempts >= 8 and not is_known_recovered_session:
+                if attempts >= 8:
                     continue
                 raw_path = Path(str((pending or {}).get("file_path") or "")).resolve()
                 try:

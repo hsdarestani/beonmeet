@@ -14,6 +14,9 @@ required = [
     'pending_state["transcript_delivered"] = True',
     'premium downstream delivery incomplete',
     'large_audio_download',
+    'delivery_locks: dict[str, asyncio.Lock] = {}',
+    'async with lock:',
+    '"duplicate": True',
 ]
 
 for needle in required:
@@ -27,3 +30,6 @@ assert 'if not (audio_already_delivered and transcript_already_delivered):' in M
 assert 'if audio_delivery_error is not None or transcript_processing_error is not None:' in MAIN
 
 print("PREMIUM_DELIVERY_TEST_PASS")
+
+assert "manual-99a88a85-53f5-467b-908c-25b5c98aa78f" not in MAIN, "remove session-specific recovery hacks"
+print("DELIVERY_IDEMPOTENCY_TEST_PASS")
