@@ -1133,6 +1133,54 @@ async def send_recording_to_recipients(
         )
 
 
+async def send_audio_to_recipients(
+    recipients: list[dict[str, str]],
+    path: Path,
+    filename: str,
+) -> None:
+    """Deliver meeting audio without blocking downstream transcription.
+
+    Telegram's official Bot API rejects uploads around 50 MB. Prefer a compact
+    speech-friendly MP3 that normally fits, and fall back to an expiring secure
+    download for unusually long meetings or transient upload-size failures.
+    """
+    max_cloud = 49 * 1024 * 1024
+    size = path.stat().st_size
+    download_url: str | None = None
+
+    for target in recipients:
+        if size <= max_cloud or TELEGRAM_API_BASE != "https://api.telegram.org":
+            try:
+                with path.open("rb") as fp:
+                    await telegram(
+                        "sendDocument",
+                        {
+                            "chat_id": target["chat_id"],
+                            "caption": target["caption"],
+                        },
+                        {"document": (filename, fp, "audio/mpeg")},
+                    )
+                continue
+            except Exception as exc:
+                # Do not let one Telegram upload failure cancel transcription.
+                print(
+                    f"audio Telegram upload failed for {target['chat_id']}: {exc!r}",
+                    flush=True,
+                )
+
+        if download_url is None:
+            download_url = await create_recording_download(path, filename)
+        await tg_text(
+            target["chat_id"],
+            t(
+                target["chat_id"],
+                "large_audio_download",
+                url=download_url,
+                hours=DOWNLOAD_TTL_HOURS,
+            ),
+        )
+
+
 def _normalize_transcript_text(value: str) -> str:
     text_value = re.sub(r"\s+", " ", (value or "").strip())
     # Normalize common Arabic code points to Persian forms without translating
@@ -1824,21 +1872,6 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                 pending_state["video_delivered_at"] = datetime.now(timezone.utc).isoformat()
                 pending_state["updated_at"] = datetime.now(timezone.utc).isoformat()
                 await save_state()
-        elif (
-            pending_state is not None
-            and event_id == "manual-99a88a85-53f5-467b-908c-25b5c98aa78f"
-            and not pending_state.get("full_file_link_sent")
-            and raw_path.exists()
-        ):
-            download_url = await create_recording_download(raw_path, filename)
-            await tg_text(
-                chat_id,
-                t(chat_id, "large_video_download", url=download_url, hours=DOWNLOAD_TTL_HOURS),
-            )
-            pending_state["full_file_link_sent"] = True
-            pending_state["updated_at"] = datetime.now(timezone.utc).isoformat()
-            await save_state()
-
         await asyncio.to_thread(
             record_recording,
             chat_id,
@@ -1851,35 +1884,76 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
         if premium_active:
             audio_path = raw_path.with_suffix(".mp3")
             try:
+                # 64 kbps mono is well suited to speech and keeps roughly two-hour
+                # meetings close to Telegram's upload ceiling. Longer files use the
+                # secure download fallback in send_audio_to_recipients().
                 await asyncio.to_thread(
                     subprocess.run,
-                    ["ffmpeg", "-y", "-i", str(raw_path), "-vn", "-c:a", "libmp3lame", "-b:a", "160k", str(audio_path)],
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(raw_path),
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "44100",
+                        "-c:a",
+                        "libmp3lame",
+                        "-b:a",
+                        "64k",
+                        str(audio_path),
+                    ],
                     check=True,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+
                 audio_targets = [
-                    {"chat_id": chat_id, "caption": t(chat_id, "audio_ready_caption")}
+                    {
+                        "chat_id": chat_id,
+                        "caption": t(chat_id, "audio_ready_caption"),
+                    }
                 ]
                 if ADMINUSER and ADMINUSER != chat_id:
                     audio_targets.append({
                         "chat_id": ADMINUSER,
-                        "caption": f"🎧 فایل صوتی نسخه ویژه\n\n👤 درخواست دهنده:\n{who}\n🔗 جلسه: {meeting_link or 'نامشخص'}",
+                        "caption": (
+                            "🎧 فایل صوتی نسخه ویژه\n\n"
+                            f"👤 درخواست دهنده:\n{who}\n"
+                            f"🔗 جلسه: {meeting_link or 'نامشخص'}"
+                        ),
                     })
-                for target in audio_targets:
-                    with audio_path.open("rb") as fp:
-                        await telegram(
-                            "sendDocument",
-                            {"chat_id": target["chat_id"], "caption": target["caption"]},
-                            {"document": (f"{Path(filename).stem}.mp3", fp, "audio/mpeg")},
-                        )
+
+                # Audio delivery is intentionally isolated from transcription.
+                # Even if Telegram is temporarily unavailable, transcript creation
+                # must continue for Premium users.
+                try:
+                    await send_audio_to_recipients(
+                        audio_targets,
+                        audio_path,
+                        f"{Path(filename).stem}.mp3",
+                    )
+                except Exception as audio_delivery_error:
+                    print(
+                        "audio delivery error:",
+                        repr(audio_delivery_error),
+                        flush=True,
+                    )
 
                 try:
                     await tg_text(chat_id, t(chat_id, "transcribing"))
                     async with TRANSCRIPTION_SEMAPHORE:
-                        transcript, detected_language = await asyncio.to_thread(transcribe_audio_local, audio_path)
+                        transcript, detected_language = await asyncio.to_thread(
+                            transcribe_audio_local,
+                            audio_path,
+                        )
+
                     if transcript:
-                        transcript_path = raw_path.with_name(f"{raw_path.stem}_transcript.txt")
+                        transcript_path = raw_path.with_name(
+                            f"{raw_path.stem}_transcript.txt"
+                        )
                         transcript_path.write_text(
                             t(chat_id, "transcript_header")
                             + "\n"
@@ -1895,25 +1969,45 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                             encoding="utf-8",
                         )
                         transcript_targets = [
-                            {"chat_id": chat_id, "caption": t(chat_id, "transcript_ready_caption")}
+                            {
+                                "chat_id": chat_id,
+                                "caption": t(chat_id, "transcript_ready_caption"),
+                            }
                         ]
                         if ADMINUSER and ADMINUSER != chat_id:
                             transcript_targets.append({
                                 "chat_id": ADMINUSER,
-                                "caption": f"📝 متن جلسه نسخه ویژه\n\n👤 درخواست دهنده:\n{who}\n🔗 جلسه: {meeting_link or 'نامشخص'}",
+                                "caption": (
+                                    "📝 متن جلسه نسخه ویژه\n\n"
+                                    f"👤 درخواست دهنده:\n{who}\n"
+                                    f"🔗 جلسه: {meeting_link or 'نامشخص'}"
+                                ),
                             })
                         for target in transcript_targets:
                             with transcript_path.open("rb") as fp:
                                 await telegram(
                                     "sendDocument",
-                                    {"chat_id": target["chat_id"], "caption": target["caption"]},
-                                    {"document": (f"{Path(filename).stem}-transcript.txt", fp, "text/plain")},
+                                    {
+                                        "chat_id": target["chat_id"],
+                                        "caption": target["caption"],
+                                    },
+                                    {
+                                        "document": (
+                                            f"{Path(filename).stem}-transcript.txt",
+                                            fp,
+                                            "text/plain",
+                                        )
+                                    },
                                 )
                         transcript_path.unlink(missing_ok=True)
                     else:
                         await tg_text(chat_id, t(chat_id, "transcript_empty"))
                 except Exception as transcript_error:
-                    print("transcription error:", repr(transcript_error), flush=True)
+                    print(
+                        "transcription error:",
+                        repr(transcript_error),
+                        flush=True,
+                    )
                     await tg_text(chat_id, t(chat_id, "transcript_error"))
             finally:
                 audio_path.unlink(missing_ok=True)
@@ -2080,10 +2174,9 @@ async def _recover_legacy_orphan(event_id: str, launched: dict[str, Any], raw_pa
 async def delivery_recovery_loop() -> None:
     await asyncio.sleep(5)
 
-    # One-time force recovery for the retained session that was interrupted by
-    # the production deploy. The delivery path is idempotent: it will not resend
-    # video parts when video_delivered is already true; it only emits the full-file
-    # download link if the retained source still exists.
+    # One-time recovery for the retained session that was interrupted by an
+    # earlier delivery failure. The delivery path is idempotent: if video was
+    # already delivered, recovery resumes with Premium audio/transcript work.
     try:
         target_event = "manual-99a88a85-53f5-467b-908c-25b5c98aa78f"
         for pending_id, pending in list(state.setdefault("pending_deliveries", {}).items()):
@@ -2105,11 +2198,11 @@ async def delivery_recovery_loop() -> None:
                 "duration": int((pending or {}).get("duration") or 0),
                 "_silent_retry": True,
             }
-            print(f"forcing one-time full-file link recovery for {target_event}", flush=True)
+            print(f"forcing one-time pending delivery recovery for {target_event}", flush=True)
             try:
                 await _process_recording(recovery_data, raw_path)
             except Exception as exc:
-                print("forced full-file link recovery error:", repr(exc), flush=True)
+                print("forced pending delivery recovery error:", repr(exc), flush=True)
             break
     except Exception as exc:
         print("forced recovery bootstrap error:", repr(exc), flush=True)
