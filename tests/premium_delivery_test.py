@@ -20,7 +20,7 @@ for needle in required:
     assert needle in MAIN, f"missing premium delivery invariant: {needle}"
 
 audio_flag = MAIN.index('pending_state["audio_delivered"] = True')
-transcript_call = MAIN.index('transcribe_audio_local')
+transcript_call = MAIN.index('transcribe_audio_local,', audio_flag)
 assert audio_flag < transcript_call, "audio completion state must be persisted before transcription"
 
 assert 'if not (audio_already_delivered and transcript_already_delivered):' in MAIN
