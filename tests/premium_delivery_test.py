@@ -17,6 +17,9 @@ required = [
     'delivery_locks: dict[str, asyncio.Lock] = {}',
     'async with lock:',
     '"duplicate": True',
+    '"source_name": raw_path.name',
+    'missing exact event/chat/file identity',
+    'event mismatch',
 ]
 
 for needle in required:
@@ -33,3 +36,8 @@ print("PREMIUM_DELIVERY_TEST_PASS")
 
 assert "manual-99a88a85-53f5-467b-908c-25b5c98aa78f" not in MAIN, "remove session-specific recovery hacks"
 print("DELIVERY_IDEMPOTENCY_TEST_PASS")
+
+assert "_legacy_orphan_candidates" not in MAIN
+assert "_recover_legacy_orphan" not in MAIN
+assert 'RECORDING_ROOT.glob("*/*")' not in MAIN
+print("NO_STALE_RECORDING_RECOVERY_TEST_PASS")

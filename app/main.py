@@ -2089,6 +2089,7 @@ async def _process_recording_locked(data: dict[str, Any], raw_path: Path) -> dic
         "event_id": event_id,
         "chat_id": chat_id,
         "file_path": str(raw_path),
+        "source_name": raw_path.name,
         "filename": str(data.get("filename") or raw_path.name),
         "meeting_link": str(data.get("meetingLink") or ""),
         "duration": int(data.get("duration") or 0),
@@ -2136,97 +2137,6 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
 
 
 
-def _legacy_orphan_candidates() -> list[tuple[str, dict[str, Any], Path]]:
-    if state.get("pending_deliveries"):
-        return []
-
-    now = datetime.now(timezone.utc)
-    launched_items = []
-    for event_id, item in state.get("launched_events", {}).items():
-        item = item or {}
-        chat_id = str(item.get("chat_id") or "").strip()
-        if not chat_id:
-            continue
-        raw_ts = str(
-            item.get("delivery_started_at")
-            or item.get("recording_started_at")
-            or item.get("waiting_since")
-            or item.get("launched_at")
-            or ""
-        )
-        try:
-            event_ts = isoparse(raw_ts) if raw_ts else now - timedelta(hours=12)
-        except Exception:
-            event_ts = now - timedelta(hours=12)
-        if now - event_ts > timedelta(hours=12):
-            continue
-        launched_items.append((str(event_id), item, event_ts))
-
-    results: list[tuple[str, dict[str, Any], Path]] = []
-    cutoff = now.timestamp() - 12 * 3600
-
-    # Local recorder source files are stored as:
-    # /recordings/<telegram_user_id>/<tempFileId>.webm
-    # The worker intentionally keeps them when controller delivery fails.
-    for path in RECORDING_ROOT.glob("*/*"):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in {".webm", ".mp4"}:
-            continue
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        if stat.st_size < 1024 * 1024 or stat.st_mtime < cutoff:
-            continue
-
-        chat_id = path.parent.name.strip()
-        if not chat_id:
-            continue
-
-        matching = [
-            (event_id, item, event_ts)
-            for event_id, item, event_ts in launched_items
-            if str(item.get("chat_id") or "").strip() == chat_id
-        ]
-        if matching:
-            matching.sort(key=lambda entry: entry[2], reverse=True)
-            event_id, item, _event_ts = matching[0]
-        else:
-            # The Telegram id is encoded in the directory name by the recorder.
-            # A matching launch record is helpful for meeting metadata but not
-            # required to safely return the retained file to its owner.
-            event_id = ""
-            item = {"chat_id": chat_id, "meet_url": ""}
-
-        results.append((event_id, item, path))
-
-    return sorted(
-        results,
-        key=lambda entry: entry[2].stat().st_mtime if entry[2].exists() else 0,
-    )
-
-
-async def _recover_legacy_orphan(event_id: str, launched: dict[str, Any], raw_path: Path) -> None:
-    chat_id = str(launched.get("chat_id") or raw_path.parent.name).strip()
-    if not chat_id:
-        return
-    recovery_data = {
-        "userId": chat_id,
-        "eventId": event_id,
-        "botId": event_id,
-        "meetingLink": str(launched.get("meet_url") or ""),
-        "filename": f"BeOnMeet-recovered-{raw_path.name}",
-        "duration": 0,
-        "_silent_retry": True,
-    }
-    print(
-        f"recovering retained recorder file chat={chat_id} event={event_id or 'unknown'} file={raw_path}",
-        flush=True,
-    )
-    await _process_recording(recovery_data, raw_path)
-
-
 async def delivery_recovery_loop() -> None:
     await asyncio.sleep(5)
 
@@ -2242,27 +2152,57 @@ async def delivery_recovery_loop() -> None:
 
             pending_items = list(state.setdefault("pending_deliveries", {}).items())
             if not pending_items:
-                legacy_items = _legacy_orphan_candidates()
-                for event_id, launched, raw_path in legacy_items:
-                    if active_delivery_jobs:
-                        break
-                    try:
-                        await _recover_legacy_orphan(event_id, launched, raw_path)
-                    except Exception as exc:
-                        print("legacy delivery recovery error:", repr(exc), flush=True)
+                # Never infer a meeting from arbitrary files on disk. Recovery is
+                # allowed only from an exact pending-delivery record that carries
+                # the original event id and exact recorder file path.
                 await asyncio.sleep(30)
                 continue
 
             for pending_id, pending in pending_items:
                 if active_delivery_jobs:
                     break
-                attempts = int((pending or {}).get("attempts") or 0)
+
+                pending = pending or {}
+                attempts = int(pending.get("attempts") or 0)
                 if attempts >= 8:
                     continue
-                raw_path = Path(str((pending or {}).get("file_path") or "")).resolve()
+
+                event_id_for_retry = str(pending.get("event_id") or "").strip()
+                chat_id_for_retry = str(pending.get("chat_id") or "").strip()
+                stored_file_path = str(pending.get("file_path") or "").strip()
+                if not event_id_for_retry or not chat_id_for_retry or not stored_file_path:
+                    print(
+                        f"dropping unsafe pending delivery {pending_id}: "
+                        "missing exact event/chat/file identity",
+                        flush=True,
+                    )
+                    state.setdefault("pending_deliveries", {}).pop(pending_id, None)
+                    await save_state()
+                    continue
+
+                # The pending key must be the exact event id. This prevents an old
+                # retained file from being associated with a later meeting by user id.
+                if str(pending_id) != event_id_for_retry:
+                    print(
+                        f"dropping unsafe pending delivery {pending_id}: "
+                        f"event mismatch {event_id_for_retry}",
+                        flush=True,
+                    )
+                    state.setdefault("pending_deliveries", {}).pop(pending_id, None)
+                    await save_state()
+                    continue
+
+                raw_path = Path(stored_file_path).resolve()
                 try:
                     raw_path.relative_to(RECORDING_ROOT)
                 except ValueError:
+                    print(
+                        f"dropping unsafe pending delivery {pending_id}: "
+                        "file is outside recording root",
+                        flush=True,
+                    )
+                    state.setdefault("pending_deliveries", {}).pop(pending_id, None)
+                    await save_state()
                     continue
                 if not raw_path.exists() or not raw_path.is_file():
                     state.setdefault("pending_deliveries", {}).pop(pending_id, None)
