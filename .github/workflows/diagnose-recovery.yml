@@ -1,0 +1,82 @@
+name: Diagnose BeOnMeet Recovery
+
+on:
+  push:
+    branches: ["ops/diagnose-stale-recovery-20260927"]
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect production recovery state
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 5m
+          script: |
+            set -euo pipefail
+            cd /opt/beonmeet
+            echo "=== HEALTH ==="
+            docker compose exec -T controller python - <<'PY'
+            import json, urllib.request
+            h=json.loads(urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=5).read().decode())
+            print(json.dumps({
+              "ok":h.get("ok"),
+              "active_delivery_jobs":h.get("active_delivery_jobs"),
+              "pending_delivery_jobs":h.get("pending_delivery_jobs"),
+              "delivery_pipeline_busy":h.get("delivery_pipeline_busy"),
+              "free_queue":h.get("free_queue"),
+              "premium_queue":h.get("premium_queue"),
+            }, ensure_ascii=False))
+            PY
+            echo "=== LOCAL WORKER RUNNING JOBS ==="
+            docker compose exec -T controller python - <<'PY'
+            import json, urllib.request
+            for name,url in {
+              "free1":"http://meeting-bot-free1:3000/capacity",
+              "free2":"http://meeting-bot-free2:3000/capacity",
+              "premium1":"http://meeting-bot-premium1:3000/capacity",
+            }.items():
+              d=json.loads(urllib.request.urlopen(url,timeout=5).read().decode())["data"]
+              print(name, {"runningJobs":d.get("runningJobs"),"maxConcurrentJobs":d.get("maxConcurrentJobs")})
+            PY
+            echo "=== PENDING DELIVERY SUMMARY ==="
+            docker compose exec -T controller python - <<'PY'
+            import json, main
+            out=[]
+            for key,p in (main.state.get("pending_deliveries") or {}).items():
+              p=p or {}
+              out.append({
+                "pending_id":key,
+                "event_id":p.get("event_id"),
+                "filename":p.get("filename"),
+                "source_name":p.get("source_name"),
+                "file_basename":__import__("pathlib").Path(str(p.get("file_path") or "")).name,
+                "attempts":p.get("attempts"),
+                "video_delivered":p.get("video_delivered"),
+                "audio_delivered":p.get("audio_delivered"),
+                "transcript_delivered":p.get("transcript_delivered"),
+                "updated_at":p.get("updated_at"),
+                "last_error":str(p.get("last_error") or "")[:300],
+              })
+            print(json.dumps(out,ensure_ascii=False))
+            PY
+            echo "=== RETAINED RECORDINGS ==="
+            docker compose exec -T controller python - <<'PY'
+            from pathlib import Path
+            import time, json, main
+            out=[]
+            for p in main.RECORDING_ROOT.glob("*/*"):
+              if p.is_file() and p.suffix.lower() in {".webm",".mp4"}:
+                st=p.stat()
+                out.append({
+                  "name":p.name,
+                  "size_mb":round(st.st_size/1024/1024,1),
+                  "age_minutes":round((time.time()-st.st_mtime)/60,1),
+                })
+            out=sorted(out,key=lambda x:x["age_minutes"])
+            print(json.dumps(out[:20],ensure_ascii=False))
+            PY
