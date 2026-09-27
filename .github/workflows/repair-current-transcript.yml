@@ -34,8 +34,8 @@ jobs:
             cd /opt/beonmeet
 
             TARGET_BASENAME="MzE2MjQ0MDU1bWFudWFsLTUxZWY0ZmVlLWRiMWItNDllYi1iMDZjLTVkZjY4NzRiMWZjZjA.webm"
-            TARGET_PATH="$(find /recordings -maxdepth 2 -type f -name "$TARGET_BASENAME" -print -quit)"
-            if [ -z "$TARGET_PATH" ] || [ ! -f "$TARGET_PATH" ]; then
+            TARGET_HOST_PATH="$(find /dev/shm/beonmeet -maxdepth 2 -type f -name "$TARGET_BASENAME" -print -quit)"
+            if [ -z "$TARGET_HOST_PATH" ] || [ ! -f "$TARGET_HOST_PATH" ]; then
               echo "Exact current meeting source not found"
               exit 1
             fi
@@ -70,7 +70,7 @@ jobs:
             done
 
             echo "Generating audio and transcript from the exact current meeting source..."
-            docker compose exec -T -e REPAIR_SOURCE="$TARGET_PATH" controller python - <<'PY'
+            docker compose exec -T -e REPAIR_BASENAME="$TARGET_BASENAME" controller python - <<'PY'
             import asyncio
             import base64
             import os
@@ -79,7 +79,11 @@ jobs:
             from pathlib import Path
             import main
 
-            source = Path(os.environ["REPAIR_SOURCE"]).resolve()
+            basename = os.environ["REPAIR_BASENAME"]
+            matches = list(main.RECORDING_ROOT.glob(f"*/{basename}"))
+            if len(matches) != 1:
+                raise SystemExit(f"repair source match count was {len(matches)}, expected 1")
+            source = matches[0].resolve()
             source.relative_to(main.RECORDING_ROOT)
             if not source.exists() or not source.is_file():
                 raise SystemExit("repair source missing")
