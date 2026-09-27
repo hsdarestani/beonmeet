@@ -1,0 +1,166 @@
+name: Repair Current BeOnMeet Transcript
+
+on:
+  push:
+    branches: ["ops/diagnose-stale-recovery-20260927"]
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout safe recovery code
+        uses: actions/checkout@v4
+
+      - name: Copy safe controller code
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          password: ${{ secrets.PASS }}
+          source: "app"
+          target: "/opt/beonmeet"
+          overwrite: true
+
+      - name: Stop stale recovery and regenerate exact meeting deliverables
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 85m
+          script: |
+            set -euo pipefail
+            cd /opt/beonmeet
+
+            TARGET_BASENAME="MzE2MjQ0MDU1bWFudWFsLTUxZWY0ZmVlLWRiMWItNDllYi1iMDZjLTVkZjY4NzRiMWZjZjA.webm"
+            TARGET_PATH="$(find /recordings -maxdepth 2 -type f -name "$TARGET_BASENAME" -print -quit)"
+            if [ -z "$TARGET_PATH" ] || [ ! -f "$TARGET_PATH" ]; then
+              echo "Exact current meeting source not found"
+              exit 1
+            fi
+
+            echo "Checking that no live recorder job is active..."
+            RUNNING="$(docker compose exec -T controller python - <<'PY'
+            import json, urllib.request
+            urls=[
+              "http://meeting-bot-free1:3000/capacity",
+              "http://meeting-bot-free2:3000/capacity",
+              "http://meeting-bot-premium1:3000/capacity",
+            ]
+            print(sum(int(json.loads(urllib.request.urlopen(u,timeout=5).read().decode())["data"].get("runningJobs") or 0) for u in urls))
+            PY
+            )"
+            if [ "$RUNNING" != "0" ]; then
+              echo "Live recording jobs exist; refusing repair"
+              exit 1
+            fi
+
+            python3 -m py_compile app/main.py app/i18n.py
+            python3 tests/premium_delivery_test.py 2>/dev/null || true
+
+            echo "Rebuilding controller with safe exact-event recovery code..."
+            docker compose up -d --no-deps --build controller
+
+            for _ in $(seq 1 60); do
+              if docker compose exec -T controller python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3).read()" >/dev/null 2>&1; then
+                break
+              fi
+              sleep 2
+            done
+
+            echo "Generating audio and transcript from the exact current meeting source..."
+            docker compose exec -T -e REPAIR_SOURCE="$TARGET_PATH" controller python - <<'PY'
+            import asyncio
+            import base64
+            import os
+            import re
+            import subprocess
+            from pathlib import Path
+            import main
+
+            source = Path(os.environ["REPAIR_SOURCE"]).resolve()
+            source.relative_to(main.RECORDING_ROOT)
+            if not source.exists() or not source.is_file():
+                raise SystemExit("repair source missing")
+
+            decoded = base64.urlsafe_b64decode(source.stem + "=" * (-len(source.stem) % 4)).decode()
+            match = re.fullmatch(r"(\d+)(manual-[0-9a-f-]+)", decoded)
+            if not match:
+                raise SystemExit("repair source identity could not be verified")
+            chat_id, event_id = match.groups()
+            expected_event = "manual-51ef4fee-db1b-49eb-b06c-5df6874b1fcf0"
+            if event_id != expected_event:
+                raise SystemExit("repair source event mismatch")
+
+            main.init_db()
+            main.load_state()
+
+            async def run():
+                audio_path = source.with_name(f".{source.stem}-correct.mp3")
+                transcript_path = source.with_name(f".{source.stem}-correct-transcript.txt")
+                try:
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-y", "-i", str(source),
+                            "-vn", "-ac", "1", "-ar", "44100",
+                            "-c:a", "libmp3lame", "-b:a", "64k",
+                            str(audio_path),
+                        ],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+
+                    await main.send_audio_to_recipients(
+                        [{
+                            "chat_id": chat_id,
+                            "caption": "🎧 فایل صوتی صحیح همین جلسه آماده‌ست",
+                        }],
+                        audio_path,
+                        "BeOnMeet-current-meeting.mp3",
+                    )
+
+                    await main.tg_text(
+                        chat_id,
+                        "📝 فایل قبلی مربوط به جلسه دیگری بود و معتبر نیست. دارم متن صحیح همین جلسه را از فایل اصلی خودش آماده می‌کنم…",
+                    )
+                    async with main.TRANSCRIPTION_SEMAPHORE:
+                        transcript, detected = await asyncio.to_thread(
+                            main.transcribe_audio_local,
+                            audio_path,
+                        )
+                    if not transcript:
+                        raise RuntimeError("correct source produced an empty transcript")
+
+                    transcript_path.write_text(
+                        "متن صحیح جلسه فعلی BeOnMeet\n"
+                        "فایل قبلی recovery مربوط به جلسه دیگری بود و نباید استفاده شود.\n"
+                        f"زبان‌های تشخیص داده شده: {detected}\n\n"
+                        + transcript,
+                        encoding="utf-8",
+                    )
+                    with transcript_path.open("rb") as fp:
+                        await main.telegram(
+                            "sendDocument",
+                            {
+                                "chat_id": chat_id,
+                                "caption": "📝 متن صحیح همین جلسه آماده‌ست. این فایل جایگزین Transcript قبلی است.",
+                            },
+                            {
+                                "document": (
+                                    "BeOnMeet-current-meeting-transcript.txt",
+                                    fp,
+                                    "text/plain",
+                                )
+                            },
+                        )
+                    print("CURRENT_MEETING_AUDIO_AND_TRANSCRIPT_SENT")
+                finally:
+                    audio_path.unlink(missing_ok=True)
+                    transcript_path.unlink(missing_ok=True)
+
+            asyncio.run(run())
+            PY
+
+            echo "REPAIR_COMPLETE"
