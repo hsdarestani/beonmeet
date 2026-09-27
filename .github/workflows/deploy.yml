@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: beonmeet-production
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -19,6 +19,8 @@ jobs:
       - name: Validate Python before production
         run: |
           python3 -m py_compile app/main.py app/i18n.py app/hetzner_autoscaler.py app/autoscaler_smoke.py
+          python3 tests/i18n_test.py
+          python3 tests/premium_delivery_test.py
           python3 tests/cloud_init_render_test.py
 
       - name: Copy application files
@@ -60,21 +62,24 @@ jobs:
             cd /opt/beonmeet
 
             pipeline_state() {
-              docker compose exec -T controller python -c 'import json,os,urllib.request,redis; urls=["http://meeting-bot-free1:3000/capacity","http://meeting-bot-free2:3000/capacity","http://meeting-bot-premium1:3000/capacity"]; running=sum(int(json.loads(urllib.request.urlopen(u,timeout=5).read().decode())["data"].get("runningJobs") or 0) for u in urls); r=redis.Redis.from_url(os.environ.get("REDIS_URL","redis://redis:6379/0"),decode_responses=True); raw=r.get(os.environ.get("REDIS_STATE_KEY","beonmeet:controller:state")) or "{}"; st=json.loads(raw); p=list((st.get("pending_deliveries") or {}).values()); print(f"{running}:{len(p)}:{max([int(x.get(chr(97)+chr(116)+chr(116)+chr(101)+chr(109)+chr(112)+chr(116)+chr(115)) or 0) for x in p]+[0])}")'
+              docker compose exec -T controller python -c 'import json,os,urllib.request,redis; urls=["http://meeting-bot-free1:3000/capacity","http://meeting-bot-free2:3000/capacity","http://meeting-bot-premium1:3000/capacity"]; running=sum(int(json.loads(urllib.request.urlopen(u,timeout=5).read().decode())["data"].get("runningJobs") or 0) for u in urls); health=json.loads(urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=5).read().decode()); active=int(health.get("active_delivery_jobs") or 0); r=redis.Redis.from_url(os.environ.get("REDIS_URL","redis://redis:6379/0"),decode_responses=True); raw=r.get(os.environ.get("REDIS_STATE_KEY","beonmeet:controller:state")) or "{}"; st=json.loads(raw); p=list((st.get("pending_deliveries") or {}).values()); print(f"{running}:{active}:{len(p)}:{max([int(x.get(chr(97)+chr(116)+chr(116)+chr(101)+chr(109)+chr(112)+chr(116)+chr(115)) or 0) for x in p]+[0])}")'
             }
 
             IDLE_STREAK=0
             PIPELINE_SAFE=0
             for _ in $(seq 1 360); do
               PIPELINE_STATE="$(pipeline_state 2>/dev/null || true)"
-              IFS=':' read -r RUNNING_JOBS PENDING_DELIVERIES MAX_ATTEMPTS <<< "$PIPELINE_STATE"
+              IFS=':' read -r RUNNING_JOBS ACTIVE_DELIVERIES PENDING_DELIVERIES MAX_ATTEMPTS <<< "$PIPELINE_STATE"
 
-              if [[ "$RUNNING_JOBS" =~ ^[0-9]+$ ]] && [[ "$PENDING_DELIVERIES" =~ ^[0-9]+$ ]] && [[ "$MAX_ATTEMPTS" =~ ^[0-9]+$ ]]; then
+              if [[ "$RUNNING_JOBS" =~ ^[0-9]+$ ]] && [[ "$ACTIVE_DELIVERIES" =~ ^[0-9]+$ ]] && [[ "$PENDING_DELIVERIES" =~ ^[0-9]+$ ]] && [[ "$MAX_ATTEMPTS" =~ ^[0-9]+$ ]]; then
                 if [ "$RUNNING_JOBS" -gt 0 ]; then
                   IDLE_STREAK=0
                   echo "Active recordings detected: $RUNNING_JOBS. Holding deploy."
+                elif [ "$ACTIVE_DELIVERIES" -gt 0 ]; then
+                  IDLE_STREAK=0
+                  echo "Active recording delivery or transcription detected: $ACTIVE_DELIVERIES. Holding deploy."
                 elif [ "$PENDING_DELIVERIES" -gt 0 ] && [ "$MAX_ATTEMPTS" -ge 2 ]; then
-                  echo "Retry storm detected with no active recording; allowing controller restart to load idempotent delivery fix."
+                  echo "Retry storm detected with no active processing; allowing controller restart to load idempotent delivery fix."
                   PIPELINE_SAFE=1
                   break
                 elif [ "$PENDING_DELIVERIES" -gt 0 ]; then
@@ -277,7 +282,6 @@ jobs:
             docker compose ps
 
             echo "Sending one-time full-file link for the interrupted meeting if its retained source still exists..."
-            docker compose exec -T controller python -c 'import asyncio,pathlib,main; event="manual-99a88a85-53f5-467b-908c-25b5c98aa78f"; p=next((x for x in (main.state.get("pending_deliveries") or {}).values() if str((x or {}).get("event_id") or "")==event),None); path=pathlib.Path(str((p or {}).get("file_path") or "")); chat=str((p or {}).get("chat_id") or ""); ns={"asyncio":asyncio,"pathlib":pathlib,"main":main,"p":p,"path":path,"chat":chat}; exec("async def send():\n    if not p or not chat or not path.exists() or not path.is_file():\n        print(\"FORCED_FULL_LINK_SKIPPED\")\n        return\n    url=await main.create_recording_download(path,str((p or {}).get(\"filename\") or path.name))\n    await main.tg_text(chat,main.t(chat,\"large_video_download\",url=url,hours=main.DOWNLOAD_TTL_HOURS))\n    p[\"video_delivered\"]=True\n    p[\"full_file_link_sent\"]=True\n    p[\"updated_at\"]=main.datetime.now(main.timezone.utc).isoformat()\n    await main.save_state()\n    print(\"FORCED_FULL_LINK_SENT\")",ns); asyncio.run(ns["send"]())' || true
 
             for i in $(seq 1 30); do
               if docker compose exec -T controller python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read().decode())"; then

@@ -1882,135 +1882,182 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
         )
 
         if premium_active:
-            audio_path = raw_path.with_suffix(".mp3")
-            try:
-                # 64 kbps mono is well suited to speech and keeps roughly two-hour
-                # meetings close to Telegram's upload ceiling. Longer files use the
-                # secure download fallback in send_audio_to_recipients().
-                await asyncio.to_thread(
-                    subprocess.run,
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-i",
-                        str(raw_path),
-                        "-vn",
-                        "-ac",
-                        "1",
-                        "-ar",
-                        "44100",
-                        "-c:a",
-                        "libmp3lame",
-                        "-b:a",
-                        "64k",
-                        str(audio_path),
-                    ],
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+            audio_already_delivered = bool((pending_state or {}).get("audio_delivered"))
+            transcript_already_delivered = bool((pending_state or {}).get("transcript_delivered"))
+            audio_delivery_error: Exception | None = None
+            transcript_processing_error: Exception | None = None
 
-                audio_targets = [
-                    {
-                        "chat_id": chat_id,
-                        "caption": t(chat_id, "audio_ready_caption"),
-                    }
-                ]
-                if ADMINUSER and ADMINUSER != chat_id:
-                    audio_targets.append({
-                        "chat_id": ADMINUSER,
-                        "caption": (
-                            "🎧 فایل صوتی نسخه ویژه\n\n"
-                            f"👤 درخواست دهنده:\n{who}\n"
-                            f"🔗 جلسه: {meeting_link or 'نامشخص'}"
-                        ),
-                    })
-
-                # Audio delivery is intentionally isolated from transcription.
-                # Even if Telegram is temporarily unavailable, transcript creation
-                # must continue for Premium users.
+            if not (audio_already_delivered and transcript_already_delivered):
+                audio_path = raw_path.with_suffix(".mp3")
                 try:
-                    await send_audio_to_recipients(
-                        audio_targets,
-                        audio_path,
-                        f"{Path(filename).stem}.mp3",
-                    )
-                except Exception as audio_delivery_error:
-                    print(
-                        "audio delivery error:",
-                        repr(audio_delivery_error),
-                        flush=True,
+                    # Speech-friendly mono audio keeps most meetings under Telegram's
+                    # 50 MB Bot API upload cap. Very long meetings transparently fall
+                    # back to the secure expiring download link.
+                    await asyncio.to_thread(
+                        subprocess.run,
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-i",
+                            str(raw_path),
+                            "-vn",
+                            "-ac",
+                            "1",
+                            "-ar",
+                            "44100",
+                            "-c:a",
+                            "libmp3lame",
+                            "-b:a",
+                            "64k",
+                            str(audio_path),
+                        ],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
                     )
 
-                try:
-                    await tg_text(chat_id, t(chat_id, "transcribing"))
-                    async with TRANSCRIPTION_SEMAPHORE:
-                        transcript, detected_language = await asyncio.to_thread(
-                            transcribe_audio_local,
-                            audio_path,
-                        )
-
-                    if transcript:
-                        transcript_path = raw_path.with_name(
-                            f"{raw_path.stem}_transcript.txt"
-                        )
-                        transcript_path.write_text(
-                            t(chat_id, "transcript_header")
-                            + "\n"
-                            + t(chat_id, "transcript_warning")
-                            + "\n"
-                            + t(
-                                chat_id,
-                                "transcript_detected",
-                                languages=detected_language,
+                    if not audio_already_delivered:
+                        try:
+                            await send_audio_to_recipients(
+                                [{
+                                    "chat_id": chat_id,
+                                    "caption": t(chat_id, "audio_ready_caption"),
+                                }],
+                                audio_path,
+                                f"{Path(filename).stem}.mp3",
                             )
-                            + "\n\n"
-                            + transcript,
-                            encoding="utf-8",
-                        )
-                        transcript_targets = [
-                            {
-                                "chat_id": chat_id,
-                                "caption": t(chat_id, "transcript_ready_caption"),
-                            }
-                        ]
-                        if ADMINUSER and ADMINUSER != chat_id:
-                            transcript_targets.append({
-                                "chat_id": ADMINUSER,
-                                "caption": (
-                                    "📝 متن جلسه نسخه ویژه\n\n"
-                                    f"👤 درخواست دهنده:\n{who}\n"
-                                    f"🔗 جلسه: {meeting_link or 'نامشخص'}"
-                                ),
-                            })
-                        for target in transcript_targets:
-                            with transcript_path.open("rb") as fp:
-                                await telegram(
-                                    "sendDocument",
-                                    {
-                                        "chat_id": target["chat_id"],
-                                        "caption": target["caption"],
-                                    },
-                                    {
-                                        "document": (
-                                            f"{Path(filename).stem}-transcript.txt",
-                                            fp,
-                                            "text/plain",
-                                        )
-                                    },
+                            if pending_state is not None:
+                                pending_state["audio_delivered"] = True
+                                pending_state["audio_delivered_at"] = datetime.now(timezone.utc).isoformat()
+                                pending_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+                                await save_state()
+                            audio_already_delivered = True
+                        except Exception as exc:
+                            audio_delivery_error = exc
+                            print("audio delivery error:", repr(exc), flush=True)
+
+                        # Admin copy is best effort and must never cause a duplicate
+                        # user delivery or block transcript generation.
+                        if audio_already_delivered and ADMINUSER and ADMINUSER != chat_id:
+                            try:
+                                await send_audio_to_recipients(
+                                    [{
+                                        "chat_id": ADMINUSER,
+                                        "caption": (
+                                            "🎧 فایل صوتی نسخه ویژه\n\n"
+                                            f"👤 درخواست دهنده:\n{who}\n"
+                                            f"🔗 جلسه: {meeting_link or 'نامشخص'}"
+                                        ),
+                                    }],
+                                    audio_path,
+                                    f"{Path(filename).stem}.mp3",
                                 )
-                        transcript_path.unlink(missing_ok=True)
-                    else:
-                        await tg_text(chat_id, t(chat_id, "transcript_empty"))
-                except Exception as transcript_error:
-                    print(
-                        "transcription error:",
-                        repr(transcript_error),
-                        flush=True,
-                    )
-                    await tg_text(chat_id, t(chat_id, "transcript_error"))
-            finally:
-                audio_path.unlink(missing_ok=True)
+                            except Exception as exc:
+                                print("admin audio copy error:", repr(exc), flush=True)
+
+                    if not transcript_already_delivered:
+                        try:
+                            await tg_text(chat_id, t(chat_id, "transcribing"))
+                            async with TRANSCRIPTION_SEMAPHORE:
+                                transcript, detected_language = await asyncio.to_thread(
+                                    transcribe_audio_local,
+                                    audio_path,
+                                )
+
+                            if transcript:
+                                transcript_path = raw_path.with_name(
+                                    f"{raw_path.stem}_transcript.txt"
+                                )
+                                try:
+                                    transcript_path.write_text(
+                                        t(chat_id, "transcript_header")
+                                        + "\n"
+                                        + t(chat_id, "transcript_warning")
+                                        + "\n"
+                                        + t(
+                                            chat_id,
+                                            "transcript_detected",
+                                            languages=detected_language,
+                                        )
+                                        + "\n\n"
+                                        + transcript,
+                                        encoding="utf-8",
+                                    )
+                                    with transcript_path.open("rb") as fp:
+                                        await telegram(
+                                            "sendDocument",
+                                            {
+                                                "chat_id": chat_id,
+                                                "caption": t(chat_id, "transcript_ready_caption"),
+                                            },
+                                            {
+                                                "document": (
+                                                    f"{Path(filename).stem}-transcript.txt",
+                                                    fp,
+                                                    "text/plain",
+                                                )
+                                            },
+                                        )
+
+                                    if pending_state is not None:
+                                        pending_state["transcript_delivered"] = True
+                                        pending_state["transcript_delivered_at"] = datetime.now(timezone.utc).isoformat()
+                                        pending_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+                                        await save_state()
+                                    transcript_already_delivered = True
+
+                                    if ADMINUSER and ADMINUSER != chat_id:
+                                        try:
+                                            with transcript_path.open("rb") as fp:
+                                                await telegram(
+                                                    "sendDocument",
+                                                    {
+                                                        "chat_id": ADMINUSER,
+                                                        "caption": (
+                                                            "📝 متن جلسه نسخه ویژه\n\n"
+                                                            f"👤 درخواست دهنده:\n{who}\n"
+                                                            f"🔗 جلسه: {meeting_link or 'نامشخص'}"
+                                                        ),
+                                                    },
+                                                    {
+                                                        "document": (
+                                                            f"{Path(filename).stem}-transcript.txt",
+                                                            fp,
+                                                            "text/plain",
+                                                        )
+                                                    },
+                                                )
+                                        except Exception as exc:
+                                            print("admin transcript copy error:", repr(exc), flush=True)
+                                finally:
+                                    transcript_path.unlink(missing_ok=True)
+                            else:
+                                await tg_text(chat_id, t(chat_id, "transcript_empty"))
+                                if pending_state is not None:
+                                    pending_state["transcript_delivered"] = True
+                                    pending_state["transcript_empty"] = True
+                                    pending_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+                                    await save_state()
+                                transcript_already_delivered = True
+                        except Exception as exc:
+                            transcript_processing_error = exc
+                            print("transcription error:", repr(exc), flush=True)
+                            if not bool(data.get("_silent_retry")):
+                                try:
+                                    await tg_text(chat_id, t(chat_id, "transcript_error"))
+                                except Exception as notify_exc:
+                                    print("transcript error notification failed:", repr(notify_exc), flush=True)
+                finally:
+                    audio_path.unlink(missing_ok=True)
+
+            # Never delete the source recording while a Premium deliverable is
+            # incomplete. Recovery retries only the missing stage because the
+            # per-stage flags above are persisted in Redis state.
+            if audio_delivery_error is not None or transcript_processing_error is not None:
+                raise RuntimeError(
+                    "premium downstream delivery incomplete: "
+                    f"audio={audio_delivery_error!r} transcript={transcript_processing_error!r}"
+                )
 
         if free_path:
             free_path.unlink(missing_ok=True)

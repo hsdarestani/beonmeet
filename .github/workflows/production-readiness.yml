@@ -25,6 +25,7 @@ jobs:
         run: |
           python3 -m py_compile app/main.py app/i18n.py app/hetzner_autoscaler.py
           python3 tests/i18n_test.py
+          python3 tests/premium_delivery_test.py
           python3 tests/cloud_init_render_test.py
 
       - name: Run synthetic scaling load test
@@ -44,9 +45,39 @@ jobs:
           assert h.get('autoscaler_enabled') is True, h
           assert int(h.get('healthy_free_workers') or 0) >= 2, h
           assert int(h.get('healthy_premium_workers') or 0) >= 1, h
-          assert int(h.get('recorder_account_profiles') or 0) >= 1, h
+          assert int(h.get('recorder_account_profiles') or 0) >= 3, h
+          ids=set(h.get('recorder_account_ids') or [])
+          assert {'primary','recorder136','recorder802'}.issubset(ids), h
           print('PRODUCTION_HEALTH_PASS')
           print(json.dumps(h, ensure_ascii=False))
+          PY
+
+
+      - name: Wait for recording delivery pipeline to be idle
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 120); do
+            curl -fsS https://beonmeet.smarbiz.sbs/health > /tmp/delivery-health.json
+            if python3 - <<'PY'
+          import json
+          h=json.load(open('/tmp/delivery-health.json'))
+          active=int(h.get('active_delivery_jobs') or 0)
+          pending=int(h.get('pending_delivery_jobs') or 0)
+          print(f"delivery active={active} pending={pending}")
+          raise SystemExit(0 if active == 0 and pending == 0 else 1)
+          PY
+            then
+              echo "DELIVERY_PIPELINE_IDLE"
+              break
+            fi
+            sleep 10
+          done
+          python3 - <<'PY'
+          import json
+          h=json.load(open('/tmp/delivery-health.json'))
+          assert int(h.get('active_delivery_jobs') or 0) == 0, h
+          assert int(h.get('pending_delivery_jobs') or 0) == 0, h
+          print('DELIVERY_PIPELINE_IDLE_CONFIRMED')
           PY
 
       - name: Install SSH helper
