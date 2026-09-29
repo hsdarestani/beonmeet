@@ -19,6 +19,30 @@ jobs:
           password: ${{ secrets.PASS }}
           script: |
             cd /opt/beonmeet
+            echo "=== PIPELINE STATE ==="
+            docker compose exec -T controller python - <<'PY'
+            import json, urllib.request, os, redis
+            urls=["http://meeting-bot-free1:3000/capacity","http://meeting-bot-free2:3000/capacity","http://meeting-bot-premium1:3000/capacity"]
+            running=0
+            for u in urls:
+                try:
+                    d=json.loads(urllib.request.urlopen(u,timeout=5).read().decode())
+                    running+=int(d.get("data",{}).get("runningJobs") or 0)
+                except Exception:
+                    pass
+            try:
+                health=json.loads(urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=5).read().decode())
+            except Exception:
+                health={}
+            r=redis.Redis.from_url(os.environ.get("REDIS_URL","redis://redis:6379/0"),decode_responses=True)
+            st=json.loads(r.get(os.environ.get("REDIS_STATE_KEY","beonmeet:controller:state")) or "{}")
+            print(json.dumps({
+                "running_jobs":running,
+                "active_delivery_jobs":int(health.get("active_delivery_jobs") or 0),
+                "pending_delivery_jobs":len(st.get("pending_deliveries") or {}),
+                "recovery_processing":sum(1 for x in (st.get("premium_recoveries") or {}).values() if str(x.get("status") or "")=="processing"),
+            },separators=(",",":")))
+            PY
             echo "=== STATS ==="
             docker stats --no-stream beonmeet-controller-1 || true
             echo "=== PROCESSES ==="
