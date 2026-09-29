@@ -372,6 +372,31 @@ def is_premium(telegram_id: str) -> bool:
     return bool(until and until > utcnow())
 
 
+def was_premium_at(telegram_id: str, when_iso: str) -> bool:
+    when = _parse_dt(when_iso)
+    if not when:
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    with _db() as db:
+        rows = db.execute(
+            "SELECT starts_at, ends_at FROM subscriptions WHERE telegram_id=? ORDER BY id DESC LIMIT 100",
+            (str(telegram_id),),
+        ).fetchall()
+    for row in rows:
+        starts = _parse_dt(row["starts_at"])
+        ends = _parse_dt(row["ends_at"])
+        if not starts or not ends:
+            continue
+        if starts.tzinfo is None:
+            starts = starts.replace(tzinfo=timezone.utc)
+        if ends.tzinfo is None:
+            ends = ends.replace(tzinfo=timezone.utc)
+        if starts <= when < ends:
+            return True
+    return False
+
+
 def subscription_info(telegram_id: str) -> dict:
     with _db() as db:
         row = db.execute(
