@@ -317,6 +317,45 @@ def record_recording(telegram_id: str, meet_url: str, filename: str, size_bytes:
         )
 
 
+def find_recording_for_artifact(
+    filename: str,
+    size_bytes: int,
+    artifact_created_at: str,
+    tolerance_minutes: int = 15,
+) -> dict | None:
+    """Resolve one recording owner from exact artifact metadata.
+
+    Recovery is deliberately fail-closed: filename and byte size must match and
+    exactly one recording must fall inside the narrow creation-time window.
+    """
+    target = _parse_dt(artifact_created_at)
+    if not target:
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+    with _db() as db:
+        rows = db.execute(
+            """
+            SELECT * FROM recordings
+            WHERE filename=? AND size_bytes=?
+            ORDER BY id DESC
+            LIMIT 50
+            """,
+            (filename or "", int(size_bytes or 0)),
+        ).fetchall()
+    matches = []
+    tolerance = timedelta(minutes=max(1, int(tolerance_minutes)))
+    for row in rows:
+        created = _parse_dt(row["created_at"])
+        if not created:
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if abs(created - target) <= tolerance:
+            matches.append(dict(row))
+    return matches[0] if len(matches) == 1 else None
+
+
 def _parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
