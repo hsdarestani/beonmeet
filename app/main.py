@@ -1812,7 +1812,11 @@ async def premium_upgrade_backfill_loop() -> None:
             downloads = list(state.setdefault("recording_downloads", {}).items())
             for token, item in downloads:
                 recovery = state.setdefault("premium_recoveries", {}).get(token) or {}
-                if recovery.get("status") in {"queued", "processing", "completed"}:
+                recovery_status = str(recovery.get("status") or "")
+                recovery_task = premium_recovery_tasks.get(token)
+                if recovery_status == "completed":
+                    continue
+                if recovery_status in {"queued", "processing"} and recovery_task is not None and not recovery_task.done():
                     continue
                 if int(recovery.get("attempts") or 0) >= 3:
                     continue
