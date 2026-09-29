@@ -51,6 +51,7 @@ from admin_panel import (
     router as admin_router,
     subscription_info,
     touch_user,
+    was_premium_at,
 )
 
 app = FastAPI(title="BeOnMeet Controller")
@@ -1380,6 +1381,7 @@ async def startup() -> None:
     asyncio.create_task(worker_health_loop())
     asyncio.create_task(state_cleanup_loop())
     asyncio.create_task(delivery_recovery_loop())
+    asyncio.create_task(premium_upgrade_backfill_loop())
     asyncio.create_task(autoscale_loop())
 
 
@@ -1703,6 +1705,7 @@ async def _recover_premium_download_inner(token: str, chat_id: str) -> None:
     audio_path = DOWNLOAD_ROOT / f".premium-recovery-{token[:16]}.mp3"
     transcript_path = DOWNLOAD_ROOT / f".premium-recovery-{token[:16]}.txt"
     try:
+        recovery["attempts"] = int(recovery.get("attempts") or 0) + 1
         recovery["status"] = "processing"
         recovery["updated_at"] = datetime.now(timezone.utc).isoformat()
         await save_state()
@@ -1794,6 +1797,86 @@ async def _recover_premium_download_inner(token: str, chat_id: str) -> None:
         audio_path.unlink(missing_ok=True)
         transcript_path.unlink(missing_ok=True)
         premium_recovery_tasks.pop(token, None)
+
+
+async def premium_upgrade_backfill_loop() -> None:
+    """Backfill Premium outputs when a user upgrades after a recent meeting.
+
+    Only exact download artifacts are considered, ownership must resolve safely,
+    the user must be Premium now, and the recording must have occurred outside
+    any Premium entitlement window. Existing Premium meetings are never resent.
+    """
+    await asyncio.sleep(8)
+    while True:
+        try:
+            downloads = list(state.setdefault("recording_downloads", {}).items())
+            for token, item in downloads:
+                recovery = state.setdefault("premium_recoveries", {}).get(token) or {}
+                if recovery.get("status") in {"queued", "processing", "completed"}:
+                    continue
+                if int(recovery.get("attempts") or 0) >= 3:
+                    continue
+
+                item = item or {}
+                expires_raw = str(item.get("expires_at") or "")
+                try:
+                    expires_at = isoparse(expires_raw)
+                except Exception:
+                    continue
+                if datetime.now(timezone.utc) >= expires_at:
+                    continue
+
+                file_path = Path(str(item.get("file_path") or "")).resolve()
+                try:
+                    file_path.relative_to(DOWNLOAD_ROOT)
+                except ValueError:
+                    continue
+                if not file_path.exists() or not file_path.is_file():
+                    continue
+
+                created_raw = str(item.get("created_at") or "").strip()
+                if not created_raw:
+                    created_raw = (
+                        expires_at - timedelta(hours=DOWNLOAD_TTL_HOURS)
+                    ).isoformat()
+                recording = await asyncio.to_thread(
+                    find_recording_for_artifact,
+                    str(item.get("filename") or file_path.name),
+                    int(file_path.stat().st_size),
+                    created_raw,
+                    15,
+                )
+                if not recording:
+                    continue
+
+                chat_id = str(recording.get("telegram_id") or "").strip()
+                recorded_at = str(recording.get("created_at") or "").strip()
+                if not chat_id or not recorded_at:
+                    continue
+                if not await asyncio.to_thread(is_premium, chat_id):
+                    continue
+                if await asyncio.to_thread(was_premium_at, chat_id, recorded_at):
+                    continue
+
+                recovery = state.setdefault("premium_recoveries", {}).setdefault(token, {})
+                recovery["chat_id"] = chat_id
+                recovery["status"] = "queued"
+                recovery["reason"] = "upgraded_after_recording"
+                recovery["updated_at"] = datetime.now(timezone.utc).isoformat()
+                await save_state()
+                task = premium_recovery_tasks.get(token)
+                if task is None or task.done():
+                    premium_recovery_tasks[token] = asyncio.create_task(
+                        _recover_premium_download_inner(token, chat_id)
+                    )
+                print(
+                    f"premium upgrade backfill queued token={token[:8]} chat_id={chat_id}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print("premium upgrade backfill loop error:", repr(exc), flush=True)
+
+        await asyncio.sleep(60)
 
 
 @app.get("/recover-premium/{token}")
