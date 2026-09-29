@@ -285,6 +285,7 @@ jobs:
 
             for i in $(seq 1 30); do
               if docker compose exec -T controller python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read().decode())"; then
+                docker compose exec -T controller python -c 'import json,os,redis; r=redis.Redis.from_url(os.environ.get("REDIS_URL","redis://redis:6379/0"),decode_responses=True); st=json.loads(r.get(os.environ.get("REDIS_STATE_KEY","beonmeet:controller:state")) or "{}"); items=list((st.get("premium_recoveries") or {}).values()); safe=[{"status":x.get("status"),"audio_delivered":bool(x.get("audio_delivered")),"transcript_delivered":bool(x.get("transcript_delivered")),"transcript_empty":bool(x.get("transcript_empty")),"last_error":bool(x.get("last_error")),"updated_at":x.get("updated_at")} for x in items]; print("PREMIUM_RECOVERY_STATUS="+json.dumps(safe,separators=(",",":")))'
                 exit 0
               fi
               sleep 5
