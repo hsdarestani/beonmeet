@@ -1,0 +1,27 @@
+name: Controller Readonly Diagnostic
+
+on:
+  push:
+    branches:
+      - ops/recovery-mri4760-20260929
+    paths:
+      - ".github/workflows/controller-readonly-diagnostic.yml"
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read controller runtime
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          password: ${{ secrets.PASS }}
+          script: |
+            cd /opt/beonmeet
+            echo "=== STATS ==="
+            docker stats --no-stream beonmeet-controller-1 || true
+            echo "=== PROCESSES ==="
+            docker compose exec -T controller sh -lc 'ps -eo pid,pcpu,pmem,etime,comm,args | grep -E "python|ffmpeg" | grep -v grep' || true
+            echo "=== RECENT LOGS ==="
+            docker compose logs --tail=120 controller | grep -E "premium|transcrib|recovery|Whisper|error" || true
