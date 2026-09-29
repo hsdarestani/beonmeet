@@ -40,6 +40,7 @@ from admin_panel import (
     PLANS,
     activate_subscription,
     create_payment_intent,
+    find_recording_for_artifact,
     get_payment_intent,
     init_db,
     is_premium,
@@ -110,6 +111,7 @@ remote_worker_cache: dict[str, dict[str, Any]] = {}
 _whisper_model = None
 active_delivery_jobs = 0
 delivery_locks: dict[str, asyncio.Lock] = {}
+premium_recovery_tasks: dict[str, asyncio.Task[Any]] = {}
 state: dict[str, Any] = {
     "telegram_offset": 0,
     "requests": {},
@@ -120,6 +122,7 @@ state: dict[str, Any] = {
     "user_languages": {},
     "pending_deliveries": {},
     "recording_downloads": {},
+    "premium_recoveries": {},
 }
 
 
@@ -137,6 +140,7 @@ def load_state() -> None:
     state.setdefault("user_languages", {})
     state.setdefault("pending_deliveries", {})
     state.setdefault("recording_downloads", {})
+    state.setdefault("premium_recoveries", {})
     print(f"controller state loaded from {source}", flush=True)
 
 
@@ -1080,7 +1084,7 @@ async def telegram_loop() -> None:
             await asyncio.sleep(5)
 
 
-async def create_recording_download(path: Path, filename: str) -> str:
+async def create_recording_download(path: Path, filename: str, owner_chat_id: str = "") -> str:
     token = secrets.token_urlsafe(32)
     suffix = path.suffix.lower() if path.suffix else ".webm"
     stored_path = (DOWNLOAD_ROOT / f"{token}{suffix}").resolve()
@@ -1090,6 +1094,8 @@ async def create_recording_download(path: Path, filename: str) -> str:
     state.setdefault("recording_downloads", {})[token] = {
         "file_path": str(stored_path),
         "filename": filename,
+        "owner_chat_id": str(owner_chat_id or ""),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "expires_at": expires_at.isoformat(),
     }
     await save_state()
@@ -1120,7 +1126,11 @@ async def send_recording_to_recipients(
 
     # The official Telegram Bot API caps uploaded files at 50 MB.
     # For larger recordings, avoid chat spam and provide one expiring full-file download.
-    download_url = await create_recording_download(path, filename)
+    download_url = await create_recording_download(
+        path,
+        filename,
+        owner_chat_id=str(recipients[0]["chat_id"]) if recipients else "",
+    )
     expires_hours = DOWNLOAD_TTL_HOURS
     for target in recipients:
         await tg_text(
@@ -1170,7 +1180,11 @@ async def send_audio_to_recipients(
                 )
 
         if download_url is None:
-            download_url = await create_recording_download(path, filename)
+            download_url = await create_recording_download(
+                path,
+                filename,
+                owner_chat_id=str(recipients[0]["chat_id"]) if recipients else "",
+            )
         await tg_text(
             target["chat_id"],
             t(
@@ -1651,6 +1665,200 @@ async def download_recording(token: str):
         filename=filename,
         media_type="application/octet-stream",
     )
+
+
+async def _resolve_download_owner(token: str, item: dict[str, Any], file_path: Path) -> str:
+    owner_chat_id = str(item.get("owner_chat_id") or "").strip()
+    if owner_chat_id:
+        return owner_chat_id
+
+    created_raw = str(item.get("created_at") or "").strip()
+    if not created_raw:
+        expires_raw = str(item.get("expires_at") or "").strip()
+        try:
+            created_raw = (
+                isoparse(expires_raw) - timedelta(hours=DOWNLOAD_TTL_HOURS)
+            ).isoformat()
+        except Exception:
+            created_raw = ""
+    if not created_raw:
+        raise HTTPException(status_code=409, detail="Recording identity is unavailable")
+
+    recording = await asyncio.to_thread(
+        find_recording_for_artifact,
+        str(item.get("filename") or file_path.name),
+        int(file_path.stat().st_size),
+        created_raw,
+        15,
+    )
+    if not recording:
+        raise HTTPException(status_code=409, detail="Recording owner could not be resolved safely")
+    return str(recording.get("telegram_id") or "").strip()
+
+
+async def _recover_premium_download_inner(token: str, chat_id: str) -> None:
+    recovery = state.setdefault("premium_recoveries", {}).setdefault(token, {})
+    item = state.setdefault("recording_downloads", {}).get(token) or {}
+    file_path = Path(str(item.get("file_path") or "")).resolve()
+    audio_path = DOWNLOAD_ROOT / f".premium-recovery-{token[:16]}.mp3"
+    transcript_path = DOWNLOAD_ROOT / f".premium-recovery-{token[:16]}.txt"
+    try:
+        recovery["status"] = "processing"
+        recovery["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await save_state()
+
+        if not bool(recovery.get("audio_delivered")):
+            await asyncio.to_thread(
+                subprocess.run,
+                [
+                    "ffmpeg", "-y", "-i", str(file_path),
+                    "-vn", "-ac", "1", "-ar", "44100",
+                    "-c:a", "libmp3lame", "-b:a", "64k", str(audio_path),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            await send_audio_to_recipients(
+                [{"chat_id": chat_id, "caption": t(chat_id, "audio_ready_caption")}],
+                audio_path,
+                f"{Path(str(item.get('filename') or file_path.name)).stem}.mp3",
+            )
+            recovery["audio_delivered"] = True
+            recovery["audio_delivered_at"] = datetime.now(timezone.utc).isoformat()
+            recovery["updated_at"] = datetime.now(timezone.utc).isoformat()
+            await save_state()
+
+        if not bool(recovery.get("transcript_delivered")):
+            if not audio_path.exists():
+                await asyncio.to_thread(
+                    subprocess.run,
+                    [
+                        "ffmpeg", "-y", "-i", str(file_path),
+                        "-vn", "-ac", "1", "-ar", "44100",
+                        "-c:a", "libmp3lame", "-b:a", "64k", str(audio_path),
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            await tg_text(chat_id, t(chat_id, "transcribing"))
+            async with TRANSCRIPTION_SEMAPHORE:
+                transcript, detected_language = await asyncio.to_thread(
+                    transcribe_audio_local,
+                    audio_path,
+                )
+            if transcript:
+                transcript_path.write_text(
+                    t(chat_id, "transcript_header")
+                    + "\n"
+                    + t(chat_id, "transcript_warning")
+                    + "\n"
+                    + t(chat_id, "transcript_detected", languages=detected_language)
+                    + "\n\n"
+                    + transcript,
+                    encoding="utf-8",
+                )
+                with transcript_path.open("rb") as fp:
+                    await telegram(
+                        "sendDocument",
+                        {
+                            "chat_id": chat_id,
+                            "caption": t(chat_id, "transcript_ready_caption"),
+                        },
+                        {
+                            "document": (
+                                f"{Path(str(item.get('filename') or file_path.name)).stem}-transcript.txt",
+                                fp,
+                                "text/plain",
+                            )
+                        },
+                    )
+            else:
+                await tg_text(chat_id, t(chat_id, "transcript_empty"))
+            recovery["transcript_delivered"] = True
+            recovery["transcript_empty"] = not bool(transcript)
+            recovery["transcript_delivered_at"] = datetime.now(timezone.utc).isoformat()
+
+        recovery["status"] = "completed"
+        recovery["updated_at"] = datetime.now(timezone.utc).isoformat()
+        recovery["last_error"] = ""
+        await save_state()
+    except Exception as exc:
+        recovery["status"] = "failed"
+        recovery["last_error"] = repr(exc)[:1000]
+        recovery["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await save_state()
+        print(f"premium recovery failed for {token}: {exc!r}", flush=True)
+    finally:
+        audio_path.unlink(missing_ok=True)
+        transcript_path.unlink(missing_ok=True)
+        premium_recovery_tasks.pop(token, None)
+
+
+@app.get("/recover-premium/{token}")
+async def recover_premium_download(token: str) -> dict[str, Any]:
+    item = state.setdefault("recording_downloads", {}).get(token)
+    if not item:
+        raise HTTPException(status_code=404, detail="Download not found or expired")
+    expires_raw = str(item.get("expires_at") or "")
+    try:
+        expires_at = isoparse(expires_raw)
+    except Exception:
+        raise HTTPException(status_code=410, detail="Download expired")
+    if datetime.now(timezone.utc) >= expires_at:
+        raise HTTPException(status_code=410, detail="Download expired")
+
+    file_path = Path(str(item.get("file_path") or "")).resolve()
+    try:
+        file_path.relative_to(DOWNLOAD_ROOT)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Download not found")
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Download file missing")
+
+    chat_id = await _resolve_download_owner(token, item, file_path)
+    if not chat_id or not await asyncio.to_thread(is_premium, chat_id):
+        raise HTTPException(status_code=409, detail="Premium is not active for recording owner")
+
+    recovery = state.setdefault("premium_recoveries", {}).setdefault(token, {})
+    if recovery.get("status") == "completed":
+        return {
+            "ok": True,
+            "queued": False,
+            "duplicate": True,
+            "status": "completed",
+            "audio_delivered": bool(recovery.get("audio_delivered")),
+            "transcript_delivered": bool(recovery.get("transcript_delivered")),
+        }
+
+    recovery["chat_id"] = chat_id
+    recovery["status"] = "queued"
+    recovery["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await save_state()
+
+    task = premium_recovery_tasks.get(token)
+    if task is None or task.done():
+        premium_recovery_tasks[token] = asyncio.create_task(
+            _recover_premium_download_inner(token, chat_id)
+        )
+    return {"ok": True, "queued": True, "status": recovery.get("status")}
+
+
+@app.get("/recover-premium/{token}/status")
+async def recover_premium_download_status(token: str) -> dict[str, Any]:
+    recovery = state.setdefault("premium_recoveries", {}).get(token)
+    if not recovery:
+        raise HTTPException(status_code=404, detail="Recovery not found")
+    return {
+        "ok": True,
+        "status": recovery.get("status"),
+        "audio_delivered": bool(recovery.get("audio_delivered")),
+        "transcript_delivered": bool(recovery.get("transcript_delivered")),
+        "transcript_empty": bool(recovery.get("transcript_empty")),
+        "last_error": str(recovery.get("last_error") or ""),
+        "updated_at": recovery.get("updated_at"),
+    }
 
 
 @app.get("/health")
