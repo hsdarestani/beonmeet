@@ -1818,7 +1818,7 @@ async def premium_upgrade_backfill_loop() -> None:
                     continue
                 if recovery_status in {"queued", "processing"} and recovery_task is not None and not recovery_task.done():
                     continue
-                if int(recovery.get("attempts") or 0) >= 3:
+                if int(recovery.get("attempts") or 0) >= 3 and recovery_status not in {"queued", "processing"}:
                     continue
 
                 item = item or {}
