@@ -110,6 +110,7 @@ queue_mutation_lock = asyncio.Lock()
 worker_health_cache: dict[str, bool] = {}
 remote_worker_cache: dict[str, dict[str, Any]] = {}
 _whisper_model = None
+_whisper_recovery_model = None
 active_delivery_jobs = 0
 delivery_locks: dict[str, asyncio.Lock] = {}
 premium_recovery_tasks: dict[str, asyncio.Task[Any]] = {}
@@ -1354,6 +1355,111 @@ def transcribe_audio_local(audio_path: Path) -> tuple[str, str]:
     return "\n".join(lines).strip(), language_label
 
 
+
+def transcribe_audio_recovery_fast(audio_path: Path) -> tuple[str, str]:
+    """Faster CPU path used only for retained-file Premium backfills."""
+    global _whisper_recovery_model
+    from faster_whisper import WhisperModel
+
+    if _whisper_recovery_model is None:
+        model_name = os.environ.get("RECOVERY_WHISPER_MODEL", "medium")
+        _whisper_recovery_model = WhisperModel(
+            model_name,
+            device="cpu",
+            compute_type=os.environ.get("WHISPER_COMPUTE_TYPE", "int8"),
+            cpu_threads=max(6, min(14, (os.cpu_count() or 8) - 2)),
+            num_workers=1,
+            download_root=str(DATA_DIR / "whisper-models"),
+        )
+
+    duration = _audio_duration_seconds(audio_path)
+    chunk_seconds = max(120, int(os.environ.get("RECOVERY_TRANSCRIPTION_CHUNK_SECONDS", "300")))
+    chunks: list[tuple[float, Path, bool]] = []
+
+    if duration <= 0 or duration <= chunk_seconds * 1.25:
+        chunks.append((0.0, audio_path, False))
+    else:
+        start_at = 0.0
+        index = 0
+        while start_at < duration:
+            length = min(float(chunk_seconds), duration - start_at)
+            chunk_path = audio_path.with_name(
+                f".{audio_path.stem}_recovery_{index:04d}.wav"
+            )
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-ss", f"{start_at:.3f}",
+                    "-t", f"{length:.3f}",
+                    "-i", str(audio_path),
+                    "-vn", "-ac", "1", "-ar", "16000",
+                    "-c:a", "pcm_s16le",
+                    str(chunk_path),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            chunks.append((start_at, chunk_path, True))
+            start_at += length
+            index += 1
+
+    lines: list[str] = []
+    previous_text = ""
+    language_stats: dict[str, list[float]] = {}
+    try:
+        for offset_seconds, chunk_path, _temporary in chunks:
+            segments, info = _whisper_recovery_model.transcribe(
+                str(chunk_path),
+                task="transcribe",
+                language=None,
+                beam_size=3,
+                best_of=2,
+                patience=1.0,
+                temperature=0.0,
+                vad_filter=True,
+                vad_parameters={
+                    "min_silence_duration_ms": 300,
+                    "speech_pad_ms": 300,
+                    "min_speech_duration_ms": 200,
+                },
+                condition_on_previous_text=False,
+                multilingual=True,
+                language_detection_threshold=0.45,
+                language_detection_segments=6,
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.4,
+                log_prob_threshold=-1.0,
+            )
+            language = str(getattr(info, "language", None) or "unknown")
+            probability = float(getattr(info, "language_probability", 0.0) or 0.0)
+            language_stats.setdefault(language, []).append(probability)
+
+            for segment in segments:
+                text_value = _normalize_transcript_text(segment.text or "")
+                if not text_value or text_value == previous_text:
+                    continue
+                previous_text = text_value
+                absolute_start = offset_seconds + float(segment.start or 0.0)
+                minutes = int(absolute_start // 60)
+                seconds = int(absolute_start % 60)
+                lines.append(f"[{minutes:02d}:{seconds:02d}] {text_value}")
+    finally:
+        for _offset, chunk_path, temporary in chunks:
+            if temporary:
+                chunk_path.unlink(missing_ok=True)
+
+    detected = []
+    for language, probabilities in sorted(
+        language_stats.items(),
+        key=lambda item: (-len(item[1]), item[0]),
+    ):
+        average = sum(probabilities) / max(1, len(probabilities))
+        detected.append(f"{language} ({average * 100:.0f}%)")
+
+    return "\n".join(lines).strip(), (", ".join(detected) if detected else "auto")
+
+
 def requester_summary(req: dict[str, Any], fallback_chat_id: str) -> str:
     full_name = " ".join(
         p for p in [str(req.get("first_name") or "").strip(), str(req.get("last_name") or "").strip()] if p
@@ -1748,7 +1854,7 @@ async def _recover_premium_download_inner(token: str, chat_id: str) -> None:
             await tg_text(chat_id, t(chat_id, "transcribing"))
             async with TRANSCRIPTION_SEMAPHORE:
                 transcript, detected_language = await asyncio.to_thread(
-                    transcribe_audio_local,
+                    transcribe_audio_recovery_fast,
                     audio_path,
                 )
             if transcript:
