@@ -1362,7 +1362,7 @@ def transcribe_audio_recovery_fast(audio_path: Path) -> tuple[str, str]:
     from faster_whisper import WhisperModel
 
     if _whisper_recovery_model is None:
-        model_name = os.environ.get("RECOVERY_WHISPER_MODEL", "medium")
+        model_name = os.environ.get("RECOVERY_WHISPER_MODEL", "small")
         _whisper_recovery_model = WhisperModel(
             model_name,
             device="cpu",
@@ -1373,7 +1373,7 @@ def transcribe_audio_recovery_fast(audio_path: Path) -> tuple[str, str]:
         )
 
     duration = _audio_duration_seconds(audio_path)
-    chunk_seconds = max(120, int(os.environ.get("RECOVERY_TRANSCRIPTION_CHUNK_SECONDS", "300")))
+    chunk_seconds = max(180, int(os.environ.get("RECOVERY_TRANSCRIPTION_CHUNK_SECONDS", "600")))
     chunks: list[tuple[float, Path, bool]] = []
 
     if duration <= 0 or duration <= chunk_seconds * 1.25:
@@ -1413,8 +1413,8 @@ def transcribe_audio_recovery_fast(audio_path: Path) -> tuple[str, str]:
                 str(chunk_path),
                 task="transcribe",
                 language=None,
-                beam_size=3,
-                best_of=2,
+                beam_size=1,
+                best_of=1,
                 patience=1.0,
                 temperature=0.0,
                 vad_filter=True,
@@ -1426,7 +1426,7 @@ def transcribe_audio_recovery_fast(audio_path: Path) -> tuple[str, str]:
                 condition_on_previous_text=False,
                 multilingual=True,
                 language_detection_threshold=0.45,
-                language_detection_segments=6,
+                language_detection_segments=4,
                 no_speech_threshold=0.6,
                 compression_ratio_threshold=2.4,
                 log_prob_threshold=-1.0,
