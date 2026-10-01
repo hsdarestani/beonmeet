@@ -21,6 +21,7 @@ DB_PATH = Path(os.environ.get("BEONMEET_DB_PATH", "/data/beonmeet.db"))
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
 ADMINUSER = os.environ.get("ADMINUSER", "").strip()
 DOMAIN = os.environ.get("DOMAIN", "beonmeet.smarbiz.sbs")
+FREE_RECORDING_LIMIT = max(0, int(os.environ.get("FREE_RECORDING_LIMIT", "5")))
 
 PLANS = {
     "monthly": {"label": "یک ماهه", "months": 1, "price": 198_000},
@@ -363,6 +364,27 @@ def _parse_dt(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value)
     except Exception:
         return None
+
+
+def free_recording_entitlement(telegram_id: str) -> dict:
+    """Return the current lifetime free-recording allowance for one Telegram user."""
+    with _db() as db:
+        row = db.execute(
+            "SELECT total_recordings, premium_until FROM users WHERE telegram_id=?",
+            (str(telegram_id),),
+        ).fetchone()
+
+    used = int(row["total_recordings"] or 0) if row else 0
+    until = _parse_dt(row["premium_until"]) if row else None
+    premium = bool(until and until > utcnow())
+    remaining = max(0, FREE_RECORDING_LIMIT - used)
+    return {
+        "premium": premium,
+        "used": used,
+        "limit": FREE_RECORDING_LIMIT,
+        "remaining": remaining,
+        "allowed": premium or remaining > 0,
+    }
 
 
 def is_premium(telegram_id: str) -> bool:

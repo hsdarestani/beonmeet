@@ -20,6 +20,7 @@ jobs:
         run: |
           python3 -m py_compile app/main.py app/i18n.py app/hetzner_autoscaler.py app/autoscaler_smoke.py
           python3 tests/i18n_test.py
+          python3 tests/free_plan_limit_test.py
           python3 tests/premium_delivery_test.py
           python3 tests/cloud_init_render_test.py
 

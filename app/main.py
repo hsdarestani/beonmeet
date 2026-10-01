@@ -41,6 +41,7 @@ from admin_panel import (
     activate_subscription,
     create_payment_intent,
     find_recording_for_artifact,
+    free_recording_entitlement,
     get_payment_intent,
     init_db,
     is_premium,
@@ -125,6 +126,7 @@ state: dict[str, Any] = {
     "pending_deliveries": {},
     "recording_downloads": {},
     "premium_recoveries": {},
+    "free_limit_notified": {},
 }
 
 
@@ -143,6 +145,7 @@ def load_state() -> None:
     state.setdefault("pending_deliveries", {})
     state.setdefault("recording_downloads", {})
     state.setdefault("premium_recoveries", {})
+    state.setdefault("free_limit_notified", {})
     print(f"controller state loaded from {source}", flush=True)
 
 
@@ -241,6 +244,40 @@ async def tg_text(
     elif with_menu:
         data["reply_markup"] = json.dumps(telegram_reply_keyboard(chat_id), ensure_ascii=False)
     await telegram("sendMessage", data)
+
+
+async def send_subscription_offer(chat_id: int | str, message_key: str = "premium_offer") -> None:
+    intents: dict[str, dict[str, Any]] = {}
+    for plan_code in ("monthly", "quarterly", "halfyear"):
+        intents[plan_code] = await asyncio.to_thread(
+            create_payment_intent, str(chat_id), plan_code
+        )
+
+    lang = user_language(chat_id)
+    keyboard = {
+        "inline_keyboard": [
+            [{
+                "text": i18n_tr(lang, "plan_monthly"),
+                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['monthly']['intent']}",
+            }],
+            [{
+                "text": i18n_tr(lang, "plan_quarterly"),
+                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['quarterly']['intent']}",
+            }],
+            [{
+                "text": i18n_tr(lang, "plan_halfyear"),
+                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['halfyear']['intent']}",
+            }],
+        ]
+    }
+    await telegram(
+        "sendMessage",
+        {
+            "chat_id": str(chat_id),
+            "text": t(chat_id, message_key),
+            "reply_markup": json.dumps(keyboard, ensure_ascii=False),
+        },
+    )
 
 
 async def setup_telegram_profile() -> None:
@@ -489,6 +526,62 @@ def _queue_position(event_id: str, premium: bool) -> int:
     return len(matching) + 1
 
 
+def _pending_free_recordings(chat_id: str, exclude_event_id: str = "") -> int:
+    """Count free recordings already reserved in queue or actively being processed."""
+    event_ids: set[str] = set()
+
+    for item in state.get("join_queue", []):
+        if bool(item.get("premium")):
+            continue
+        req = item.get("req") or {}
+        if str(req.get("chat_id") or "") != str(chat_id):
+            continue
+        event_id = str(item.get("event_id") or "")
+        if event_id and event_id != exclude_event_id:
+            event_ids.add(event_id)
+
+    active_statuses = {"remote_claimed", "joining", "waiting_for_admission", "recording", "delivering"}
+    for event_id, launched in state.get("launched_events", {}).items():
+        if bool((launched or {}).get("premium")):
+            continue
+        if str((launched or {}).get("chat_id") or "") != str(chat_id):
+            continue
+        if str(event_id) == exclude_event_id:
+            continue
+        if str((launched or {}).get("status") or "joining") in active_statuses:
+            event_ids.add(str(event_id))
+
+    return len(event_ids)
+
+
+async def _free_recording_allowed(
+    chat_id: str,
+    *,
+    event_id: str = "",
+    include_pending: bool = True,
+    notify: bool = True,
+) -> bool:
+    entitlement = await asyncio.to_thread(free_recording_entitlement, str(chat_id))
+    if entitlement.get("premium"):
+        return True
+
+    used = int(entitlement.get("used") or 0)
+    limit = int(entitlement.get("limit") or 0)
+    pending = _pending_free_recordings(str(chat_id), exclude_event_id=event_id) if include_pending else 0
+    if used + pending < limit:
+        return True
+
+    if notify:
+        notification_key = f"{chat_id}:{event_id}" if event_id else ""
+        notified = state.setdefault("free_limit_notified", {})
+        if not notification_key or notification_key not in notified:
+            await send_subscription_offer(chat_id, "free_limit_reached")
+            if notification_key:
+                notified[notification_key] = datetime.now(timezone.utc).isoformat()
+                await save_state()
+    return False
+
+
 async def enqueue_meeting(
     event: dict[str, Any],
     req: dict[str, Any],
@@ -600,6 +693,14 @@ async def launch_meeting(
 ) -> bool:
     chat_id = str(req["chat_id"])
     premium = await asyncio.to_thread(is_premium, chat_id)
+    event_id = _queue_event_id(event)
+    if not premium and not await _free_recording_allowed(
+        chat_id,
+        event_id=event_id,
+        include_pending=True,
+        notify=True,
+    ):
+        return False
 
     launched, busy, pool_name = await _dispatch_meeting(
         event, req, meet_url, premium
@@ -788,6 +889,16 @@ async def state_cleanup_loop() -> None:
                     launched_events.pop(event_id, None)
                     changed = True
 
+            free_limit_notified = state.setdefault("free_limit_notified", {})
+            for key, raw in list(free_limit_notified.items()):
+                try:
+                    created = isoparse(str(raw)) if raw else now
+                except Exception:
+                    created = now
+                if now - created > timedelta(days=2):
+                    free_limit_notified.pop(key, None)
+                    changed = True
+
             if changed:
                 await save_state()
         except Exception as exc:
@@ -928,36 +1039,7 @@ async def telegram_loop() -> None:
                             with_menu=True,
                         )
                     else:
-                        intents = {}
-                        for plan_code in ("monthly", "quarterly", "halfyear"):
-                            intents[plan_code] = await asyncio.to_thread(
-                                create_payment_intent, str(chat_id), plan_code
-                            )
-                        lang = user_language(chat_id)
-                        keyboard = {
-                            "inline_keyboard": [
-                                [{
-                                    "text": i18n_tr(lang, "plan_monthly"),
-                                    "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['monthly']['intent']}",
-                                }],
-                                [{
-                                    "text": i18n_tr(lang, "plan_quarterly"),
-                                    "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['quarterly']['intent']}",
-                                }],
-                                [{
-                                    "text": i18n_tr(lang, "plan_halfyear"),
-                                    "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['halfyear']['intent']}",
-                                }],
-                            ]
-                        }
-                        await telegram(
-                            "sendMessage",
-                            {
-                                "chat_id": str(chat_id),
-                                "text": t(chat_id, "premium_offer"),
-                                "reply_markup": json.dumps(keyboard, ensure_ascii=False),
-                            },
-                        )
+                        await send_subscription_offer(chat_id)
                     continue
 
                 if text.startswith("/start"):
@@ -982,6 +1064,12 @@ async def telegram_loop() -> None:
                     continue
 
                 if text.strip().lower() == "/now":
+                    if not await _free_recording_allowed(
+                        str(chat_id),
+                        include_pending=True,
+                        notify=True,
+                    ):
+                        continue
                     state.setdefault("pending_now", {})[str(chat_id)] = True
                     await save_state()
                     await tg_text(chat_id, t(chat_id, "now_prompt"), with_menu=True)
@@ -992,6 +1080,12 @@ async def telegram_loop() -> None:
                 )
                 meet_url = normalize_meet_url(text)
                 if meet_url:
+                    if not await _free_recording_allowed(
+                        str(chat_id),
+                        include_pending=False,
+                        notify=True,
+                    ):
+                        continue
                     state["requests"][meet_url] = {
                         "chat_id": str(chat_id),
                         "requester_id": str(from_user.get("id") or chat_id),
