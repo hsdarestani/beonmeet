@@ -41,3 +41,16 @@ assert "_legacy_orphan_candidates" not in MAIN
 assert "_recover_legacy_orphan" not in MAIN
 assert 'RECORDING_ROOT.glob("*/*")' not in MAIN
 print("NO_STALE_RECORDING_RECOVERY_TEST_PASS")
+
+assert 'PREMIUM_DOWNLOAD_TTL_HOURS = max(1, int(os.environ.get("PREMIUM_DOWNLOAD_TTL_HOURS", "72")))' in MAIN
+assert 'FREE_DOWNLOAD_TTL_HOURS = max(' in MAIN
+assert 'async def recording_download_ttl_hours' in MAIN
+assert 'return PREMIUM_DOWNLOAD_TTL_HOURS' in MAIN
+assert 'return FREE_DOWNLOAD_TTL_HOURS' in MAIN
+assert '"ttl_hours": ttl_hours' in MAIN
+assert 'return f"https://{DOMAIN}/download/{token}", ttl_hours' in MAIN
+assert 'download_url, expires_hours = await create_recording_download(' in MAIN
+assert 'hours=expires_hours' in MAIN
+assert 'download_url, download_hours = await create_recording_download(' in MAIN
+assert 'hours=download_hours' in MAIN
+print("PREMIUM_RETENTION_72H_TEST_PASS")
