@@ -92,7 +92,11 @@ INTERNAL_SECRET = os.environ["INTERNAL_SECRET"]
 RECORDING_ROOT = Path(os.environ.get("RECORDING_TMP_DIR", "/recordings")).resolve()
 DOWNLOAD_ROOT = DATA_DIR / "recording-downloads"
 DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
-DOWNLOAD_TTL_HOURS = max(1, int(os.environ.get("DOWNLOAD_TTL_HOURS", "24")))
+FREE_DOWNLOAD_TTL_HOURS = max(
+    1,
+    int(os.environ.get("FREE_DOWNLOAD_TTL_HOURS", os.environ.get("DOWNLOAD_TTL_HOURS", "24"))),
+)
+PREMIUM_DOWNLOAD_TTL_HOURS = max(1, int(os.environ.get("PREMIUM_DOWNLOAD_TTL_HOURS", "72")))
 BOT_DISPLAY_NAME = os.environ.get("BOT_DISPLAY_NAME", "BeOnMeet Recorder")
 CALENDAR_POLL_SECONDS = int(os.environ.get("CALENDAR_POLL_SECONDS", "30"))
 PAYMENT_STATUS_URL = os.environ.get(
@@ -1180,22 +1184,35 @@ async def telegram_loop() -> None:
             await asyncio.sleep(5)
 
 
-async def create_recording_download(path: Path, filename: str, owner_chat_id: str = "") -> str:
+async def recording_download_ttl_hours(owner_chat_id: str = "") -> int:
+    if owner_chat_id and await asyncio.to_thread(is_premium, str(owner_chat_id)):
+        return PREMIUM_DOWNLOAD_TTL_HOURS
+    return FREE_DOWNLOAD_TTL_HOURS
+
+
+async def create_recording_download(
+    path: Path,
+    filename: str,
+    owner_chat_id: str = "",
+) -> tuple[str, int]:
     token = secrets.token_urlsafe(32)
     suffix = path.suffix.lower() if path.suffix else ".webm"
     stored_path = (DOWNLOAD_ROOT / f"{token}{suffix}").resolve()
     stored_path.relative_to(DOWNLOAD_ROOT)
     await asyncio.to_thread(shutil.copy2, path, stored_path)
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=DOWNLOAD_TTL_HOURS)
+    ttl_hours = await recording_download_ttl_hours(owner_chat_id)
+    created_at = datetime.now(timezone.utc)
+    expires_at = created_at + timedelta(hours=ttl_hours)
     state.setdefault("recording_downloads", {})[token] = {
         "file_path": str(stored_path),
         "filename": filename,
         "owner_chat_id": str(owner_chat_id or ""),
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": created_at.isoformat(),
         "expires_at": expires_at.isoformat(),
+        "ttl_hours": ttl_hours,
     }
     await save_state()
-    return f"https://{DOMAIN}/download/{token}"
+    return f"https://{DOMAIN}/download/{token}", ttl_hours
 
 
 async def send_recording_to_recipients(
@@ -1222,12 +1239,11 @@ async def send_recording_to_recipients(
 
     # The official Telegram Bot API caps uploaded files at 50 MB.
     # For larger recordings, avoid chat spam and provide one expiring full-file download.
-    download_url = await create_recording_download(
+    download_url, expires_hours = await create_recording_download(
         path,
         filename,
         owner_chat_id=str(recipients[0]["chat_id"]) if recipients else "",
     )
-    expires_hours = DOWNLOAD_TTL_HOURS
     for target in recipients:
         await tg_text(
             target["chat_id"],
@@ -1254,6 +1270,7 @@ async def send_audio_to_recipients(
     max_cloud = 49 * 1024 * 1024
     size = path.stat().st_size
     download_url: str | None = None
+    download_hours = FREE_DOWNLOAD_TTL_HOURS
 
     for target in recipients:
         if size <= max_cloud or TELEGRAM_API_BASE != "https://api.telegram.org":
@@ -1276,7 +1293,7 @@ async def send_audio_to_recipients(
                 )
 
         if download_url is None:
-            download_url = await create_recording_download(
+            download_url, download_hours = await create_recording_download(
                 path,
                 filename,
                 owner_chat_id=str(recipients[0]["chat_id"]) if recipients else "",
@@ -1287,7 +1304,7 @@ async def send_audio_to_recipients(
                 target["chat_id"],
                 "large_audio_download",
                 url=download_url,
-                hours=DOWNLOAD_TTL_HOURS,
+                hours=download_hours,
             ),
         )
 
@@ -1878,8 +1895,9 @@ async def _resolve_download_owner(token: str, item: dict[str, Any], file_path: P
     if not created_raw:
         expires_raw = str(item.get("expires_at") or "").strip()
         try:
+            ttl_hours = int(item.get("ttl_hours") or FREE_DOWNLOAD_TTL_HOURS)
             created_raw = (
-                isoparse(expires_raw) - timedelta(hours=DOWNLOAD_TTL_HOURS)
+                isoparse(expires_raw) - timedelta(hours=ttl_hours)
             ).isoformat()
         except Exception:
             created_raw = ""
@@ -2040,8 +2058,9 @@ async def premium_upgrade_backfill_loop() -> None:
 
                 created_raw = str(item.get("created_at") or "").strip()
                 if not created_raw:
+                    ttl_hours = int(item.get("ttl_hours") or FREE_DOWNLOAD_TTL_HOURS)
                     created_raw = (
-                        expires_at - timedelta(hours=DOWNLOAD_TTL_HOURS)
+                        expires_at - timedelta(hours=ttl_hours)
                     ).isoformat()
                 recording = await asyncio.to_thread(
                     find_recording_for_artifact,
