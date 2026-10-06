@@ -63,6 +63,8 @@ DATA_DIR = Path("/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "state.json"
 TOKEN_FILE = DATA_DIR / "google-token.json"
+USER_TOKEN_DIR = DATA_DIR / "google-tokens"
+USER_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
 STATE_STORE = DurableStateStore(STATE_FILE)
 
 BOT_EMAIL = os.environ.get("BOT_EMAIL", "meetrecorderbot@gmail.com")
@@ -126,6 +128,9 @@ state: dict[str, Any] = {
     "join_queue": [],
     "remote_claims": {},
     "oauth_state": None,
+    "oauth_states": {},
+    "auto_join_all": {},
+    "auto_registered_events": {},
     "user_languages": {},
     "pending_deliveries": {},
     "recording_downloads": {},
@@ -145,6 +150,9 @@ def load_state() -> None:
     state.setdefault("remote_claims", {})
     state.setdefault("telegram_offset", 0)
     state.setdefault("oauth_state", None)
+    state.setdefault("oauth_states", {})
+    state.setdefault("auto_join_all", {})
+    state.setdefault("auto_registered_events", {})
     state.setdefault("user_languages", {})
     state.setdefault("pending_deliveries", {})
     state.setdefault("recording_downloads", {})
@@ -207,8 +215,8 @@ def telegram_reply_keyboard(chat_id: int | str) -> dict[str, Any]:
     labels = i18n_menu(user_language(chat_id))
     rows = [
         [{"text": labels["new"]}, {"text": labels["premium"]}],
-        [{"text": labels["now"]}, {"text": labels["help"]}],
-        [{"text": labels["language"]}],
+        [{"text": labels["now"]}, {"text": labels["auto"]}],
+        [{"text": labels["help"]}, {"text": labels["language"]}],
     ]
     if ADMINUSER and str(chat_id) == ADMINUSER:
         rows.append([{"text": labels["admin"]}])
@@ -301,6 +309,7 @@ async def setup_telegram_profile() -> None:
                 {"command": "start", "description": profile["commands"]["start"]},
                 {"command": "plans", "description": profile["commands"]["plans"]},
                 {"command": "now", "description": profile["commands"]["now"]},
+                {"command": "auto", "description": profile["commands"]["auto"]},
                 {"command": "language", "description": profile["commands"]["language"]},
             ]
             await telegram("setMyCommands", {
@@ -321,6 +330,7 @@ async def setup_telegram_profile() -> None:
             {"command": "start", "description": default_profile["commands"]["start"]},
             {"command": "plans", "description": default_profile["commands"]["plans"]},
             {"command": "now", "description": default_profile["commands"]["now"]},
+            {"command": "auto", "description": default_profile["commands"]["auto"]},
             {"command": "language", "description": default_profile["commands"]["language"]},
         ]
         await telegram("setMyCommands", {
@@ -338,6 +348,7 @@ async def setup_telegram_profile() -> None:
                     {"command": "start", "description": profile["commands"]["start"]},
                     {"command": "plans", "description": profile["commands"]["plans"]},
                     {"command": "now", "description": profile["commands"]["now"]},
+                    {"command": "auto", "description": profile["commands"]["auto"]},
                     {"command": "language", "description": profile["commands"]["language"]},
                     {"command": "admin", "description": profile["commands"]["admin"]},
                 ]
@@ -369,18 +380,54 @@ def google_flow(state_value: str | None = None) -> Flow:
     return flow
 
 
-def load_google_credentials() -> Credentials | None:
-    if not TOKEN_FILE.exists():
+def _safe_chat_id(chat_id: int | str) -> str:
+    value = str(chat_id or "").strip()
+    if not re.fullmatch(r"-?\d{1,20}", value):
+        raise ValueError("invalid Telegram chat id")
+    return value
+
+
+def google_token_file(chat_id: int | str) -> Path:
+    return USER_TOKEN_DIR / f"{_safe_chat_id(chat_id)}.json"
+
+
+def _calendar_token_path(chat_id: int | str | None = None) -> Path:
+    if chat_id is None:
+        return TOKEN_FILE
+    path = google_token_file(chat_id)
+    if path.exists():
+        return path
+    # Backward compatibility for the original single-account installation.
+    if ADMINUSER and str(chat_id) == ADMINUSER and TOKEN_FILE.exists():
+        return TOKEN_FILE
+    return path
+
+
+def calendar_connected(chat_id: int | str | None = None) -> bool:
+    return _calendar_token_path(chat_id).exists()
+
+
+def auto_join_enabled(chat_id: int | str) -> bool:
+    return bool(state.setdefault("auto_join_all", {}).get(str(chat_id)))
+
+
+def calendar_auth_url(chat_id: int | str) -> str:
+    return f"https://{DOMAIN}/auth/google?chat_id={quote(_safe_chat_id(chat_id))}"
+
+
+def load_google_credentials(chat_id: int | str | None = None) -> Credentials | None:
+    token_path = _calendar_token_path(chat_id)
+    if not token_path.exists():
         return None
-    creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+    creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
     if creds.expired and creds.refresh_token:
         creds.refresh(GoogleRequest())
-        TOKEN_FILE.write_text(creds.to_json())
+        token_path.write_text(creds.to_json())
     return creds
 
 
-def list_calendar_events() -> list[dict[str, Any]]:
-    creds = load_google_credentials()
+def list_calendar_events(chat_id: int | str | None = None) -> list[dict[str, Any]]:
+    creds = load_google_credentials(chat_id)
     if not creds:
         return []
     service = build("calendar", "v3", credentials=creds, cache_discovery=False)
@@ -469,8 +516,34 @@ def event_end(event: dict[str, Any]) -> datetime | None:
     return _event_datetime(event, "end")
 
 
-def find_calendar_event_for_meet(meet_url: str) -> dict[str, Any] | None:
-    matches = [event for event in list_calendar_events() if event_meet_url(event) == meet_url]
+def event_declined_by_owner(event: dict[str, Any]) -> bool:
+    for attendee in event.get("attendees", []) or []:
+        if attendee.get("self") and attendee.get("responseStatus") == "declined":
+            return True
+    return False
+
+
+def find_calendar_event_for_meet(
+    meet_url: str,
+    chat_id: int | str | None = None,
+) -> dict[str, Any] | None:
+    events: list[dict[str, Any]] = []
+    personal_path = None
+    if chat_id is not None:
+        try:
+            personal_path = google_token_file(chat_id)
+        except ValueError:
+            personal_path = None
+        if personal_path and personal_path.exists():
+            events.extend(list_calendar_events(chat_id))
+    # Keep the original shared bot-calendar lookup as a fallback so existing
+    # manually registered meetings continue to work unchanged.
+    if TOKEN_FILE.exists():
+        events.extend(list_calendar_events())
+    elif chat_id is not None and calendar_connected(chat_id):
+        events.extend(list_calendar_events(chat_id))
+
+    matches = [event for event in events if event_meet_url(event) == meet_url]
     if not matches:
         return None
 
@@ -903,6 +976,27 @@ async def state_cleanup_loop() -> None:
                     free_limit_notified.pop(key, None)
                     changed = True
 
+            auto_registered = state.setdefault("auto_registered_events", {})
+            for key, raw in list(auto_registered.items()):
+                try:
+                    created = isoparse(str(raw)) if raw else now
+                except Exception:
+                    created = now
+                if now - created > timedelta(days=30):
+                    auto_registered.pop(key, None)
+                    changed = True
+
+            oauth_states = state.setdefault("oauth_states", {})
+            for key, item in list(oauth_states.items()):
+                raw = str((item or {}).get("created_at") or "")
+                try:
+                    created = isoparse(raw) if raw else now
+                except Exception:
+                    created = now
+                if now - created > timedelta(hours=1):
+                    oauth_states.pop(key, None)
+                    changed = True
+
             if changed:
                 await save_state()
         except Exception as exc:
@@ -911,12 +1005,90 @@ async def state_cleanup_loop() -> None:
         await asyncio.sleep(600)
 
 
+def same_meeting_inflight(
+    chat_id: int | str,
+    meet_url: str,
+    event_id: str,
+    now: datetime,
+) -> bool:
+    target_chat = str(chat_id)
+    for item in state.get("join_queue", []):
+        if str(item.get("event_id") or "") == event_id:
+            continue
+        req = item.get("req") or {}
+        if (
+            str(req.get("chat_id") or "") == target_chat
+            and str(item.get("meet_url") or "") == meet_url
+        ):
+            return True
+
+    for other_event_id, launched in state.get("launched_events", {}).items():
+        if str(other_event_id) == event_id:
+            continue
+        if (
+            str(launched.get("chat_id") or "") != target_chat
+            or str(launched.get("meet_url") or "") != meet_url
+        ):
+            continue
+        status = str(launched.get("status") or "joining")
+        if status in {"recording", "waiting_for_admission", "delivering", "remote_claimed"}:
+            return True
+        launched_at_raw = str(launched.get("launched_at") or "")
+        try:
+            launched_at = isoparse(launched_at_raw) if launched_at_raw else None
+        except Exception:
+            launched_at = None
+        if launched_at and now - launched_at < timedelta(minutes=7):
+            return True
+    return False
+
+
+async def maybe_launch_calendar_event(
+    event: dict[str, Any],
+    req: dict[str, Any],
+    meet_url: str,
+    now: datetime,
+) -> bool:
+    event_id = str(event.get("id") or "")
+    if not event_id or _is_queued(event_id):
+        return False
+    if same_meeting_inflight(req.get("chat_id") or "", meet_url, event_id, now):
+        return False
+
+    launched = state["launched_events"].get(event_id)
+    if launched:
+        status = str(launched.get("status") or "joining")
+        launched_at_raw = launched.get("launched_at")
+        launched_at = isoparse(launched_at_raw) if launched_at_raw else None
+        if status in {"recording", "waiting_for_admission", "delivering"}:
+            return False
+        if launched_at and now - launched_at < timedelta(minutes=7):
+            return False
+        state["launched_events"].pop(event_id, None)
+        await save_state()
+
+    start = event_start(event)
+    end = event_end(event)
+    if not start:
+        return False
+    if end and now > end:
+        return False
+    live_until = (end + timedelta(minutes=5)) if end else (start + timedelta(hours=3))
+    if not (start <= now <= live_until):
+        return False
+
+    await launch_meeting(event, req, meet_url)
+    return True
+
+
 async def calendar_loop() -> None:
     while True:
         try:
+            now = datetime.now(timezone.utc)
+
+            # Legacy/manual mode: retain the shared recorder calendar behavior.
             if TOKEN_FILE.exists():
                 events = await asyncio.to_thread(list_calendar_events)
-                now = datetime.now(timezone.utc)
                 for event in events:
                     meet_url = event_meet_url(event)
                     if not meet_url:
@@ -924,31 +1096,54 @@ async def calendar_loop() -> None:
                     req = state["requests"].get(meet_url)
                     if not req:
                         continue
-                    event_id = event.get("id")
-                    if not event_id:
+                    await maybe_launch_calendar_event(event, req, meet_url, now)
+
+            # Personal auto mode: once enabled, every Google Meet on that user's
+            # connected calendar is discovered and launched without sending links.
+            auto_settings = dict(state.setdefault("auto_join_all", {}))
+            for chat_id, enabled in auto_settings.items():
+                if not enabled or not calendar_connected(chat_id):
+                    continue
+                try:
+                    events = await asyncio.to_thread(list_calendar_events, chat_id)
+                except Exception as exc:
+                    print(f"calendar auto lookup error ({chat_id}):", repr(exc), flush=True)
+                    continue
+
+                for source_event in events:
+                    if source_event.get("status") == "cancelled" or event_declined_by_owner(source_event):
                         continue
-                    if _is_queued(str(event_id)):
+                    meet_url = event_meet_url(source_event)
+                    original_event_id = str(source_event.get("id") or "")
+                    if not meet_url or not original_event_id:
                         continue
-                    launched = state["launched_events"].get(event_id)
-                    if launched:
-                        status = str(launched.get("status") or "joining")
-                        launched_at_raw = launched.get("launched_at")
-                        launched_at = isoparse(launched_at_raw) if launched_at_raw else None
-                        if status in {"recording", "waiting_for_admission"}:
-                            continue
-                        if launched_at and now - launched_at < timedelta(minutes=7):
-                            continue
-                        state["launched_events"].pop(event_id, None)
-                        await save_state()
-                    start = event_start(event)
-                    end = event_end(event)
+
+                    start = event_start(source_event)
+                    end = event_end(source_event)
                     if not start:
                         continue
-                    if end and now > end:
-                        continue
                     live_until = (end + timedelta(minutes=5)) if end else (start + timedelta(hours=3))
-                    if start <= now <= live_until:
-                        await launch_meeting(event, req, meet_url)
+                    if not (start <= now <= live_until):
+                        continue
+
+                    event = dict(source_event)
+                    event["google_event_id"] = original_event_id
+                    event["id"] = f"auto-{chat_id}-{original_event_id}"
+                    req = {
+                        "chat_id": str(chat_id),
+                        "requester_id": str(chat_id),
+                        "ui_language": user_language(chat_id),
+                        "requested_at": now.isoformat(),
+                        "auto_calendar": True,
+                    }
+
+                    registered = state.setdefault("auto_registered_events", {})
+                    if event["id"] not in registered:
+                        await asyncio.to_thread(record_request, str(chat_id), meet_url, "auto_calendar")
+                        registered[event["id"]] = now.isoformat()
+                        await save_state()
+
+                    await maybe_launch_calendar_event(event, req, meet_url, now)
         except Exception as exc:
             print("calendar loop error:", repr(exc), flush=True)
         await asyncio.sleep(CALENDAR_POLL_SECONDS)
@@ -1046,14 +1241,43 @@ async def telegram_loop() -> None:
                         await send_subscription_offer(chat_id)
                     continue
 
+                if text.startswith("/auto"):
+                    if not calendar_connected(chat_id):
+                        await tg_text(
+                            chat_id,
+                            t(chat_id, "auto_connect", url=calendar_auth_url(chat_id)),
+                            with_menu=True,
+                        )
+                        continue
+                    parts = text.strip().lower().split(maxsplit=1)
+                    explicit = parts[1] if len(parts) > 1 else ""
+                    if explicit in {"on", "1", "true", "enable"}:
+                        enabled = True
+                    elif explicit in {"off", "0", "false", "disable"}:
+                        enabled = False
+                    else:
+                        enabled = not auto_join_enabled(chat_id)
+                    state.setdefault("auto_join_all", {})[str(chat_id)] = enabled
+                    await save_state()
+                    await tg_text(
+                        chat_id,
+                        t(chat_id, "auto_enabled" if enabled else "auto_disabled"),
+                        with_menu=True,
+                    )
+                    continue
+
                 if text.startswith("/start"):
-                    if TOKEN_FILE.exists():
+                    if calendar_connected(chat_id):
                         auth_status = t(chat_id, "calendar_connected")
+                        auth_status += "\n" + t(
+                            chat_id,
+                            "auto_status_on" if auto_join_enabled(chat_id) else "auto_status_off",
+                        )
                     else:
                         auth_status = t(
                             chat_id,
                             "calendar_disconnected",
-                            url=f"https://{DOMAIN}/auth/google",
+                            url=calendar_auth_url(chat_id),
                         )
                     await tg_text(
                         chat_id,
@@ -1128,6 +1352,7 @@ async def telegram_loop() -> None:
                         matched_event = await asyncio.to_thread(
                             find_calendar_event_for_meet,
                             meet_url,
+                            str(chat_id),
                         )
                     except Exception as exc:
                         print(
@@ -2200,6 +2425,8 @@ async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "calendar_connected": TOKEN_FILE.exists(),
+        "personal_calendar_connections": len(list(USER_TOKEN_DIR.glob("*.json"))),
+        "auto_join_users": sum(1 for enabled in state.get("auto_join_all", {}).values() if enabled),
         "bot_email": BOT_EMAIL,
         "admin_recipient_configured": bool(ADMINUSER),
         "max_concurrent_meetings": total_free_slots + total_premium_slots,
@@ -2239,26 +2466,58 @@ async def home() -> str:
 
 
 @app.get("/auth/google")
-async def auth_google() -> RedirectResponse:
+async def auth_google(chat_id: str | None = None) -> RedirectResponse:
+    normalized_chat_id = None
+    if chat_id:
+        try:
+            normalized_chat_id = _safe_chat_id(chat_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Telegram chat id")
+
     flow = google_flow()
     authorization_url, oauth_state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
     )
-    state["oauth_state"] = oauth_state
+    if normalized_chat_id:
+        state.setdefault("oauth_states", {})[oauth_state] = {
+            "chat_id": normalized_chat_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    else:
+        state["oauth_state"] = oauth_state
     await save_state()
     return RedirectResponse(authorization_url)
 
 
 @app.get("/auth/google/callback", response_class=HTMLResponse)
 async def auth_google_callback(request: Request, state: str) -> str:
-    if state != globals()["state"].get("oauth_state"):
+    oauth_entry = globals()["state"].setdefault("oauth_states", {}).pop(state, None)
+    legacy_flow = state == globals()["state"].get("oauth_state")
+    if not oauth_entry and not legacy_flow:
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
     flow = google_flow(state)
     callback_url = f"https://{DOMAIN}/auth/google/callback?{request.url.query}"
     flow.fetch_token(authorization_response=callback_url)
     creds = flow.credentials
+
+    chat_id = str((oauth_entry or {}).get("chat_id") or "")
+    if chat_id:
+        google_token_file(chat_id).write_text(creds.to_json())
+        globals()["state"].setdefault("auto_join_all", {})[chat_id] = True
+        await save_state()
+        try:
+            await tg_text(chat_id, t(chat_id, "auto_enabled"), with_menu=True)
+        except Exception as exc:
+            print("calendar connect Telegram confirmation error:", repr(exc), flush=True)
+        return (
+            "<h2>Google Calendar connected ✅</h2>"
+            "<p>Automatic mode is on. BeOnMeet will now detect Google Meet events "
+            "on this calendar automatically. You can close this page.</p>"
+        )
+
     TOKEN_FILE.write_text(creds.to_json())
     globals()["state"]["oauth_state"] = None
     await save_state()
