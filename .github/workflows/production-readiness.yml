@@ -26,11 +26,19 @@ jobs:
           python3 -m py_compile app/main.py app/i18n.py app/hetzner_autoscaler.py
           python3 tests/i18n_test.py
           python3 tests/auto_calendar_test.py
+          python3 tests/public_oauth_pages_test.py
           python3 tests/premium_delivery_test.py
           python3 tests/cloud_init_render_test.py
 
       - name: Run synthetic scaling load test
         run: python3 tests/scaling_load_test.py
+
+      - name: Check public OAuth verification pages
+        run: |
+          set -euo pipefail
+          curl -fsS https://beonmeet.smarbiz.sbs/ | grep -q "Your calendar knows the meeting"
+          curl -fsS https://beonmeet.smarbiz.sbs/privacy | grep -q "Google API Services User Data Policy"
+          curl -fsS https://beonmeet.smarbiz.sbs/terms | grep -q "BeOnMeet Terms of Service"
 
       - name: Check production health
         run: |
