@@ -594,7 +594,7 @@ def find_calendar_event_for_meet(
             personal_path = google_token_file(chat_id)
         except ValueError:
             personal_path = None
-        if personal_path and personal_path.exists():
+        if personal_path and personal_path.exists() and personal_calendar_scopes_ready(chat_id):
             events.extend(list_calendar_events(chat_id))
     # Keep the original shared bot-calendar lookup as a fallback so existing
     # manually registered meetings continue to work unchanged.
