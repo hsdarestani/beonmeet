@@ -7,6 +7,11 @@ I18N = (ROOT / "app" / "i18n.py").read_text(encoding="utf-8")
 
 required_main = [
     'USER_TOKEN_DIR = DATA_DIR / "google-tokens"',
+    '"https://www.googleapis.com/auth/calendar.calendarlist.readonly"',
+    'def personal_calendar_scopes_ready',
+    'def _calendar_entries',
+    'service.calendarList().list(',
+    'all_calendars = chat_id is not None',
     'def google_token_file',
     'def calendar_connected',
     'def auto_join_enabled',
@@ -16,7 +21,9 @@ required_main = [
     'async def maybe_launch_calendar_event',
     'state.setdefault("auto_join_all", {})',
     '"auto_calendar"',
-    'event["id"] = f"auto-{chat_id}-{original_event_id}"',
+    'uuid.uuid5(',
+    'event["google_calendar_id"] = calendar_id',
+    'event["id"] = f"auto-{stable_event_key}"',
     'if source_event.get("status") == "cancelled" or event_declined_by_owner(source_event):',
     'google_token_file(chat_id).write_text(creds.to_json())',
     'globals()["state"].setdefault("auto_join_all", {})[chat_id] = True',

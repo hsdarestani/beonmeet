@@ -110,7 +110,12 @@ TRANSCRIPTION_SEMAPHORE = asyncio.Semaphore(
 )
 
 MEET_RE = re.compile(r"(?:https?://)?(?:www\.)?meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}(?:\?[^\s]*)?", re.I)
-SCOPES = ["https://www.googleapis.com/auth/calendar.events.readonly"]
+LEGACY_SCOPES = ["https://www.googleapis.com/auth/calendar.events.readonly"]
+PERSONAL_SCOPES = [
+    "https://www.googleapis.com/auth/calendar.events.readonly",
+    "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+]
+SCOPES = LEGACY_SCOPES
 
 state_lock = asyncio.Lock()
 queue_mutation_lock = asyncio.Lock()
@@ -365,7 +370,10 @@ async def setup_telegram_profile() -> None:
         print("telegram profile setup error:", repr(exc), flush=True)
 
 
-def google_flow(state_value: str | None = None) -> Flow:
+def google_flow(
+    state_value: str | None = None,
+    scopes: list[str] | None = None,
+) -> Flow:
     cfg = {
         "web": {
             "client_id": GOOGLE_CLIENT_ID,
@@ -375,7 +383,11 @@ def google_flow(state_value: str | None = None) -> Flow:
             "redirect_uris": [GOOGLE_REDIRECT_URI],
         }
     }
-    flow = Flow.from_client_config(cfg, scopes=SCOPES, state=state_value)
+    flow = Flow.from_client_config(
+        cfg,
+        scopes=scopes or LEGACY_SCOPES,
+        state=state_value,
+    )
     flow.redirect_uri = GOOGLE_REDIRECT_URI
     return flow
 
@@ -403,8 +415,25 @@ def _calendar_token_path(chat_id: int | str | None = None) -> Path:
     return path
 
 
+def personal_calendar_scopes_ready(chat_id: int | str) -> bool:
+    path = google_token_file(chat_id)
+    if not path.exists():
+        return False
+    try:
+        payload = json.loads(path.read_text())
+        granted = set(payload.get("scopes") or [])
+    except Exception:
+        return False
+    return set(PERSONAL_SCOPES).issubset(granted)
+
+
 def calendar_connected(chat_id: int | str | None = None) -> bool:
-    return _calendar_token_path(chat_id).exists()
+    token_path = _calendar_token_path(chat_id)
+    if not token_path.exists():
+        return False
+    if chat_id is not None and token_path == google_token_file(chat_id):
+        return personal_calendar_scopes_ready(chat_id)
+    return True
 
 
 def auto_join_enabled(chat_id: int | str) -> bool:
@@ -419,50 +448,85 @@ def load_google_credentials(chat_id: int | str | None = None) -> Credentials | N
     token_path = _calendar_token_path(chat_id)
     if not token_path.exists():
         return None
-    creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+    scopes = PERSONAL_SCOPES if chat_id is not None and token_path == google_token_file(chat_id) else LEGACY_SCOPES
+    creds = Credentials.from_authorized_user_file(str(token_path), scopes)
     if creds.expired and creds.refresh_token:
         creds.refresh(GoogleRequest())
         token_path.write_text(creds.to_json())
     return creds
 
 
-def list_calendar_events(chat_id: int | str | None = None) -> list[dict[str, Any]]:
+def _calendar_entries(service: Any, *, all_calendars: bool) -> list[dict[str, Any]]:
+    if not all_calendars:
+        return [{"id": "primary", "primary": True}]
+
+    entries: list[dict[str, Any]] = []
+    page_token = None
+    while True:
+        result = service.calendarList().list(
+            maxResults=250,
+            pageToken=page_token,
+            showDeleted=False,
+            showHidden=True,
+        ).execute()
+        for item in result.get("items", []):
+            calendar_id = str(item.get("id") or "").strip()
+            if calendar_id and not item.get("deleted"):
+                entries.append(item)
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            break
+    return entries
+
+
+def list_calendar_events(
+    chat_id: int | str | None = None,
+    *,
+    all_calendars: bool | None = None,
+) -> list[dict[str, Any]]:
     creds = load_google_credentials(chat_id)
     if not creds:
         return []
     service = build("calendar", "v3", credentials=creds, cache_discovery=False)
     now = datetime.now(timezone.utc)
-    result = (
-        service.events()
-        .list(
-            calendarId="primary",
-            timeMin=(now - timedelta(minutes=30)).isoformat(),
-            timeMax=(now + timedelta(days=14)).isoformat(),
-            singleEvents=True,
-            orderBy="startTime",
-            maxResults=250,
-        )
-        .execute()
-    )
-    calendar_tz = None
+    if all_calendars is None:
+        all_calendars = chat_id is not None
+
+    default_tz = None
     try:
-        calendar_tz = (
-            service.calendars()
-            .get(calendarId="primary")
-            .execute()
-            .get("timeZone")
-        )
+        default_tz = service.settings().get(setting="timezone").execute().get("value")
     except Exception:
         pass
-    if not calendar_tz:
+
+    events: list[dict[str, Any]] = []
+    for calendar in _calendar_entries(service, all_calendars=bool(all_calendars)):
+        calendar_id = str(calendar.get("id") or "primary")
+        calendar_tz = str(calendar.get("timeZone") or default_tz or "")
+        page_token = None
         try:
-            calendar_tz = service.settings().get(setting="timezone").execute().get("value")
-        except Exception:
-            pass
-    events = result.get("items", [])
-    if calendar_tz:
-        for event in events:
-            event["_calendarTimeZone"] = calendar_tz
+            while True:
+                result = service.events().list(
+                    calendarId=calendar_id,
+                    timeMin=(now - timedelta(minutes=30)).isoformat(),
+                    timeMax=(now + timedelta(days=14)).isoformat(),
+                    singleEvents=True,
+                    orderBy="startTime",
+                    maxResults=250,
+                    pageToken=page_token,
+                ).execute()
+                for source_event in result.get("items", []):
+                    event = dict(source_event)
+                    event["_calendarId"] = calendar_id
+                    event["_calendarSummary"] = str(calendar.get("summaryOverride") or calendar.get("summary") or "")
+                    if calendar_tz:
+                        event["_calendarTimeZone"] = calendar_tz
+                    events.append(event)
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
+        except Exception as exc:
+            print(f"calendar events skipped ({calendar_id}):", repr(exc), flush=True)
+            continue
     return events
 
 
@@ -534,7 +598,7 @@ def find_calendar_event_for_meet(
             personal_path = google_token_file(chat_id)
         except ValueError:
             personal_path = None
-        if personal_path and personal_path.exists():
+        if personal_path and personal_path.exists() and personal_calendar_scopes_ready(chat_id):
             events.extend(list_calendar_events(chat_id))
     # Keep the original shared bot-calendar lookup as a fallback so existing
     # manually registered meetings continue to work unchanged.
@@ -1126,9 +1190,17 @@ async def calendar_loop() -> None:
                     if not (start <= now <= live_until):
                         continue
 
+                    calendar_id = str(source_event.get("_calendarId") or "primary")
+                    stable_event_key = str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"beonmeet:{chat_id}:{calendar_id}:{original_event_id}",
+                        )
+                    )
                     event = dict(source_event)
                     event["google_event_id"] = original_event_id
-                    event["id"] = f"auto-{chat_id}-{original_event_id}"
+                    event["google_calendar_id"] = calendar_id
+                    event["id"] = f"auto-{stable_event_key}"
                     req = {
                         "chat_id": str(chat_id),
                         "requester_id": str(chat_id),
@@ -2474,7 +2546,9 @@ async def auth_google(chat_id: str | None = None) -> RedirectResponse:
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid Telegram chat id")
 
-    flow = google_flow()
+    flow = google_flow(
+        scopes=PERSONAL_SCOPES if normalized_chat_id else LEGACY_SCOPES,
+    )
     authorization_url, oauth_state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
@@ -2498,7 +2572,10 @@ async def auth_google_callback(request: Request, state: str) -> str:
     if not oauth_entry and not legacy_flow:
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
-    flow = google_flow(state)
+    flow = google_flow(
+        state,
+        scopes=PERSONAL_SCOPES if oauth_entry else LEGACY_SCOPES,
+    )
     callback_url = f"https://{DOMAIN}/auth/google/callback?{request.url.query}"
     flow.fetch_token(authorization_response=callback_url)
     creds = flow.credentials
@@ -2515,7 +2592,7 @@ async def auth_google_callback(request: Request, state: str) -> str:
         return (
             "<h2>Google Calendar connected ✅</h2>"
             "<p>Automatic mode is on. BeOnMeet will now detect Google Meet events "
-            "on this calendar automatically. You can close this page.</p>"
+            "across all calendars in this Google account automatically. You can close this page.</p>"
         )
 
     TOKEN_FILE.write_text(creds.to_json())
