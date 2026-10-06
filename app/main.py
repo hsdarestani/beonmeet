@@ -1164,6 +1164,8 @@ async def calendar_loop() -> None:
             for chat_id, enabled in auto_settings.items():
                 if not enabled or not calendar_connected(chat_id):
                     continue
+                if not await asyncio.to_thread(is_premium, str(chat_id)):
+                    continue
                 try:
                     events = await asyncio.to_thread(list_calendar_events, chat_id)
                 except Exception as exc:
@@ -1310,6 +1312,20 @@ async def telegram_loop() -> None:
                     continue
 
                 if text.startswith("/auto"):
+                    parts = text.strip().lower().split(maxsplit=1)
+                    explicit = parts[1] if len(parts) > 1 else ""
+
+                    # Turning the feature off is always allowed, even after Premium expires.
+                    if explicit in {"off", "0", "false", "disable"}:
+                        state.setdefault("auto_join_all", {})[str(chat_id)] = False
+                        await save_state()
+                        await tg_text(chat_id, t(chat_id, "auto_disabled"), with_menu=True)
+                        continue
+
+                    if not await asyncio.to_thread(is_premium, str(chat_id)):
+                        await send_subscription_offer(chat_id, "auto_premium_only")
+                        continue
+
                     if not calendar_connected(chat_id):
                         await tg_text(
                             chat_id,
@@ -1317,12 +1333,9 @@ async def telegram_loop() -> None:
                             with_menu=True,
                         )
                         continue
-                    parts = text.strip().lower().split(maxsplit=1)
-                    explicit = parts[1] if len(parts) > 1 else ""
+
                     if explicit in {"on", "1", "true", "enable"}:
                         enabled = True
-                    elif explicit in {"off", "0", "false", "disable"}:
-                        enabled = False
                     else:
                         enabled = not auto_join_enabled(chat_id)
                     state.setdefault("auto_join_all", {})[str(chat_id)] = enabled
@@ -1335,7 +1348,10 @@ async def telegram_loop() -> None:
                     continue
 
                 if text.startswith("/start"):
-                    if calendar_connected(chat_id):
+                    premium_active = await asyncio.to_thread(is_premium, str(chat_id))
+                    if not premium_active:
+                        auth_status = t(chat_id, "auto_premium_status")
+                    elif calendar_connected(chat_id):
                         auth_status = t(chat_id, "calendar_connected")
                         auth_status += "\n" + t(
                             chat_id,
@@ -2556,7 +2572,7 @@ async def home() -> str:
 <div class="cta"><a class="button" href="#how">See how it works</a><a class="button secondary" href="/privacy">How Google data is used</a></div>
 </div></section>
 <section id="how"><div class="wrap grid">
-<div class="card"><b>1. Connect once</b><p>Authorize read only access to your Google Calendar from the BeOnMeet Telegram bot.</p></div>
+<div class="card"><b>1. Connect once with Premium</b><p>Premium users authorize read only access to Google Calendar from the BeOnMeet Telegram bot.</p></div>
 <div class="card"><b>2. Meetings are detected</b><p>Google Meet events are found automatically whether you organize them or are invited to them. Cancelled and declined events are ignored.</p></div>
 <div class="card"><b>3. Receive the result</b><p>The recorder joins at the scheduled time and sends the recording back to the Telegram user who connected the calendar.</p></div>
 </div></section>
@@ -2651,6 +2667,9 @@ async def auth_google(chat_id: str | None = None) -> RedirectResponse:
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid Telegram chat id")
 
+    if normalized_chat_id and not await asyncio.to_thread(is_premium, normalized_chat_id):
+        raise HTTPException(status_code=403, detail="Premium required for All meetings")
+
     flow = google_flow(
         scopes=PERSONAL_SCOPES if normalized_chat_id else LEGACY_SCOPES,
     )
@@ -2677,6 +2696,10 @@ async def auth_google_callback(request: Request, state: str) -> str:
     if not oauth_entry and not legacy_flow:
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
+    oauth_chat_id = str((oauth_entry or {}).get("chat_id") or "")
+    if oauth_chat_id and not await asyncio.to_thread(is_premium, oauth_chat_id):
+        raise HTTPException(status_code=403, detail="Premium required for All meetings")
+
     flow = google_flow(
         state,
         scopes=PERSONAL_SCOPES if oauth_entry else LEGACY_SCOPES,
@@ -2685,7 +2708,7 @@ async def auth_google_callback(request: Request, state: str) -> str:
     flow.fetch_token(authorization_response=callback_url)
     creds = flow.credentials
 
-    chat_id = str((oauth_entry or {}).get("chat_id") or "")
+    chat_id = oauth_chat_id
     if chat_id:
         google_token_file(chat_id).write_text(creds.to_json())
         globals()["state"].setdefault("auto_join_all", {})[chat_id] = True
