@@ -112,6 +112,7 @@ services:
       MAX_CONCURRENT_MEETINGS: "4"
       MEETING_INACTIVITY_MINUTES: "1"
       INACTIVITY_DETECTION_START_DELAY_MINUTES: "3"
+      LONE_PARTICIPANT_EXIT_DELAY_SECONDS: "120"
       JOIN_WAIT_TIME_MINUTES: "5"
     volumes:
       - /dev/shm/beonmeet:/recordings
@@ -143,6 +144,7 @@ services:
       MAX_CONCURRENT_MEETINGS: "4"
       MEETING_INACTIVITY_MINUTES: "1"
       INACTIVITY_DETECTION_START_DELAY_MINUTES: "3"
+      LONE_PARTICIPANT_EXIT_DELAY_SECONDS: "120"
       JOIN_WAIT_TIME_MINUTES: "5"
     volumes:
       - /dev/shm/beonmeet:/recordings
@@ -174,6 +176,7 @@ services:
       MAX_CONCURRENT_MEETINGS: "4"
       MEETING_INACTIVITY_MINUTES: "1"
       INACTIVITY_DETECTION_START_DELAY_MINUTES: "3"
+      LONE_PARTICIPANT_EXIT_DELAY_SECONDS: "120"
       JOIN_WAIT_TIME_MINUTES: "5"
     volumes:
       - /dev/shm/beonmeet:/recordings
