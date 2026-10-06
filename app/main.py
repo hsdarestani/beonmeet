@@ -406,13 +406,9 @@ def google_token_file(chat_id: int | str) -> Path:
 def _calendar_token_path(chat_id: int | str | None = None) -> Path:
     if chat_id is None:
         return TOKEN_FILE
-    path = google_token_file(chat_id)
-    if path.exists():
-        return path
-    # Backward compatibility for the original single-account installation.
-    if ADMINUSER and str(chat_id) == ADMINUSER and TOKEN_FILE.exists():
-        return TOKEN_FILE
-    return path
+    # Personal calendar features must always use the OAuth token created for
+    # this exact Telegram user. Never fall back to the legacy shared bot token.
+    return google_token_file(chat_id)
 
 
 def personal_calendar_scopes_ready(chat_id: int | str) -> bool:

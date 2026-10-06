@@ -9,6 +9,8 @@ required_main = [
     'USER_TOKEN_DIR = DATA_DIR / "google-tokens"',
     '"https://www.googleapis.com/auth/calendar.calendarlist.readonly"',
     'def personal_calendar_scopes_ready',
+    'Never fall back to the legacy shared bot token',
+    'return google_token_file(chat_id)',
     'def _calendar_entries',
     'service.calendarList().list(',
     'all_calendars = chat_id is not None',
@@ -38,3 +40,5 @@ assert I18N.count('"auto":') >= 6
 assert 'BUTTON_ACTIONS[_labels["auto"]] = "/auto"' in I18N
 
 print("AUTO_CALENDAR_TEST_PASS")
+
+assert 'if ADMINUSER and str(chat_id) == ADMINUSER and TOKEN_FILE.exists()' not in MAIN
