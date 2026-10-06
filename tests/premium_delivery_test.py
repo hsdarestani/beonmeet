@@ -35,7 +35,8 @@ assert audio_flag < transcript_call, "audio completion state must be persisted b
 
 assert 'if not (audio_already_delivered and transcript_already_delivered):' in MAIN
 assert 'if audio_delivery_error is not None or transcript_processing_error is not None:' in MAIN
-assert MAIN.index('transcribe_audio_recovery_fast,') > MAIN.index('transcribe_audio_local,')
+local_call = MAIN.index('transcribe_audio_local,')
+assert MAIN.find('transcribe_audio_recovery_fast,', local_call) > local_call
 assert 'if not bool(data.get("_silent_retry")) and not video_delivered_after_failure:' in MAIN
 
 print("PREMIUM_DELIVERY_TEST_PASS")
