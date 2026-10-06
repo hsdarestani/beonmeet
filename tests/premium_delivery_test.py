@@ -20,6 +20,10 @@ required = [
     '"source_name": raw_path.name',
     'missing exact event/chat/file identity',
     'event mismatch',
+    'primary transcription failed; trying recovery model:',
+    'transcribe_audio_recovery_fast,',
+    'video_delivered_after_failure',
+    'recording delivered; downstream Premium output remains pending:',
 ]
 
 for needle in required:
@@ -31,6 +35,8 @@ assert audio_flag < transcript_call, "audio completion state must be persisted b
 
 assert 'if not (audio_already_delivered and transcript_already_delivered):' in MAIN
 assert 'if audio_delivery_error is not None or transcript_processing_error is not None:' in MAIN
+assert MAIN.index('transcribe_audio_recovery_fast,') > MAIN.index('transcribe_audio_local,')
+assert 'if not bool(data.get("_silent_retry")) and not video_delivered_after_failure:' in MAIN
 
 print("PREMIUM_DELIVERY_TEST_PASS")
 
