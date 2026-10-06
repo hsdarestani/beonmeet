@@ -1005,6 +1005,44 @@ async def state_cleanup_loop() -> None:
         await asyncio.sleep(600)
 
 
+def same_meeting_inflight(
+    chat_id: int | str,
+    meet_url: str,
+    event_id: str,
+    now: datetime,
+) -> bool:
+    target_chat = str(chat_id)
+    for item in state.get("join_queue", []):
+        if str(item.get("event_id") or "") == event_id:
+            continue
+        req = item.get("req") or {}
+        if (
+            str(req.get("chat_id") or "") == target_chat
+            and str(item.get("meet_url") or "") == meet_url
+        ):
+            return True
+
+    for other_event_id, launched in state.get("launched_events", {}).items():
+        if str(other_event_id) == event_id:
+            continue
+        if (
+            str(launched.get("chat_id") or "") != target_chat
+            or str(launched.get("meet_url") or "") != meet_url
+        ):
+            continue
+        status = str(launched.get("status") or "joining")
+        if status in {"recording", "waiting_for_admission", "delivering", "remote_claimed"}:
+            return True
+        launched_at_raw = str(launched.get("launched_at") or "")
+        try:
+            launched_at = isoparse(launched_at_raw) if launched_at_raw else None
+        except Exception:
+            launched_at = None
+        if launched_at and now - launched_at < timedelta(minutes=7):
+            return True
+    return False
+
+
 async def maybe_launch_calendar_event(
     event: dict[str, Any],
     req: dict[str, Any],
@@ -1013,6 +1051,8 @@ async def maybe_launch_calendar_event(
 ) -> bool:
     event_id = str(event.get("id") or "")
     if not event_id or _is_queued(event_id):
+        return False
+    if same_meeting_inflight(req.get("chat_id") or "", meet_url, event_id, now):
         return False
 
     launched = state["launched_events"].get(event_id)
@@ -1088,7 +1128,7 @@ async def calendar_loop() -> None:
 
                     event = dict(source_event)
                     event["google_event_id"] = original_event_id
-                    event["id"] = f"auto:{chat_id}:{original_event_id}"
+                    event["id"] = f"auto-{chat_id}-{original_event_id}"
                     req = {
                         "chat_id": str(chat_id),
                         "requester_id": str(chat_id),
