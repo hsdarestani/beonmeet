@@ -119,18 +119,43 @@ def _google_account_info(telegram_id: str) -> dict:
 
         email = str(payload.get("account") or "").strip()
         if not email or "@" not in email:
-            response = httpx.get(
-                "https://www.googleapis.com/calendar/v3/calendars/primary",
-                headers={"Authorization": f"Bearer {creds.token}"},
-                timeout=6.0,
-            )
-            response.raise_for_status()
-            calendar = response.json()
-            primary_id = str(calendar.get("id") or "").strip()
-            if "@" in primary_id:
-                email = primary_id
-            elif "@" in str(calendar.get("summary") or ""):
-                email = str(calendar.get("summary") or "").strip()
+            # The personal OAuth flow grants calendar.calendarlist.readonly.
+            # Resolve the account from the primary CalendarList entry instead of
+            # calendars/primary, which may require a different Calendar scope.
+            page_token = None
+            while True:
+                params = {
+                    "maxResults": 250,
+                    "showDeleted": "false",
+                    "showHidden": "true",
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                response = httpx.get(
+                    "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+                    headers={"Authorization": f"Bearer {creds.token}"},
+                    params=params,
+                    timeout=6.0,
+                )
+                response.raise_for_status()
+                calendar_list = response.json()
+                for calendar in calendar_list.get("items", []) or []:
+                    if not calendar.get("primary"):
+                        continue
+                    primary_id = str(calendar.get("id") or "").strip()
+                    summary = str(
+                        calendar.get("summaryOverride")
+                        or calendar.get("summary")
+                        or ""
+                    ).strip()
+                    if "@" in primary_id:
+                        email = primary_id
+                    elif "@" in summary:
+                        email = summary
+                    break
+                if email or not calendar_list.get("nextPageToken"):
+                    break
+                page_token = calendar_list.get("nextPageToken")
 
         info["email"] = email
         info["connected"] = bool(info["scope_ready"] and creds.valid)
@@ -138,6 +163,9 @@ def _google_account_info(telegram_id: str) -> dict:
             info["error"] = "مجوز کامل Calendar نیاز به اتصال مجدد دارد"
         elif not email:
             info["error"] = "اتصال برقرار است ولی ایمیل از Google برنگشت"
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        info["error"] = f"خطا در بررسی Google: HTTP {status}"
     except Exception as exc:
         info["error"] = f"خطا در بررسی Google: {type(exc).__name__}"
 
