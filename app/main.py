@@ -50,6 +50,8 @@ from admin_panel import (
     record_recording,
     record_request,
     router as admin_router,
+    set_auto_join_enabled,
+    set_calendar_connection,
     subscription_info,
     touch_user,
     was_premium_at,
@@ -473,6 +475,21 @@ def _calendar_entries(service: Any, *, all_calendars: bool) -> list[dict[str, An
         if not page_token:
             break
     return entries
+
+
+def connected_google_calendar_email(
+    chat_id: int | str,
+    credentials: Credentials | None = None,
+) -> str:
+    """Resolve the connected Google account from its primary Calendar id."""
+    creds = credentials or load_google_credentials(chat_id)
+    if not creds:
+        return ""
+    service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    for calendar in _calendar_entries(service, all_calendars=True):
+        if calendar.get("primary"):
+            return str(calendar.get("id") or "").strip()
+    return ""
 
 
 def list_calendar_events(
@@ -1319,6 +1336,7 @@ async def telegram_loop() -> None:
                     if explicit in {"off", "0", "false", "disable"}:
                         state.setdefault("auto_join_all", {})[str(chat_id)] = False
                         await save_state()
+                        await asyncio.to_thread(set_auto_join_enabled, str(chat_id), False)
                         await tg_text(chat_id, t(chat_id, "auto_disabled"), with_menu=True)
                         continue
 
@@ -1340,6 +1358,7 @@ async def telegram_loop() -> None:
                         enabled = not auto_join_enabled(chat_id)
                     state.setdefault("auto_join_all", {})[str(chat_id)] = enabled
                     await save_state()
+                    await asyncio.to_thread(set_auto_join_enabled, str(chat_id), enabled)
                     await tg_text(
                         chat_id,
                         t(chat_id, "auto_enabled" if enabled else "auto_disabled"),
@@ -1895,11 +1914,50 @@ def requester_summary(req: dict[str, Any], fallback_chat_id: str) -> str:
         bits.append("کاربر تلگرام")
     return f"{' '.join(bits)}\n🆔 {requester_id}"
 
+async def sync_calendar_admin_metadata() -> None:
+    """Backfill admin-visible Calendar email/status for existing personal OAuth users."""
+    await asyncio.sleep(1)
+    chat_ids = set(str(key) for key in state.setdefault("auto_join_all", {}).keys())
+    for token_path in USER_TOKEN_DIR.glob("*.json"):
+        chat_ids.add(token_path.stem)
+
+    for chat_id in sorted(chat_ids):
+        try:
+            connected = calendar_connected(chat_id)
+            email = ""
+            if connected:
+                try:
+                    email = await asyncio.to_thread(
+                        connected_google_calendar_email,
+                        chat_id,
+                    )
+                except Exception as exc:
+                    print(
+                        f"calendar admin email backfill failed ({chat_id}):",
+                        repr(exc),
+                        flush=True,
+                    )
+            await asyncio.to_thread(
+                set_calendar_connection,
+                chat_id,
+                email or None,
+                connected=connected,
+                all_meetings_enabled=auto_join_enabled(chat_id),
+            )
+        except Exception as exc:
+            print(
+                f"calendar admin metadata sync failed ({chat_id}):",
+                repr(exc),
+                flush=True,
+            )
+
+
 @app.on_event("startup")
 async def startup() -> None:
     init_db()
     load_state()
     RECORDING_ROOT.mkdir(parents=True, exist_ok=True)
+    asyncio.create_task(sync_calendar_admin_metadata())
     asyncio.create_task(setup_telegram_profile())
     asyncio.create_task(telegram_loop())
     asyncio.create_task(calendar_loop())
@@ -2713,6 +2771,22 @@ async def auth_google_callback(request: Request, state: str) -> str:
         google_token_file(chat_id).write_text(creds.to_json())
         globals()["state"].setdefault("auto_join_all", {})[chat_id] = True
         await save_state()
+        google_email = ""
+        try:
+            google_email = await asyncio.to_thread(
+                connected_google_calendar_email,
+                chat_id,
+                creds,
+            )
+        except Exception as exc:
+            print("connected Google account lookup error:", repr(exc), flush=True)
+        await asyncio.to_thread(
+            set_calendar_connection,
+            chat_id,
+            google_email or None,
+            connected=True,
+            all_meetings_enabled=True,
+        )
         try:
             await tg_text(chat_id, t(chat_id, "auto_enabled"), with_menu=True)
         except Exception as exc:
