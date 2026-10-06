@@ -503,26 +503,30 @@ def list_calendar_events(
         calendar_id = str(calendar.get("id") or "primary")
         calendar_tz = str(calendar.get("timeZone") or default_tz or "")
         page_token = None
-        while True:
-            result = service.events().list(
-                calendarId=calendar_id,
-                timeMin=(now - timedelta(minutes=30)).isoformat(),
-                timeMax=(now + timedelta(days=14)).isoformat(),
-                singleEvents=True,
-                orderBy="startTime",
-                maxResults=250,
-                pageToken=page_token,
-            ).execute()
-            for source_event in result.get("items", []):
-                event = dict(source_event)
-                event["_calendarId"] = calendar_id
-                event["_calendarSummary"] = str(calendar.get("summaryOverride") or calendar.get("summary") or "")
-                if calendar_tz:
-                    event["_calendarTimeZone"] = calendar_tz
-                events.append(event)
-            page_token = result.get("nextPageToken")
-            if not page_token:
-                break
+        try:
+            while True:
+                result = service.events().list(
+                    calendarId=calendar_id,
+                    timeMin=(now - timedelta(minutes=30)).isoformat(),
+                    timeMax=(now + timedelta(days=14)).isoformat(),
+                    singleEvents=True,
+                    orderBy="startTime",
+                    maxResults=250,
+                    pageToken=page_token,
+                ).execute()
+                for source_event in result.get("items", []):
+                    event = dict(source_event)
+                    event["_calendarId"] = calendar_id
+                    event["_calendarSummary"] = str(calendar.get("summaryOverride") or calendar.get("summary") or "")
+                    if calendar_tz:
+                        event["_calendarTimeZone"] = calendar_tz
+                    events.append(event)
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
+        except Exception as exc:
+            print(f"calendar events skipped ({calendar_id}):", repr(exc), flush=True)
+            continue
     return events
 
 
