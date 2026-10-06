@@ -1,4 +1,6 @@
+import asyncio
 import hashlib
+import json
 import hmac
 import html
 import os
@@ -10,14 +12,26 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 import httpx
+from google.auth.transport.requests import Request as GoogleRequest
+from google.oauth2.credentials import Credentials
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from db_compat import connect_db, is_postgres
+from state_store import DurableStateStore
 
 router = APIRouter()
 DB_PATH = Path(os.environ.get("BEONMEET_DB_PATH", "/data/beonmeet.db"))
+DATA_DIR = Path(os.environ.get("BEONMEET_DATA_DIR", "/data"))
+STATE_FILE = DATA_DIR / "state.json"
+USER_TOKEN_DIR = DATA_DIR / "google-tokens"
+ADMIN_STATE_STORE = DurableStateStore(STATE_FILE)
+PERSONAL_CALENDAR_SCOPES = {
+    "https://www.googleapis.com/auth/calendar.events.readonly",
+    "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+}
+_GOOGLE_ACCOUNT_CACHE: dict[str, tuple[float, dict]] = {}
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
 ADMINUSER = os.environ.get("ADMINUSER", "").strip()
 DOMAIN = os.environ.get("DOMAIN", "beonmeet.smarbiz.sbs")
@@ -40,6 +54,95 @@ PREMIUM_FEATURES = [
 
 def _db():
     return connect_db(DB_PATH)
+
+
+def _controller_state() -> dict:
+    loaded, _source = ADMIN_STATE_STORE.load()
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _personal_token_ids() -> set[str]:
+    if not USER_TOKEN_DIR.exists():
+        return set()
+    return {
+        path.stem
+        for path in USER_TOKEN_DIR.glob("*.json")
+        if path.stem.lstrip("-").isdigit()
+    }
+
+
+def _google_account_info(telegram_id: str) -> dict:
+    """Return safe admin metadata for one personal Google Calendar connection.
+
+    The token itself is never returned. Existing users are resolved through the
+    primary Calendar resource, whose id is normally the connected Google account
+    email. Results are cached briefly so opening the admin page does not hammer
+    Google APIs.
+    """
+    chat_id = str(telegram_id or "").strip()
+    now = time.time()
+    cached = _GOOGLE_ACCOUNT_CACHE.get(chat_id)
+    if cached and now - cached[0] < 300:
+        return dict(cached[1])
+
+    info = {
+        "connected": False,
+        "scope_ready": False,
+        "email": "",
+        "token_updated_at": None,
+        "error": "",
+    }
+    if not chat_id.lstrip("-").isdigit():
+        info["error"] = "Telegram ID نامعتبر"
+        return info
+
+    token_path = USER_TOKEN_DIR / f"{chat_id}.json"
+    if not token_path.exists():
+        info["error"] = "Google Calendar متصل نیست"
+        _GOOGLE_ACCOUNT_CACHE[chat_id] = (now, dict(info))
+        return info
+
+    try:
+        payload = json.loads(token_path.read_text(encoding="utf-8"))
+        granted = set(payload.get("scopes") or [])
+        info["scope_ready"] = PERSONAL_CALENDAR_SCOPES.issubset(granted)
+        info["token_updated_at"] = datetime.fromtimestamp(
+            token_path.stat().st_mtime,
+            tz=timezone.utc,
+        ).isoformat()
+
+        creds = Credentials.from_authorized_user_file(str(token_path))
+        if creds.expired and creds.refresh_token:
+            creds.refresh(GoogleRequest())
+            token_path.write_text(creds.to_json(), encoding="utf-8")
+            info["token_updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        email = str(payload.get("account") or "").strip()
+        if not email or "@" not in email:
+            response = httpx.get(
+                "https://www.googleapis.com/calendar/v3/calendars/primary",
+                headers={"Authorization": f"Bearer {creds.token}"},
+                timeout=6.0,
+            )
+            response.raise_for_status()
+            calendar = response.json()
+            primary_id = str(calendar.get("id") or "").strip()
+            if "@" in primary_id:
+                email = primary_id
+            elif "@" in str(calendar.get("summary") or ""):
+                email = str(calendar.get("summary") or "").strip()
+
+        info["email"] = email
+        info["connected"] = bool(info["scope_ready"] and creds.valid)
+        if not info["scope_ready"]:
+            info["error"] = "مجوز کامل Calendar نیاز به اتصال مجدد دارد"
+        elif not email:
+            info["error"] = "اتصال برقرار است ولی ایمیل از Google برنگشت"
+    except Exception as exc:
+        info["error"] = f"خطا در بررسی Google: {type(exc).__name__}"
+
+    _GOOGLE_ACCOUNT_CACHE[chat_id] = (now, dict(info))
+    return info
 
 
 def _migrate_sqlite_to_postgres_once() -> None:
@@ -580,6 +683,7 @@ def _layout(title: str, body: str, active: str = "dashboard") -> str:
         ("dashboard", "/admin", "داشبورد", "⌂"),
         ("users", "/admin/users", "کاربران", "◉"),
         ("recordings", "/admin/recordings", "ضبط ها", "◍"),
+        ("auto", "/admin/auto-meetings", "همه جلسات", "◎"),
         ("subscriptions", "/admin/subscriptions", "اشتراک ها", "◆"),
         ("plans", "/admin/plans", "پلن ویژه", "✦"),
         ("system", "/admin/system", "سیستم", "◫"),
@@ -736,6 +840,9 @@ async def user_page(request: Request, telegram_id: str):
         recs=db.execute("SELECT * FROM recordings WHERE telegram_id=? ORDER BY id DESC LIMIT 10", (telegram_id,)).fetchall()
     if not u: raise HTTPException(404, "کاربر پیدا نشد")
     active=is_premium(telegram_id)
+    controller_state = _controller_state()
+    auto_enabled = bool(controller_state.get("auto_join_all", {}).get(str(telegram_id)))
+    google_info = await asyncio.to_thread(_google_account_info, str(telegram_id))
     name=(f'{u["first_name"]} {u["last_name"]}').strip() or "بدون نام"
     sub_rows="".join(f'<tr><td>{_esc(PLANS.get(s["plan_code"], {"label": s["plan_code"]})["label"])}</td><td>{_money(s["price_toman"])}</td><td>{_fa_date(s["starts_at"])}</td><td>{_fa_date(s["ends_at"])}</td><td>{_esc(s["status"])}</td></tr>' for s in subs) or '<tr><td colspan="5" class="empty">اشتراکی ندارد</td></tr>'
     rec_rows="".join(f'<tr><td>{_fa_date(r["created_at"])}</td><td>{_esc(r["meet_url"])}</td><td>{round(r["size_bytes"]/1024/1024,1)} MB</td><td>{round(r["duration_seconds"]/60,1)} دقیقه</td></tr>' for r in recs) or '<tr><td colspan="4" class="empty">ضبطی ندارد</td></tr>'
@@ -746,6 +853,14 @@ async def user_page(request: Request, telegram_id: str):
       <div class="card metric"><div class="label">ضبط ها</div><div class="num">{u["total_recordings"]}</div></div>
       <div class="card metric"><div class="label">اولین ورود</div><div class="num" style="font-size:15px">{_fa_date(u["first_seen"])}</div></div>
       <div class="card metric"><div class="label">آخرین فعالیت</div><div class="num" style="font-size:15px">{_fa_date(u["last_seen"])}</div></div>
+    </div>
+    <div class="card section">
+      <div class="section-head"><h2>Google Calendar و همه جلسات</h2><a class="pill" href="/admin/auto-meetings" style="text-decoration:none">نمایش همه اتصال ها</a></div>
+      <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px">
+        <div><div class="muted">همه جلسات</div><div style="margin-top:7px">{'<span class="badge premium">روشن</span>' if auto_enabled else '<span class="badge free">خاموش</span>'}</div></div>
+        <div><div class="muted">ایمیل Google متصل</div><b style="display:block;margin-top:7px;direction:ltr;text-align:right">{_esc(google_info.get("email") or "مشخص نشده")}</b></div>
+        <div><div class="muted">وضعیت اتصال</div><div style="margin-top:7px">{'<span class="badge premium">Calendar متصل</span>' if google_info.get("connected") else '<span class="badge free">نیاز به بررسی</span>'}<div class="muted" style="margin-top:6px">{_esc(google_info.get("error") or "مجوزهای لازم فعال است")}</div></div></div>
+      </div>
     </div>
     <div class="card section"><div class="section-head"><h2>مدیریت اشتراک</h2></div>
       <form class="inline" method="post" action="/admin/users/{_esc(telegram_id)}/activate">
@@ -776,6 +891,124 @@ async def deactivate_user(request: Request, telegram_id: str):
     _require_admin(request)
     deactivate_subscription(telegram_id)
     return RedirectResponse(f"/admin/users/{telegram_id}", status_code=303)
+
+
+@router.get("/admin/auto-meetings", response_class=HTMLResponse)
+async def auto_meetings_page(request: Request, q: str = "", mode: str = "enabled"):
+    _require_admin(request)
+    controller_state = _controller_state()
+    enabled_map = controller_state.get("auto_join_all", {}) or {}
+    enabled_ids = {
+        str(chat_id)
+        for chat_id, enabled in enabled_map.items()
+        if bool(enabled)
+    }
+    connected_ids = _personal_token_ids()
+    candidate_ids = enabled_ids | connected_ids
+
+    with _db() as db:
+        users = db.execute("SELECT * FROM users ORDER BY last_seen DESC").fetchall()
+    user_map = {str(row["telegram_id"]): row for row in users}
+
+    account_pairs = await asyncio.gather(*[
+        asyncio.to_thread(_google_account_info, chat_id)
+        for chat_id in sorted(candidate_ids)
+    ])
+    account_map = {
+        chat_id: info
+        for chat_id, info in zip(sorted(candidate_ids), account_pairs)
+    }
+
+    needle = q.strip().casefold()
+    rows = []
+    for chat_id in candidate_ids:
+        user = user_map.get(chat_id)
+        info = account_map.get(chat_id) or {}
+        auto_enabled = chat_id in enabled_ids
+        connected = bool(info.get("connected"))
+        if mode == "enabled" and not auto_enabled:
+            continue
+        if mode == "connected" and not connected:
+            continue
+        if mode == "attention" and not (auto_enabled and not connected):
+            continue
+
+        name = ""
+        username = ""
+        last_seen = None
+        if user:
+            name = (f'{user["first_name"]} {user["last_name"]}').strip()
+            username = str(user["username"] or "")
+            last_seen = user["last_seen"]
+        label = name or (f"@{username}" if username else chat_id)
+        email = str(info.get("email") or "")
+
+        haystack = " ".join([chat_id, name, username, email]).casefold()
+        if needle and needle not in haystack:
+            continue
+
+        rows.append({
+            "telegram_id": chat_id,
+            "name": label,
+            "username": username,
+            "auto_enabled": auto_enabled,
+            "connected": connected,
+            "email": email,
+            "error": str(info.get("error") or ""),
+            "token_updated_at": info.get("token_updated_at"),
+            "last_seen": last_seen,
+        })
+
+    rows.sort(key=lambda item: (
+        not item["auto_enabled"],
+        not item["connected"],
+        str(item["name"]).casefold(),
+    ))
+
+    trs = "".join(
+        f"""<tr>
+          <td><div class="user"><div class="avatar">{_esc((row["name"][:1] or "U").upper())}</div><div><b>{_esc(row["name"])}</b><div class="muted">{_esc("@"+row["username"] if row["username"] else row["telegram_id"])}</div></div></div></td>
+          <td>{'<span class="badge premium">روشن</span>' if row["auto_enabled"] else '<span class="badge free">خاموش</span>'}</td>
+          <td style="direction:ltr;text-align:right"><b>{_esc(row["email"] or "—")}</b></td>
+          <td>{'<span class="badge premium">متصل</span>' if row["connected"] else '<span class="badge free">نیاز به بررسی</span>'}<div class="muted" style="margin-top:5px">{_esc(row["error"])}</div></td>
+          <td class="muted">{_fa_date(row["token_updated_at"])}</td>
+          <td class="muted">{_fa_date(row["last_seen"])}</td>
+          <td><a class="btn" href="/admin/users/{_esc(row["telegram_id"])}">باز کردن</a></td>
+        </tr>"""
+        for row in rows
+    ) or '<tr><td colspan="7" class="empty">کاربری با این وضعیت پیدا نشد</td></tr>'
+
+    enabled_count = len(enabled_ids)
+    connected_count = len(connected_ids)
+    attention_count = sum(
+        1 for chat_id in enabled_ids
+        if not bool((account_map.get(chat_id) or {}).get("connected"))
+    )
+
+    mode_options = "".join(
+        f'<option value="{value}" {"selected" if mode == value else ""}>{label}</option>'
+        for value, label in (
+            ("enabled", "فقط همه جلسات روشن"),
+            ("connected", "Calendar متصل"),
+            ("attention", "روشن ولی اتصال مشکل دارد"),
+            ("all", "همه اتصال ها"),
+        )
+    )
+    body = f"""
+    <div class="top"><div><h1>همه جلسات و Google Calendar</h1><div class="sub">مشخص است چه کسی Auto Join را روشن کرده و کدام حساب Google به آن متصل است.</div></div>
+      <form class="inline"><input class="search" name="q" value="{_esc(q)}" placeholder="نام، یوزرنیم، Telegram ID یا ایمیل"><select name="mode">{mode_options}</select><button class="btn primary">فیلتر</button></form>
+    </div>
+    <div class="grid">
+      <div class="card metric"><div class="label">همه جلسات روشن</div><div class="num cyan">{enabled_count}</div><div class="hint">Auto Join فعال</div></div>
+      <div class="card metric"><div class="label">Google Calendar متصل</div><div class="num good">{connected_count}</div><div class="hint">توکن شخصی موجود</div></div>
+      <div class="card metric"><div class="label">نیاز به بررسی</div><div class="num {'warn' if attention_count else 'good'}">{attention_count}</div><div class="hint">Auto Join روشن ولی اتصال سالم نیست</div></div>
+      <div class="card metric"><div class="label">نمایش فعلی</div><div class="num">{len(rows)}</div><div class="hint">ردیف بعد از فیلتر</div></div>
+    </div>
+    <div class="card section">
+      <div class="section-head"><h2>اتصال کاربران</h2><span class="pill">ایمیل کامل فقط برای مدیر نمایش داده می شود</span></div>
+      <table><thead><tr><th>کاربر</th><th>همه جلسات</th><th>Google Account</th><th>Calendar</th><th>آخرین بروزرسانی اتصال</th><th>آخرین فعالیت</th><th>جزئیات</th></tr></thead><tbody>{trs}</tbody></table>
+    </div>"""
+    return _layout("همه جلسات", body, "auto")
 
 
 @router.get("/admin/recordings", response_class=HTMLResponse)
