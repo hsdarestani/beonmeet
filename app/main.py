@@ -2526,11 +2526,120 @@ async def health() -> dict[str, Any]:
     }
 
 
+PUBLIC_SITE_CSS = """
+:root{color-scheme:dark;--bg:#07110f;--panel:#0d1c18;--text:#f4fbf8;--muted:#a9bbb5;--line:#1e3730;--accent:#65e6b5;--accent2:#8ca8ff}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% 0,#12352b 0,transparent 34rem),var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.6}
+a{color:inherit}.wrap{width:min(1120px,calc(100% - 40px));margin:auto}.nav{display:flex;align-items:center;justify-content:space-between;padding:26px 0}.brand{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:-.02em;text-decoration:none}.mark{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(145deg,var(--accent),var(--accent2));color:#06110e;font-weight:900}.links{display:flex;gap:22px;color:var(--muted);font-size:14px}.links a{text-decoration:none}.hero{padding:88px 0 58px}.eyebrow{display:inline-flex;padding:7px 12px;border:1px solid var(--line);border-radius:999px;color:var(--accent);background:#0a1714;font-size:13px}.hero h1{max-width:820px;font-size:clamp(44px,7vw,82px);line-height:1.02;letter-spacing:-.055em;margin:24px 0}.hero p{max-width:720px;font-size:20px;color:var(--muted);margin:0}.cta{margin-top:34px;display:flex;flex-wrap:wrap;gap:12px}.button{display:inline-flex;padding:13px 18px;border-radius:12px;text-decoration:none;font-weight:750;background:var(--accent);color:#05110d}.button.secondary{background:transparent;color:var(--text);border:1px solid var(--line)}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:28px 0 80px}.card{padding:24px;border:1px solid var(--line);border-radius:20px;background:linear-gradient(180deg,#0d1d19,#091512)}.card b{display:block;margin-bottom:8px;font-size:17px}.card p{margin:0;color:var(--muted)}.section{padding:70px 0;border-top:1px solid var(--line)}.section h2{font-size:34px;letter-spacing:-.035em;margin:0 0 14px}.section>div>p{max-width:760px;color:var(--muted)}.data{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:28px}.notice{padding:22px;border-radius:18px;background:#0a1714;border:1px solid var(--line);color:var(--muted)}.notice strong{color:var(--text)}.legal{max-width:820px;padding:60px 0 100px}.legal h1{font-size:48px;letter-spacing:-.04em;line-height:1.1}.legal h2{margin-top:38px;font-size:24px}.legal p,.legal li{color:var(--muted)}.legal a{color:var(--accent)}footer{border-top:1px solid var(--line);padding:30px 0 42px;color:var(--muted);font-size:14px}.foot{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}.foot a{margin-left:18px;text-decoration:none}
+@media(max-width:760px){.links{display:none}.hero{padding-top:56px}.grid,.data{grid-template-columns:1fr}.hero p{font-size:18px}.legal h1{font-size:38px}}
+"""
+
+def public_shell(title: str, body: str) -> str:
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title><meta name="description" content="BeOnMeet automatically joins scheduled Google Meet meetings, records them, and delivers the result to Telegram.">
+<style>{PUBLIC_SITE_CSS}</style></head>
+<body><div class="wrap"><nav class="nav"><a class="brand" href="/"><span class="mark">B</span>BeOnMeet</a>
+<div class="links"><a href="/#how">How it works</a><a href="/#data">Google data</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div></nav></div>
+{body}
+<footer><div class="wrap foot"><span>© 2026 BeOnMeet</span><span><a href="/privacy">Privacy Policy</a><a href="/terms">Terms of Service</a></span></div></footer>
+</body></html>"""
+
+
 @app.get("/", response_class=HTMLResponse)
 async def home() -> str:
-    status = "connected" if TOKEN_FILE.exists() else "not connected"
-    fa_status = "وصله ✅" if TOKEN_FILE.exists() else "هنوز وصل نیست ⚠️"
-    return f"<h1>BeOnMeet</h1><p>Google Calendar: {fa_status}</p><p><a href='/auth/google'>وصل کردن کلندر</a></p>"
+    body = """
+<main>
+<section class="hero"><div class="wrap">
+<span class="eyebrow">Automatic Google Meet recorder for Telegram</span>
+<h1>Your calendar knows the meeting. BeOnMeet handles the rest.</h1>
+<p>Connect Google Calendar once. BeOnMeet detects scheduled Google Meet events across your accessible calendars, joins at meeting time, records the session and delivers the result to your Telegram chat.</p>
+<div class="cta"><a class="button" href="#how">See how it works</a><a class="button secondary" href="/privacy">How Google data is used</a></div>
+</div></section>
+<section id="how"><div class="wrap grid">
+<div class="card"><b>1. Connect once</b><p>Authorize read only access to your Google Calendar from the BeOnMeet Telegram bot.</p></div>
+<div class="card"><b>2. Meetings are detected</b><p>Google Meet events are found automatically whether you organize them or are invited to them. Cancelled and declined events are ignored.</p></div>
+<div class="card"><b>3. Receive the result</b><p>The recorder joins at the scheduled time and sends the recording back to the Telegram user who connected the calendar.</p></div>
+</div></section>
+<section class="section" id="data"><div class="wrap">
+<h2>Designed around minimum Google access</h2>
+<p>BeOnMeet requests read only Calendar permissions. It does not create, edit or delete your Google Calendar events.</p>
+<div class="data">
+<div class="notice"><strong>Calendar list</strong><br>Used to discover the calendars available to your Google account so meetings are not limited to the primary calendar.</div>
+<div class="notice"><strong>Calendar events</strong><br>Used to identify Google Meet links, event timing and whether an event is cancelled or declined so the recorder can join at the correct time.</div>
+</div>
+<div class="notice" style="margin-top:16px"><strong>No advertising use of Google user data.</strong><br>Google user data obtained through Google APIs is used only to provide BeOnMeet's user facing meeting automation. It is not sold and is not used for advertising or ad targeting. See the <a href="/privacy">Privacy Policy</a> for full details.</div>
+</div></section>
+<section class="section"><div class="wrap">
+<h2>Recordings delivered where you already work</h2>
+<p>Meeting recordings and eligible Premium outputs such as separate audio and transcripts are delivered through Telegram. Temporary delivery files are retained only as needed to complete delivery and, depending on plan, may remain available for up to 72 hours before expiry.</p>
+</div></section>
+</main>"""
+    return public_shell("BeOnMeet | Automatic Google Meet recording", body)
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+@app.get("/privacy-policy", response_class=HTMLResponse)
+async def privacy_policy() -> str:
+    body = """
+<main><div class="wrap legal">
+<span class="eyebrow">Effective 6 October 2026</span>
+<h1>BeOnMeet Privacy Policy</h1>
+<p>This policy explains how BeOnMeet accesses, uses, stores and shares information when you use the BeOnMeet meeting automation service.</p>
+<h2>Information we process</h2>
+<p>When you connect Google Calendar, BeOnMeet receives OAuth authorization and read only access to the calendars and events available to the connected Google account. This can include calendar identifiers, event timing, Google Meet links, event status and attendee response information needed to determine whether a meeting should be joined.</p>
+<p>We also process Telegram account identifiers required to deliver bot messages and files, service and payment status, operational logs, and meeting media created when you ask BeOnMeet to record a meeting.</p>
+<h2>How Google user data is used</h2>
+<p>Google Calendar data is used only to provide user facing BeOnMeet functionality: discovering scheduled Google Meet meetings, determining when the recorder should join, avoiding cancelled or declined meetings, preventing duplicate recorder joins, and associating meeting automation with the Telegram user who connected the Google account.</p>
+<p>BeOnMeet requests read only Google Calendar scopes. BeOnMeet does not use these permissions to create, modify or delete your Google Calendar events.</p>
+<h2>Google API Limited Use</h2>
+<p>BeOnMeet's use and transfer of information received from Google APIs adheres to the Google API Services User Data Policy, including the Limited Use requirements. Google user data is not sold, is not used for advertising or ad targeting, and is not transferred to third parties for advertising purposes.</p>
+<h2>Storage and retention</h2>
+<p>OAuth credentials required to keep your calendar connection active are stored on BeOnMeet infrastructure with access restricted to the service. Minimal scheduling state may be retained so that meetings can be queued, deduplicated and delivered reliably.</p>
+<p>Meeting recordings and derived files are processed for delivery to the requesting Telegram user. Temporary delivery files expire after the applicable delivery window. Depending on the plan and output type, a full file download can remain available for up to 72 hours before expiry.</p>
+<h2>Sharing</h2>
+<p>We disclose data only as necessary to operate the service, including communication with Google APIs for Calendar access and Telegram for bot communication and file delivery, or when required by law. We do not sell personal information.</p>
+<h2>Your choices and deletion</h2>
+<p>You can turn off automatic meeting detection in the BeOnMeet bot and revoke BeOnMeet's Google access at any time from your Google Account permissions. Revoking Google access prevents future Calendar reads. To request deletion of BeOnMeet account data that remains on the service, contact <a href="mailto:meetrecorderbot@gmail.com">meetrecorderbot@gmail.com</a>.</p>
+<h2>Recording responsibility</h2>
+<p>Meeting recording can be regulated by local law or organizational policy. The user who requests or enables recording is responsible for obtaining any required notice or consent from meeting participants.</p>
+<h2>Security</h2>
+<p>We use access controls, isolated service components and operational safeguards intended to protect credentials and meeting data. No internet service can guarantee absolute security.</p>
+<h2>Changes</h2>
+<p>If our use of Google user data or other material privacy practices change, this policy will be updated before the new use is introduced where required.</p>
+<h2>Contact</h2>
+<p>Privacy questions and deletion requests: <a href="mailto:meetrecorderbot@gmail.com">meetrecorderbot@gmail.com</a>.</p>
+</div></main>"""
+    return public_shell("Privacy Policy | BeOnMeet", body)
+
+
+@app.get("/terms", response_class=HTMLResponse)
+@app.get("/terms-of-service", response_class=HTMLResponse)
+async def terms_of_service() -> str:
+    body = """
+<main><div class="wrap legal">
+<span class="eyebrow">Effective 6 October 2026</span>
+<h1>BeOnMeet Terms of Service</h1>
+<p>These Terms govern use of BeOnMeet. By connecting an account or requesting a recording, you agree to these Terms.</p>
+<h2>Service</h2>
+<p>BeOnMeet is a meeting automation service that can detect eligible Google Meet events from a connected Google Calendar, dispatch a recorder, and deliver recording related outputs through Telegram. Features and capacity can vary by plan.</p>
+<h2>Your responsibilities</h2>
+<ul><li>You must have the right to connect the Google account you authorize.</li><li>You are responsible for complying with meeting, workplace and local laws, including any notice or consent required before recording participants.</li><li>You may not use BeOnMeet for unlawful surveillance, harassment, unauthorized access or other illegal activity.</li></ul>
+<h2>Google and Telegram</h2>
+<p>Google Meet, Google Calendar and Telegram are third party services. BeOnMeet is not affiliated with or endorsed by Google or Telegram. Their availability and policies can affect BeOnMeet functionality.</p>
+<h2>Availability</h2>
+<p>We work to provide reliable automatic joining and delivery, but admission controls, network conditions, third party outages, capacity limits or meeting configuration can prevent or delay recording. A host may need to admit the recorder.</p>
+<h2>Plans and temporary files</h2>
+<p>Free and Premium plans can have different recording limits, quality, output and retention features. Temporary delivery and download files expire according to the applicable plan and service configuration.</p>
+<h2>Privacy</h2>
+<p>Our handling of personal information and Google user data is described in the <a href="/privacy">Privacy Policy</a>.</p>
+<h2>Suspension</h2>
+<p>We may restrict access when reasonably necessary to protect the service, other users or third parties, or to address fraud, abuse or legal requirements.</p>
+<h2>Disclaimer</h2>
+<p>BeOnMeet is provided on an as available basis. To the maximum extent permitted by law, we do not guarantee that every meeting will be joined, recorded, transcribed or delivered without interruption or error.</p>
+<h2>Contact</h2>
+<p>Questions about these Terms: <a href="mailto:meetrecorderbot@gmail.com">meetrecorderbot@gmail.com</a>.</p>
+</div></main>"""
+    return public_shell("Terms of Service | BeOnMeet", body)
 
 
 @app.get("/auth/google")
