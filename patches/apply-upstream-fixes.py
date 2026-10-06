@@ -265,6 +265,83 @@ if old_start not in source:
     raise SystemExit("RECORDING_START_PATCH_MARKER_NOT_FOUND")
 source = source.replace(old_start, new_start, 1)
 
+# A quiet meeting is still an active meeting. The upstream recorder ends a call
+# after the configured audio-silence window, which can cut off legitimate calls
+# (muted participants, presentations, reading time, etc.). BeOnMeet ends from
+# participant departure/page termination instead, with a maximum-duration guard.
+old_silence_start = """          inactivitySilenceDetectionTimeout = setTimeout(() => {
+            detectIncrediblySilentMeeting();
+          }, activateInactivityDetectionAfterMinutes * 60 * 1000);
+"""
+new_silence_start = """          // BeOnMeet: audio silence is not a meeting-end signal.
+          // Keep the detector disabled; participant presence and max duration are safer.
+          inactivitySilenceDetectionTimeout = undefined as any;
+"""
+if old_silence_start not in source:
+    raise SystemExit("SILENCE_AUTOSTOP_PATCH_MARKER_NOT_FOUND")
+source = source.replace(old_silence_start, new_silence_start, 1)
+
+# Never stop merely because the bot appears alone before we have positively
+# observed another participant. Google Meet's count badge can lag or be missing
+# during UI transitions. Once another participant has been seen, require the
+# configured continuous-alone grace window before ending.
+old_initial_alone = """            return now - recordingStartedAt >= initialAloneGraceMs;
+"""
+new_initial_alone = """            return false;
+"""
+if old_initial_alone not in source:
+    raise SystemExit("INITIAL_ALONE_PATCH_MARKER_NOT_FOUND")
+source = source.replace(old_initial_alone, new_initial_alone, 1)
+
+old_initial_grace = """          const initialAloneGraceMs = activateInactivityDetectionAfterMinutes * 60 * 1000;
+"""
+new_initial_grace = """          // BeOnMeet intentionally has no initial-alone auto-exit. We must first
+          // positively observe another participant before participant departure
+          // can end the recording.
+"""
+if old_initial_grace not in source:
+    raise SystemExit("INITIAL_ALONE_GRACE_PATCH_MARKER_NOT_FOUND")
+source = source.replace(old_initial_grace, new_initial_grace, 1)
+
+# Google Meet can temporarily hide/replace the People and Leave-call controls.
+# Require a full minute of consecutive invalid UI checks before treating that as
+# a genuine page termination instead of ending on one transient render.
+old_page_guard = """            // check if we're still on a valid Google Meet page
+            isOnValidGoogleMeetPageInterval = setInterval(() => {
+              if (!isOnValidGoogleMeetPage()) {
+                console.log('Google Meet page state changed - ending recording on team:', userId, teamId);
+                clearInterval(isOnValidGoogleMeetPageInterval);
+                stopTheRecording();
+              }
+            }, 10000);
+"""
+new_page_guard = """            // BeOnMeet: debounce transient Meet UI changes. A single missing
+            // control set must never terminate an otherwise healthy recording.
+            let consecutiveInvalidMeetUiChecks = 0;
+            const maxInvalidMeetUiChecks = 6;
+            isOnValidGoogleMeetPageInterval = setInterval(() => {
+              if (!isOnValidGoogleMeetPage()) {
+                consecutiveInvalidMeetUiChecks += 1;
+                console.warn(
+                  'Google Meet page validity check failed',
+                  consecutiveInvalidMeetUiChecks,
+                  'of',
+                  maxInvalidMeetUiChecks,
+                );
+                if (consecutiveInvalidMeetUiChecks >= maxInvalidMeetUiChecks) {
+                  console.log('Google Meet page stayed invalid for 60s - ending recording on team:', userId, teamId);
+                  clearInterval(isOnValidGoogleMeetPageInterval);
+                  stopTheRecording();
+                }
+              } else {
+                consecutiveInvalidMeetUiChecks = 0;
+              }
+            }, 10000);
+"""
+if old_page_guard not in source:
+    raise SystemExit("MEET_PAGE_DEBOUNCE_PATCH_MARKER_NOT_FOUND")
+source = source.replace(old_page_guard, new_page_guard, 1)
+
 path.write_text(source)
 print("BeOnMeet upstream Google Meet fixes applied")
 
