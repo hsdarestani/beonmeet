@@ -1777,7 +1777,7 @@ def transcribe_audio_local(audio_path: Path) -> tuple[str, str]:
 
 
 def transcribe_audio_recovery_fast(audio_path: Path) -> tuple[str, str]:
-    """Faster CPU path used only for retained-file Premium backfills."""
+    """Faster CPU fallback for Premium transcription and retained-file recovery."""
     global _whisper_recovery_model
     from faster_whisper import WhisperModel
 
@@ -2938,10 +2938,25 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                         try:
                             await tg_text(chat_id, t(chat_id, "transcribing"))
                             async with TRANSCRIPTION_SEMAPHORE:
-                                transcript, detected_language = await asyncio.to_thread(
-                                    transcribe_audio_local,
-                                    audio_path,
-                                )
+                                try:
+                                    transcript, detected_language = await asyncio.to_thread(
+                                        transcribe_audio_local,
+                                        audio_path,
+                                    )
+                                except Exception as primary_transcription_error:
+                                    # large-v3 can fail under CPU/RAM pressure or on a
+                                    # damaged tail in an abruptly ended WebM. Retry once
+                                    # with the smaller recovery model before surfacing an
+                                    # error to the user or leaving the stage pending.
+                                    print(
+                                        "primary transcription failed; trying recovery model:",
+                                        repr(primary_transcription_error),
+                                        flush=True,
+                                    )
+                                    transcript, detected_language = await asyncio.to_thread(
+                                        transcribe_audio_recovery_fast,
+                                        audio_path,
+                                    )
 
                             if transcript:
                                 transcript_path = raw_path.with_name(
@@ -3049,8 +3064,27 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
 
         return {"ok": True, "admin_copy": bool(ADMINUSER), "premium": premium_active}
     except Exception as exc:
-        if not bool(data.get("_silent_retry")):
+        # Do not tell the user that Telegram delivery failed when the recording
+        # itself was already delivered successfully. Premium audio/transcript
+        # stages have their own error handling and are retried from the retained
+        # source by delivery_recovery_loop().
+        pending_id_after_failure = str(data.get("_pending_id") or "")
+        pending_after_failure = (
+            state.setdefault("pending_deliveries", {}).get(pending_id_after_failure)
+            if pending_id_after_failure
+            else None
+        )
+        video_delivered_after_failure = bool(
+            (pending_after_failure or {}).get("video_delivered")
+        )
+        if not bool(data.get("_silent_retry")) and not video_delivered_after_failure:
             await tg_text(chat_id, t(chat_id, "delivery_error"))
+        elif video_delivered_after_failure:
+            print(
+                "recording delivered; downstream Premium output remains pending:",
+                repr(exc),
+                flush=True,
+            )
         raise HTTPException(status_code=502, detail=str(exc))
 
 
