@@ -29,6 +29,9 @@ required_main = [
     'if source_event.get("status") == "cancelled" or event_declined_by_owner(source_event):',
     'google_token_file(chat_id).write_text(creds.to_json())',
     'globals()["state"].setdefault("auto_join_all", {})[chat_id] = True',
+    'if not await asyncio.to_thread(is_premium, str(chat_id)):',
+    'Premium required for All meetings',
+    'await send_subscription_offer(chat_id, "auto_premium_only")',
 ]
 for needle in required_main:
     assert needle in MAIN, f"missing auto calendar invariant: {needle}"
@@ -36,6 +39,8 @@ for needle in required_main:
 assert I18N.count('"auto_enabled"') == 3
 assert I18N.count('"auto_disabled"') == 3
 assert I18N.count('"auto_connect"') == 3
+assert I18N.count('"auto_premium_only"') == 3
+assert I18N.count('"auto_premium_status"') == 3
 assert I18N.count('"auto":') >= 6
 assert 'BUTTON_ACTIONS[_labels["auto"]] = "/auto"' in I18N
 
