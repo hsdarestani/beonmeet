@@ -143,6 +143,30 @@ def _migrate_sqlite_to_postgres_once() -> None:
         legacy.close()
 
 
+def _ensure_user_calendar_columns() -> None:
+    """Add Calendar admin metadata to existing databases without destructive migration."""
+    with _db() as db:
+        if is_postgres():
+            db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_calendar_email TEXT DEFAULT ''")
+            db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_connected INTEGER NOT NULL DEFAULT 0")
+            db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS all_meetings_enabled INTEGER NOT NULL DEFAULT 0")
+            db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_connected_at TEXT")
+            return
+
+        columns = {
+            str(row["name"])
+            for row in db.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "google_calendar_email" not in columns:
+            db.execute("ALTER TABLE users ADD COLUMN google_calendar_email TEXT DEFAULT ''")
+        if "calendar_connected" not in columns:
+            db.execute("ALTER TABLE users ADD COLUMN calendar_connected INTEGER NOT NULL DEFAULT 0")
+        if "all_meetings_enabled" not in columns:
+            db.execute("ALTER TABLE users ADD COLUMN all_meetings_enabled INTEGER NOT NULL DEFAULT 0")
+        if "calendar_connected_at" not in columns:
+            db.execute("ALTER TABLE users ADD COLUMN calendar_connected_at TEXT")
+
+
 def init_db() -> None:
     if is_postgres():
         schema = """
@@ -156,7 +180,11 @@ def init_db() -> None:
             total_requests BIGINT NOT NULL DEFAULT 0,
             total_recordings BIGINT NOT NULL DEFAULT 0,
             premium_until TEXT,
-            premium_plan TEXT
+            premium_plan TEXT,
+            google_calendar_email TEXT DEFAULT '',
+            calendar_connected INTEGER NOT NULL DEFAULT 0,
+            all_meetings_enabled INTEGER NOT NULL DEFAULT 0,
+            calendar_connected_at TEXT
         );
         CREATE TABLE IF NOT EXISTS meeting_requests (
             id BIGSERIAL PRIMARY KEY,
@@ -207,6 +235,7 @@ def init_db() -> None:
         """
         with _db() as db:
             db.executescript(schema)
+        _ensure_user_calendar_columns()
         _migrate_sqlite_to_postgres_once()
         return
 
@@ -224,7 +253,11 @@ def init_db() -> None:
                 total_requests INTEGER NOT NULL DEFAULT 0,
                 total_recordings INTEGER NOT NULL DEFAULT 0,
                 premium_until TEXT,
-                premium_plan TEXT
+                premium_plan TEXT,
+                google_calendar_email TEXT DEFAULT '',
+                calendar_connected INTEGER NOT NULL DEFAULT 0,
+                all_meetings_enabled INTEGER NOT NULL DEFAULT 0,
+                calendar_connected_at TEXT
             );
             CREATE TABLE IF NOT EXISTS meeting_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -266,6 +299,7 @@ def init_db() -> None:
             );
             """
         )
+    _ensure_user_calendar_columns()
 
 
 def utcnow() -> datetime:
@@ -286,6 +320,73 @@ def touch_user(telegram_id: str, username: str = "", first_name: str = "", last_
                 last_seen=excluded.last_seen
             """,
             (str(telegram_id), username or "", first_name or "", last_name or "", now, now),
+        )
+
+
+def set_calendar_connection(
+    telegram_id: str,
+    email: str | None = None,
+    *,
+    connected: bool = True,
+    all_meetings_enabled: bool | None = None,
+) -> None:
+    """Persist admin-visible Calendar identity and All meetings state."""
+    telegram_id = str(telegram_id)
+    now = utcnow().isoformat()
+    with _db() as db:
+        db.execute(
+            """
+            INSERT INTO users (telegram_id, first_seen, last_seen)
+            VALUES (?, ?, ?)
+            ON CONFLICT(telegram_id) DO NOTHING
+            """,
+            (telegram_id, now, now),
+        )
+        if email:
+            db.execute(
+                """
+                UPDATE users
+                SET google_calendar_email=?, calendar_connected=1,
+                    calendar_connected_at=COALESCE(calendar_connected_at, ?)
+                WHERE telegram_id=?
+                """,
+                (str(email).strip(), now, telegram_id),
+            )
+        else:
+            db.execute(
+                """
+                UPDATE users
+                SET calendar_connected=?,
+                    calendar_connected_at=CASE
+                        WHEN ?=1 THEN COALESCE(calendar_connected_at, ?)
+                        ELSE calendar_connected_at
+                    END
+                WHERE telegram_id=?
+                """,
+                (1 if connected else 0, 1 if connected else 0, now, telegram_id),
+            )
+        if all_meetings_enabled is not None:
+            db.execute(
+                "UPDATE users SET all_meetings_enabled=? WHERE telegram_id=?",
+                (1 if all_meetings_enabled else 0, telegram_id),
+            )
+
+
+def set_auto_join_enabled(telegram_id: str, enabled: bool) -> None:
+    telegram_id = str(telegram_id)
+    now = utcnow().isoformat()
+    with _db() as db:
+        db.execute(
+            """
+            INSERT INTO users (telegram_id, first_seen, last_seen)
+            VALUES (?, ?, ?)
+            ON CONFLICT(telegram_id) DO NOTHING
+            """,
+            (telegram_id, now, now),
+        )
+        db.execute(
+            "UPDATE users SET all_meetings_enabled=? WHERE telegram_id=?",
+            (1 if enabled else 0, telegram_id),
         )
 
 
@@ -579,6 +680,7 @@ def _layout(title: str, body: str, active: str = "dashboard") -> str:
     nav = [
         ("dashboard", "/admin", "داشبورد", "⌂"),
         ("users", "/admin/users", "کاربران", "◉"),
+        ("calendar", "/admin/calendar", "همه جلسات", "◎"),
         ("recordings", "/admin/recordings", "ضبط ها", "◍"),
         ("subscriptions", "/admin/subscriptions", "اشتراک ها", "◆"),
         ("plans", "/admin/plans", "پلن ویژه", "✦"),
@@ -602,7 +704,7 @@ def _layout(title: str, body: str, active: str = "dashboard") -> str:
 .side-foot{{position:absolute;bottom:24px;right:18px;left:18px;color:#697289;font-size:12px;line-height:1.8}}
 main{{padding:34px 38px 60px;max-width:1500px;width:100%}} .top{{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:28px}} h1{{margin:0;font-size:28px}} .sub{{color:var(--muted);font-size:13px;margin-top:7px}}
 .grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:15px}} .card{{background:linear-gradient(145deg,#151927dd,#0f121ddd);border:1px solid var(--line);border-radius:20px;padding:20px;box-shadow:0 18px 55px #0004;backdrop-filter:blur(16px)}} .metric .label{{color:var(--muted);font-size:12px}} .metric .num{{font-size:28px;font-weight:900;margin-top:12px}} .metric .hint{{font-size:11px;color:#697289;margin-top:8px}}
-.good{{color:var(--good)}} .warn{{color:var(--warn)}} .purple{{color:#b99cff}} .cyan{{color:#73dfff}}
+.good{{color:var(--good)}} .warn{{color:var(--warn)}} .purple{{color:#b99cff}} .cyan{{color:#73dfff}} .badge.enabled{{color:#8ff0c2;background:#48e5a514;border-color:#48e5a555}} .badge.disabled{{color:#9aa3b7;background:#ffffff05}}
 .section{{margin-top:20px}} .section-head{{display:flex;justify-content:space-between;align-items:center;margin:0 2px 12px}} .section-head h2{{font-size:16px;margin:0}} .pill{{padding:7px 11px;border-radius:99px;background:#ffffff0b;border:1px solid var(--line);color:var(--muted);font-size:11px}}
 table{{width:100%;border-collapse:collapse}} th{{text-align:right;color:#737d94;font-weight:500;font-size:11px;padding:0 10px 13px}} td{{padding:14px 10px;border-top:1px solid #22283a;font-size:12px;vertical-align:middle}} tr:hover td{{background:#ffffff02}} .user{{display:flex;gap:10px;align-items:center}} .avatar{{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;font-weight:800;background:linear-gradient(135deg,#7856dd,#196f91)}} .muted{{color:var(--muted)}} .badge{{font-size:10px;padding:5px 8px;border-radius:9px;border:1px solid var(--line)}} .premium{{color:#dbc9ff;background:#8c5cff1e;border-color:#7d5bdd66}} .free{{color:#a6afc1;background:#ffffff05}}
 .btn{{border:0;border-radius:10px;padding:9px 12px;font:inherit;font-size:11px;cursor:pointer;color:white;background:#ffffff0c;border:1px solid var(--line)}} .btn.primary{{background:linear-gradient(135deg,#7654f5,#4e7dff);border:0}} .btn.danger{{color:#ff9aad;border-color:#ff668544;background:#ff668510}}
@@ -747,6 +849,13 @@ async def user_page(request: Request, telegram_id: str):
       <div class="card metric"><div class="label">اولین ورود</div><div class="num" style="font-size:15px">{_fa_date(u["first_seen"])}</div></div>
       <div class="card metric"><div class="label">آخرین فعالیت</div><div class="num" style="font-size:15px">{_fa_date(u["last_seen"])}</div></div>
     </div>
+    <div class="card section">
+      <div class="section-head"><h2>Google Calendar و همه جلسات</h2><a class="pill" href="/admin/calendar" style="text-decoration:none">نمایش همه</a></div>
+      <div class="two">
+        <div class="feature"><span class="dot {' ' if bool(u["all_meetings_enabled"]) else 'planned'}"></span><div><b>All meetings</b><div class="muted">{'روشن' if bool(u["all_meetings_enabled"]) else 'خاموش'}</div></div></div>
+        <div class="feature"><span class="dot {' ' if bool(u["calendar_connected"]) else 'planned'}"></span><div><b>Google account</b><div class="muted" dir="ltr">{_esc(u["google_calendar_email"] or "ایمیل هنوز شناسایی نشده")}</div><div class="muted">{'متصل' if bool(u["calendar_connected"]) else 'متصل نیست'} · {_fa_date(u["calendar_connected_at"])}</div></div></div>
+      </div>
+    </div>
     <div class="card section"><div class="section-head"><h2>مدیریت اشتراک</h2></div>
       <form class="inline" method="post" action="/admin/users/{_esc(telegram_id)}/activate">
         <select name="plan_code"><option value="monthly">یک ماهه · ۱۹۸٬۰۰۰</option><option value="quarterly">سه ماهه · ۴۹۹٬۰۰۰</option><option value="halfyear">شش ماهه · ۷۹۹٬۰۰۰</option></select>
@@ -776,6 +885,73 @@ async def deactivate_user(request: Request, telegram_id: str):
     _require_admin(request)
     deactivate_subscription(telegram_id)
     return RedirectResponse(f"/admin/users/{telegram_id}", status_code=303)
+
+
+@router.get("/admin/calendar", response_class=HTMLResponse)
+async def calendar_users_page(request: Request, q: str = ""):
+    _require_admin(request)
+    with _db() as db:
+        params: tuple = ()
+        where = "WHERE calendar_connected=1 OR all_meetings_enabled=1 OR COALESCE(google_calendar_email,'')<>''"
+        if q.strip():
+            like = f"%{q.strip()}%"
+            where = """WHERE
+                (calendar_connected=1 OR all_meetings_enabled=1 OR COALESCE(google_calendar_email,'')<>'')
+                AND (telegram_id LIKE ? OR username LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR google_calendar_email LIKE ?)
+            """
+            params = (like, like, like, like, like)
+        rows = db.execute(
+            f"""SELECT * FROM users {where}
+                ORDER BY all_meetings_enabled DESC, calendar_connected DESC, last_seen DESC
+                LIMIT 500""",
+            params,
+        ).fetchall()
+
+    active_count = sum(1 for r in rows if bool(r["all_meetings_enabled"]))
+    connected_count = sum(1 for r in rows if bool(r["calendar_connected"]))
+    trs = []
+    for r in rows:
+        name = (f'{r["first_name"]} {r["last_name"]}').strip() or "بدون نام"
+        uname = f'@{r["username"]}' if r["username"] else r["telegram_id"]
+        enabled = bool(r["all_meetings_enabled"])
+        connected = bool(r["calendar_connected"])
+        status = '<span class="badge enabled">روشن</span>' if enabled else '<span class="badge disabled">خاموش</span>'
+        connection = '<span class="badge enabled">متصل</span>' if connected else '<span class="badge disabled">قطع</span>'
+        email = _esc(r["google_calendar_email"] or "ایمیل هنوز شناسایی نشده")
+        plan_active = bool(
+            r["premium_until"]
+            and (_parse_dt(r["premium_until"]) or utcnow() - timedelta(days=1)) > utcnow()
+        )
+        plan = '<span class="badge premium">ویژه</span>' if plan_active else '<span class="badge free">رایگان</span>'
+        trs.append(
+            f"""<tr>
+              <td><div class="user"><div class="avatar">{_esc((name[:1] or "U").upper())}</div><div><b>{_esc(name)}</b><div class="muted">{_esc(uname)}</div></div></div></td>
+              <td>{status}</td>
+              <td><b dir="ltr">{email}</b><div style="margin-top:6px">{connection}</div></td>
+              <td>{plan}</td>
+              <td class="muted">{_fa_date(r["calendar_connected_at"])}</td>
+              <td class="muted">{_fa_date(r["last_seen"])}</td>
+              <td><a class="btn" href="/admin/users/{_esc(r["telegram_id"])}">باز کردن</a></td>
+            </tr>"""
+        )
+
+    table = "".join(trs) or '<tr><td colspan="7" class="empty">هنوز کسی Google Calendar را وصل نکرده</td></tr>'
+    body = f"""
+    <div class="top">
+      <div><h1>همه جلسات</h1><div class="sub">کاربرانی که Google Calendar را متصل کرده اند و وضعیت All meetings آن ها</div></div>
+      <form><input class="search" name="q" value="{_esc(q)}" placeholder="نام، یوزرنیم، Telegram ID یا ایمیل"><button class="btn primary">جستجو</button></form>
+    </div>
+    <div class="grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:20px">
+      <div class="card metric"><div class="label">All meetings روشن</div><div class="num good">{active_count}</div><div class="hint">ورود خودکار به همه Meet ها</div></div>
+      <div class="card metric"><div class="label">Google Calendar متصل</div><div class="num cyan">{connected_count}</div><div class="hint">اتصال OAuth شخصی</div></div>
+      <div class="card metric"><div class="label">رکوردهای قابل مشاهده</div><div class="num">{len(rows)}</div><div class="hint">حداکثر ۵۰۰ کاربر</div></div>
+    </div>
+    <div class="card"><table>
+      <thead><tr><th>کاربر</th><th>All meetings</th><th>Google account</th><th>پلن</th><th>زمان اتصال</th><th>آخرین فعالیت</th><th>مدیریت</th></tr></thead>
+      <tbody>{table}</tbody>
+    </table></div>
+    """
+    return _layout("همه جلسات", body, "calendar")
 
 
 @router.get("/admin/recordings", response_class=HTMLResponse)
