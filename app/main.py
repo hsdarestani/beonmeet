@@ -121,6 +121,8 @@ state_lock = asyncio.Lock()
 queue_mutation_lock = asyncio.Lock()
 worker_health_cache: dict[str, bool] = {}
 remote_worker_cache: dict[str, dict[str, Any]] = {}
+# Runtime diagnostics are intentionally kept out of the durable OAuth/meeting state.
+calendar_scan_status: dict[str, dict[str, Any]] = {}
 _whisper_model = None
 _whisper_recovery_model = None
 active_delivery_jobs = 0
@@ -495,7 +497,10 @@ def list_calendar_events(
         pass
 
     events: list[dict[str, Any]] = []
+    calendar_count = 0
+    calendar_failures = 0
     for calendar in _calendar_entries(service, all_calendars=bool(all_calendars)):
+        calendar_count += 1
         calendar_id = str(calendar.get("id") or "primary")
         calendar_tz = str(calendar.get("timeZone") or default_tz or "")
         page_token = None
@@ -521,22 +526,30 @@ def list_calendar_events(
                 if not page_token:
                     break
         except Exception as exc:
+            calendar_failures += 1
             print(f"calendar events skipped ({calendar_id}):", repr(exc), flush=True)
             continue
+    # Previously every failed calendar was silently treated as an empty schedule,
+    # making a broken OAuth connection look healthy and preventing all auto joins.
+    if calendar_count and calendar_failures == calendar_count:
+        raise RuntimeError("Google Calendar event listing failed for all calendars")
     return events
 
 
 def event_meet_url(event: dict[str, Any]) -> str:
-    if event.get("hangoutLink"):
-        return normalize_meet_url(event["hangoutLink"])
-    for ep in event.get("conferenceData", {}).get("entryPoints", []):
-        uri = ep.get("uri", "")
-        if "meet.google.com" in uri:
-            return normalize_meet_url(uri)
-    for field in ("location", "description"):
-        found = normalize_meet_url(event.get(field, ""))
-        if found:
-            return found
+    # A malformed hangoutLink must not mask a valid Meet link in conferenceData
+    # or in the invitation description.
+    candidates = [event.get("hangoutLink")]
+    conference_data = event.get("conferenceData") or {}
+    if isinstance(conference_data, dict):
+        for entry in conference_data.get("entryPoints") or []:
+            if isinstance(entry, dict):
+                candidates.append(entry.get("uri"))
+    candidates.extend((event.get("location"), event.get("description")))
+    for candidate in candidates:
+        meet_url = normalize_meet_url(str(candidate or ""))
+        if meet_url:
+            return meet_url
     return ""
 
 
@@ -1162,16 +1175,31 @@ async def calendar_loop() -> None:
             # connected calendar is discovered and launched without sending links.
             auto_settings = dict(state.setdefault("auto_join_all", {}))
             for chat_id, enabled in auto_settings.items():
-                if not enabled or not calendar_connected(chat_id):
+                if not enabled:
+                    calendar_scan_status[chat_id] = {"status": "disabled"}
+                    continue
+                if not calendar_connected(chat_id):
+                    calendar_scan_status[chat_id] = {"status": "reconnect"}
                     continue
                 if not await asyncio.to_thread(is_premium, str(chat_id)):
+                    calendar_scan_status[chat_id] = {"status": "premium required"}
                     continue
                 try:
                     events = await asyncio.to_thread(list_calendar_events, chat_id)
                 except Exception as exc:
+                    calendar_scan_status[chat_id] = {
+                        "status": "error",
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                    }
                     print(f"calendar auto lookup error ({chat_id}):", repr(exc), flush=True)
                     continue
 
+                calendar_scan_status[chat_id] = {
+                    "status": "ok",
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                    "events": len(events),
+                    "meetings": sum(1 for event in events if event_meet_url(event)),
+                }
                 for source_event in events:
                     if source_event.get("status") == "cancelled" or event_declined_by_owner(source_event):
                         continue
@@ -1217,6 +1245,28 @@ async def calendar_loop() -> None:
         except Exception as exc:
             print("calendar loop error:", repr(exc), flush=True)
         await asyncio.sleep(CALENDAR_POLL_SECONDS)
+
+
+def auto_calendar_status_message(chat_id: int | str) -> str:
+    """Describe the effective scheduler state without exposing OAuth tokens."""
+    key = str(chat_id)
+    connected = calendar_connected(key)
+    enabled = auto_join_enabled(key)
+    scan = calendar_scan_status.get(key) or {}
+    last_checked = str(scan.get("checked_at") or "not yet")
+    reason = str(scan.get("status") or "awaiting first scan")
+    summary = (
+        f"📅 Automatic recording: {'ON' if enabled else 'OFF'}\n"
+        f"Google Calendar: {'connected' if connected else 'reconnect required'}\n"
+        f"Last scan (UTC): {last_checked}\n"
+        f"Scan result: {reason}\n"
+        f"Events found: {int(scan.get('events') or 0)}\n"
+        f"Meet events found: {int(scan.get('meetings') or 0)}\n"
+        "Enable: /auto on   Disable: /auto off   Check: /auto status"
+    )
+    if not connected or reason in {"error", "reconnect"}:
+        summary += f"\nReconnect Calendar: {calendar_auth_url(key)}"
+    return summary
 
 
 async def telegram_loop() -> None:
@@ -1315,6 +1365,10 @@ async def telegram_loop() -> None:
                     parts = text.strip().lower().split(maxsplit=1)
                     explicit = parts[1] if len(parts) > 1 else ""
 
+                    if explicit in {"status", "check"}:
+                        await tg_text(chat_id, auto_calendar_status_message(chat_id), with_menu=True)
+                        continue
+
                     # Turning the feature off is always allowed, even after Premium expires.
                     if explicit in {"off", "0", "false", "disable"}:
                         state.setdefault("auto_join_all", {})[str(chat_id)] = False
@@ -1334,15 +1388,13 @@ async def telegram_loop() -> None:
                         )
                         continue
 
-                    if explicit in {"on", "1", "true", "enable"}:
-                        enabled = True
-                    else:
-                        enabled = not auto_join_enabled(chat_id)
-                    state.setdefault("auto_join_all", {})[str(chat_id)] = enabled
+                    # /auto and the keyboard shortcut must be idempotent.
+                    # A second tap previously toggled automatic recording OFF.
+                    state.setdefault("auto_join_all", {})[str(chat_id)] = True
                     await save_state()
                     await tg_text(
                         chat_id,
-                        t(chat_id, "auto_enabled" if enabled else "auto_disabled"),
+                        t(chat_id, "auto_enabled") + "\n\n" + auto_calendar_status_message(chat_id),
                         with_menu=True,
                     )
                     continue

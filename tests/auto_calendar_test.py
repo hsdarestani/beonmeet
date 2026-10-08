@@ -47,3 +47,13 @@ assert 'BUTTON_ACTIONS[_labels["auto"]] = "/auto"' in I18N
 print("AUTO_CALENDAR_TEST_PASS")
 
 assert 'if ADMINUSER and str(chat_id) == ADMINUSER and TOKEN_FILE.exists()' not in MAIN
+
+# Automatic mode must never turn itself off when /auto is tapped repeatedly.
+assert 'enabled = not auto_join_enabled(chat_id)' not in MAIN
+assert 'def auto_calendar_status_message' in MAIN
+assert '"status": "reconnect"' in MAIN
+assert 'if calendar_count and calendar_failures == calendar_count:' in MAIN
+assert 'calendar_scan_status[chat_id]' in MAIN
+assert 'Google Calendar event listing failed for all calendars' in MAIN
+assert 'av==18.1.0' in (ROOT / "app" / "requirements.txt").read_text(encoding="utf-8")
+print("AUTO_CALENDAR_AND_TRANSCRIPTION_DEPENDENCY_FIX_PASS")

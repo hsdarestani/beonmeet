@@ -1,0 +1,25 @@
+name: BeOnMeet change validation
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax and regression tests
+        run: |
+          python3 -m py_compile app/main.py app/i18n.py app/hetzner_autoscaler.py app/autoscaler_smoke.py
+          python3 tests/auto_calendar_test.py
+          python3 tests/auto_calendar_behavior_test.py
+          python3 tests/premium_delivery_test.py
+          python3 tests/i18n_test.py
+          python3 tests/free_plan_limit_test.py
+          python3 tests/public_oauth_pages_test.py
+          python3 tests/recorder_end_guard_test.py
+          python3 tests/admin_google_email_test.py
+          python3 tests/admin_google_clay_test.py
+          python3 tests/cloud_init_render_test.py
