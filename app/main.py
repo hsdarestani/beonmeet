@@ -612,7 +612,12 @@ def find_calendar_event_for_meet(
     # Keep the original shared bot-calendar lookup as a fallback so existing
     # manually registered meetings continue to work unchanged.
     if TOKEN_FILE.exists():
-        events.extend(list_calendar_events())
+        try:
+            events.extend(list_calendar_events())
+        except Exception as exc:
+            # A revoked legacy shared OAuth token must not erase a valid
+            # personal-calendar match or prevent /now-less registration.
+            print("legacy Calendar lookup unavailable:", type(exc).__name__, flush=True)
     elif chat_id is not None and calendar_connected(chat_id):
         events.extend(list_calendar_events(chat_id))
 
@@ -1159,10 +1164,27 @@ async def calendar_loop() -> None:
         try:
             now = datetime.now(timezone.utc)
 
-            # Legacy/manual mode: retain the shared recorder calendar behavior.
+            # Legacy/manual mode is best effort. A stale/revoked token was
+            # aborting this entire loop *before* the healthy personal Premium
+            # calendars were scanned, so /auto never dispatched any joins.
             if TOKEN_FILE.exists():
-                events = await asyncio.to_thread(list_calendar_events)
-                for event in events:
+                legacy_error = calendar_scan_status.setdefault("__legacy_error", {})
+                try:
+                    legacy_events = await asyncio.to_thread(list_calendar_events)
+                except Exception as exc:
+                    # Avoid spamming logs with an invalid_grant every 30 seconds.
+                    reason = type(exc).__name__
+                    if legacy_error.get("reason") != reason:
+                        print(
+                            "legacy shared Calendar unavailable; personal auto continues:",
+                            reason,
+                            flush=True,
+                        )
+                    legacy_error["reason"] = reason
+                    legacy_events = []
+                else:
+                    calendar_scan_status.pop("__legacy_error", None)
+                for event in legacy_events:
                     meet_url = event_meet_url(event)
                     if not meet_url:
                         continue
