@@ -81,3 +81,13 @@ jobs:
               print("USER_END",safe_id)
           PY
           sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 root@"$HOST" 'cd /opt/beonmeet && docker compose logs --since=6h controller 2>&1 | python3 -c '"'"'import sys; s=sys.stdin.read().lower(); p=["calendar events skipped","calendar auto lookup error","calendar loop error","meeting dispatch error","meeting dispatch rejected","transcription error"]; print("CONTROLLER_ERROR_PATTERN_COUNTS",dict((x,s.count(x)) for x in p))'"'"''
+
+      - name: Summarize scheduler exception types without identifiers
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          sshpass -e ssh -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/beonmeet && docker compose logs --since=6h controller 2>&1 | python3 -c '"'"'import sys,re,collections; lines=[l.split("calendar loop error:",1)[1].strip() for l in sys.stdin if "calendar loop error:" in l]; lines=[re.sub(r"https?://[^ ]+","<URL>",re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+","<EMAIL>",re.sub(r"[0-9]{5,}","<ID>",line)))[:230] for line in lines]; print("RECENT_CALENDAR_LOOP_ERRORS",list(collections.Counter(lines).most_common(7)))'"'"''
