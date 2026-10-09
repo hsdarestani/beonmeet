@@ -14,6 +14,7 @@ jobs:
         run: |
           python3 -m py_compile app/main.py app/i18n.py app/hetzner_autoscaler.py app/autoscaler_smoke.py
           python3 tests/auto_calendar_test.py
+          python3 tests/calendar_legacy_isolation_test.py
           python3 tests/auto_calendar_behavior_test.py
           python3 tests/premium_delivery_test.py
           python3 tests/i18n_test.py
