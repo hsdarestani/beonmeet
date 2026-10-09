@@ -1,0 +1,83 @@
+name: Diagnose current BeOnMeet Calendar auto-join
+
+on:
+  push:
+    branches: [diagnose/beonmeet-calendar-20261009]
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Run sanitized Calendar diagnostics on production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get -qq update >/dev/null
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -qq install -y sshpass >/dev/null
+          export SSHPASS="$PASS"
+          sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 root@"$HOST" 'cd /opt/beonmeet && docker compose exec -T controller python -' <<'PY'
+          import json, hashlib, uuid
+          from collections import Counter
+          from datetime import datetime, timezone, timedelta
+          import main
+          main.load_state()
+          now = datetime.now(timezone.utc)
+          print("DIAG_TIME_UTC", now.isoformat())
+          users = main.state.get("auto_join_all") or {}
+          print("AUTO_CONFIGURED_USERS",len(users),"AUTO_ENABLED_USERS",sum(bool(v) for v in users.values()))
+          print("LEGACY_SHARED_TOKEN_EXISTS",main.TOKEN_FILE.exists())
+          for chat_id, enabled in users.items():
+              safe_id=hashlib.sha256(str(chat_id).encode()).hexdigest()[:8]
+              print("USER_BEGIN",safe_id)
+              print("  ENABLED",bool(enabled))
+              print("  TOKEN_EXISTS",main.google_token_file(chat_id).exists())
+              print("  SCOPES_READY",main.personal_calendar_scopes_ready(chat_id))
+              print("  CALENDAR_CONNECTED",main.calendar_connected(chat_id))
+              try:
+                  print("  PREMIUM_ACTIVE",bool(main.is_premium(str(chat_id))))
+              except Exception as exc:
+                  print("  PREMIUM_CHECK_ERROR",type(exc).__name__)
+              try:
+                  p=main.google_token_file(chat_id)
+                  if p.exists():
+                      meta=json.loads(p.read_text())
+                      print("  TOKEN_REFRESH_AVAILABLE",bool(meta.get("refresh_token")))
+                      print("  TOKEN_SCOPES_COUNT",len(meta.get("scopes") or []))
+                      print("  TOKEN_EXPIRY_CONFIGURED",bool(meta.get("expiry")))
+                  events=main.list_calendar_events(chat_id)
+                  with_meet=[e for e in events if main.event_meet_url(e)]
+                  eligible=[]
+                  recent=[]
+                  upcoming=[]
+                  for e in with_meet:
+                      st,en=main.event_start(e),main.event_end(e)
+                      if not st: continue
+                      end_limit=(en+timedelta(minutes=5)) if en else (st+timedelta(hours=3))
+                      if st<=now<=end_limit and e.get("status")!="cancelled" and not main.event_declined_by_owner(e):
+                          eligible.append(e)
+                      if now-timedelta(hours=4)<=st<now: recent.append(e)
+                      if now<st<=now+timedelta(hours=24): upcoming.append(e)
+                  print("  CALENDAR_QUERY_OK",True)
+                  print("  TOTAL_EVENTS_IN_SCHEDULE_WINDOW",len(events))
+                  print("  DISTINCT_CALENDARS_WITH_EVENTS",len(set(str(x.get("_calendarId") or "") for x in events)))
+                  print("  MEET_EVENTS",len(with_meet))
+                  print("  MEET_ELIGIBLE_NOW",len(eligible))
+                  print("  MEET_RECENT_START_WITHIN_4H",len(recent))
+                  print("  MEET_UPCOMING_24H",len(upcoming))
+                  print("  MEET_DECLINED",sum(main.event_declined_by_owner(e) for e in with_meet))
+                  for e in eligible[:3]:
+                      eid=str(e.get("id") or "")
+                      cid=str(e.get("_calendarId") or "primary")
+                      auto_id="auto-"+str(uuid.uuid5(uuid.NAMESPACE_URL,f"beonmeet:{chat_id}:{cid}:{eid}"))
+                      launched=main.state.get("launched_events",{}).get(auto_id) or {}
+                      print("  ELIGIBLE_EVENT_LAUNCH_STATE",str(launched.get("status") or "not launched"),"QUEUED",bool(main._is_queued(auto_id)))
+                  print("  USER_LAUNCH_STATES",dict(Counter(str(v.get("status") or "unknown") for v in (main.state.get("launched_events") or {}).values() if str(v.get("chat_id") or "")==str(chat_id))))
+              except Exception as exc:
+                  print("  CALENDAR_QUERY_FAILED",type(exc).__name__,"HTTP_STATUS",getattr(getattr(exc,"resp",None),"status","unknown"))
+              print("USER_END",safe_id)
+          PY
+          sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 root@"$HOST" 'cd /opt/beonmeet && docker compose logs --since=6h controller 2>&1 | python3 -c '"'"'import sys; s=sys.stdin.read().lower(); p=["calendar events skipped","calendar auto lookup error","calendar loop error","meeting dispatch error","meeting dispatch rejected","transcription error"]; print("CONTROLLER_ERROR_PATTERN_COUNTS",dict((x,s.count(x)) for x in p))'"'"''
