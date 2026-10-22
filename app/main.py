@@ -59,7 +59,7 @@ app = FastAPI(title="BeOnMeet Controller")
 app.include_router(admin_router)
 app.include_router(autoscaler_router)
 
-DATA_DIR = Path("/data")
+DATA_DIR = Path(os.environ.get("BEONMEET_DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "state.json"
 TOKEN_FILE = DATA_DIR / "google-token.json"
@@ -1974,6 +1974,9 @@ async def startup() -> None:
     init_db()
     load_state()
     RECORDING_ROOT.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("BEONMEET_STAGING_NO_POLL") == "1":
+        print("BeOnMeet initialized locally without Telegram/Google polling; setup incomplete.", flush=True)
+        return
     asyncio.create_task(setup_telegram_profile())
     asyncio.create_task(telegram_loop())
     asyncio.create_task(calendar_loop())
