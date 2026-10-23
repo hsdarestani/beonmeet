@@ -1,0 +1,66 @@
+name: Configure existing single-worker BeOnMeet without opening user queue
+on:
+  push:
+    branches: [ops/shared-vps-source-audit-20261022]
+    paths: [.github/workflows/shared-vps-import-runtime.yml]
+permissions:
+  contents: read
+concurrency:
+  group: beonmeet-shared-runtime
+  cancel-in-progress: false
+jobs:
+  configure:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Import into private existing systemd runtime
+        uses: appleboy/ssh-action@v1
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ADMINUSER: ${{ secrets.ADMINUSER }}
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          envs: GOOGLE_CLIENT_ID,GOOGLE_CLIENT_SECRET,TELEGRAM_BOT_TOKEN,ADMINUSER
+          command_timeout: 3m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 300 9
+            cd /opt/beonmeet
+            cp -p .env ".env.before-integration-$(date -u +%Y%m%dT%H%M%SZ)"
+            python3 - <<'PY'
+            import os,tempfile,sqlite3,datetime
+            from pathlib import Path
+            path=Path(".env")
+            incoming={k:os.environ[k] for k in ["GOOGLE_CLIENT_ID","GOOGLE_CLIENT_SECRET","TELEGRAM_BOT_TOKEN","ADMINUSER"] if os.environ.get(k)}
+            assert all(k in incoming for k in ["GOOGLE_CLIENT_ID","GOOGLE_CLIENT_SECRET","TELEGRAM_BOT_TOKEN"])
+            assert all(not any(ch in v for ch in "\n\r\0") for v in incoming.values())
+            incoming.update(GOOGLE_REDIRECT_URI="https://beonmeet.smarbiz.sbs/auth/google/callback",BEONMEET_STAGING_NO_POLL="1",FREE_MEETING_SLOTS="0",PREMIUM_MEETING_SLOTS="0",AUTOSCALE_ENABLED="false")
+            lines=[l for l in path.read_text().splitlines() if l.split("=",1)[0] not in incoming]
+            lines.extend(k+"="+v for k,v in incoming.items())
+            with tempfile.NamedTemporaryFile(mode="w",dir=".",delete=False) as f:
+                f.write("\n".join(lines)+"\n");os.chmod(f.name,0o600);tmp=f.name
+            os.replace(tmp,path)
+            dbpath=Path("data/beonmeet.db")
+            if dbpath.exists():
+                s=sqlite3.connect(str(dbpath));d=sqlite3.connect(str(dbpath)+".pre-integration-"+datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"));s.backup(d);d.close();s.close()
+            print("RUNTIME_IMPORTED_QUEUE_REMAINS_CLOSED")
+            PY
+            systemctl restart beonmeet-controller
+            for i in $(seq 1 20); do
+              if curl -fsS --max-time 3 http://127.0.0.1:8109/health >/dev/null; then break; fi
+              sleep 2
+            done
+            curl -fsS --max-time 5 http://127.0.0.1:8109/health >/dev/null
+            curl -fsS --max-time 5 http://127.0.0.1:9123/json/version >/dev/null
+            curl -fsS --max-time 5 http://127.0.0.1:9124/health >/dev/null
+            docker exec beonmeet-redis-single redis-cli ping | grep -qx PONG
+            systemctl is-active --quiet rednotedownloader
+            nginx -t
+            echo BEONMEET_CONFIGURED_GOOGLE_RECORDER_LOGIN_PENDING
