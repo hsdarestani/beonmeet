@@ -1,0 +1,55 @@
+name: Verify independent single-controller BeOnMeet redeployment
+on:
+  push:
+    branches: [ops/shared-vps-source-audit-20261022]
+    paths: [.github/workflows/shared-vps-controller-redeploy.yml]
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 5m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 600 9
+            cd /opt/beonmeet
+            test -s .env
+            python3 - <<'PY'
+            from pathlib import Path
+            import json,urllib.request
+            values=dict(l.split("=",1) for l in Path(".env").read_text().splitlines() if "=" in l and not l.startswith("#"))
+            assert values.get("BEONMEET_STAGING_NO_POLL")=="1","Google recorder acceptance still required"
+            assert values.get("AUTOSCALE_ENABLED")=="false"
+            with urllib.request.urlopen("http://127.0.0.1:9124/capacity",timeout=10) as r:
+                data=json.load(r)
+            assert int((data.get("data") or data).get("runningJobs") or 0)==0,"Recorder busy"
+            print("SINGLE_WORKER_IDLE_NO_AUTOSCALE")
+            PY
+            stamp=$(date -u +%Y%m%dT%H%M%SZ)
+            cp -p .env ".env.before-controller-deploy-$stamp"
+            previous=$(git rev-parse HEAD)
+            git fetch origin ops/shared-vps-source-audit-20261022
+            git checkout --detach FETCH_HEAD
+            .venv/bin/python -m compileall -q app
+            systemctl restart beonmeet-controller
+            ready=0
+            for i in $(seq 1 20); do
+              if curl -fsS --max-time 3 http://127.0.0.1:8109/health >/dev/null; then ready=1;break;fi
+              sleep 2
+            done
+            if [ "$ready" != 1 ]; then git checkout --detach "$previous";systemctl restart beonmeet-controller;exit 1;fi
+            curl -fsS --max-time 10 https://beonmeet.smarbiz.sbs/health >/dev/null
+            systemctl is-active --quiet rednotedownloader
+            nginx -t
+            echo BEONMEET_SINGLE_CONTROLLER_DEPLOYED_QUEUE_CLOSED_PENDING_GOOGLE_ACCEPTANCE
+            
