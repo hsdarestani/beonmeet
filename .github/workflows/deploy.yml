@@ -1,17 +1,16 @@
-name: Deploy BeOnMeet
-
+name: Validate BeOnMeet and manually deploy the existing single controller
 on:
   push:
     branches: [main]
   workflow_dispatch:
-
+permissions:
+  contents: read
 concurrency:
-  group: beonmeet-production
+  group: beonmeet-shared-controller
   cancel-in-progress: false
-
 jobs:
-  deploy:
-    runs-on: ubuntu-latest
+  validate:
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,274 +29,54 @@ jobs:
           python3 tests/admin_google_clay_test.py
           python3 tests/cloud_init_render_test.py
 
-      - name: Copy application files
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.HOST }}
-          username: root
-          password: ${{ secrets.PASS }}
-          source: "app,worker,patches,docker-compose.yml,Caddyfile,.env.example,README.md"
-          target: "/opt/beonmeet"
-          overwrite: true
 
-      - name: Deploy
-        uses: appleboy/ssh-action@v1.2.0
-        env:
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          ADMINUSER: ${{ secrets.ADMINUSER }}
-          HETZNER_API_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+  deploy:
+    if: github.event_name == 'workflow_dispatch'
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Deploy controller only from reviewed shared runtime branch
+        uses: appleboy/ssh-action@v1
         with:
-          host: ${{ secrets.HOST }}
+          host: 143.20.60.195
+          port: 9011
           username: root
-          password: ${{ secrets.PASS }}
-          command_timeout: 2h15m
-          envs: GOOGLE_CLIENT_ID,GOOGLE_CLIENT_SECRET,TELEGRAM_BOT_TOKEN,ADMINUSER,HETZNER_API_TOKEN
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 5m
           script: |
-            set -euo pipefail
-
-            if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
-              apt-get update
-              DEBIAN_FRONTEND=noninteractive apt-get install -y git curl ca-certificates
-            fi
-
-            if ! command -v docker >/dev/null 2>&1; then
-              curl -fsSL https://get.docker.com | sh
-            fi
-
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 600 9
             cd /opt/beonmeet
-
-            pipeline_state() {
-              docker compose exec -T controller python -c 'import json,os,urllib.request,redis; urls=["http://meeting-bot-free1:3000/capacity","http://meeting-bot-free2:3000/capacity","http://meeting-bot-premium1:3000/capacity"]; running=sum(int(json.loads(urllib.request.urlopen(u,timeout=5).read().decode())["data"].get("runningJobs") or 0) for u in urls); health=json.loads(urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=5).read().decode()); active=int(health.get("active_delivery_jobs") or 0); r=redis.Redis.from_url(os.environ.get("REDIS_URL","redis://redis:6379/0"),decode_responses=True); raw=r.get(os.environ.get("REDIS_STATE_KEY","beonmeet:controller:state")) or "{}"; st=json.loads(raw); p=list((st.get("pending_deliveries") or {}).values()); print(f"{running}:{active}:{len(p)}:{max([int(x.get(chr(97)+chr(116)+chr(116)+chr(101)+chr(109)+chr(112)+chr(116)+chr(115)) or 0) for x in p]+[0])}")'
-            }
-
-            IDLE_STREAK=0
-            PIPELINE_SAFE=0
-            for _ in $(seq 1 360); do
-              PIPELINE_STATE="$(pipeline_state 2>/dev/null || true)"
-              IFS=':' read -r RUNNING_JOBS ACTIVE_DELIVERIES PENDING_DELIVERIES MAX_ATTEMPTS <<< "$PIPELINE_STATE"
-
-              if [[ "$RUNNING_JOBS" =~ ^[0-9]+$ ]] && [[ "$ACTIVE_DELIVERIES" =~ ^[0-9]+$ ]] && [[ "$PENDING_DELIVERIES" =~ ^[0-9]+$ ]] && [[ "$MAX_ATTEMPTS" =~ ^[0-9]+$ ]]; then
-                if [ "$RUNNING_JOBS" -gt 0 ]; then
-                  IDLE_STREAK=0
-                  echo "Active recordings detected: $RUNNING_JOBS. Holding deploy."
-                elif [ "$ACTIVE_DELIVERIES" -gt 0 ]; then
-                  IDLE_STREAK=0
-                  echo "Active recording delivery or transcription detected: $ACTIVE_DELIVERIES. Holding deploy."
-                elif [ "$PENDING_DELIVERIES" -gt 0 ] && [ "$MAX_ATTEMPTS" -ge 2 ]; then
-                  echo "Retry storm detected with no active processing; allowing controller restart to load idempotent delivery fix."
-                  PIPELINE_SAFE=1
-                  break
-                elif [ "$PENDING_DELIVERIES" -gt 0 ]; then
-                  IDLE_STREAK=0
-                  echo "A first-attempt delivery is still pending. Holding deploy."
-                else
-                  IDLE_STREAK=$((IDLE_STREAK + 1))
-                  echo "Delivery pipeline idle check $IDLE_STREAK/6"
-                  if [ "$IDLE_STREAK" -ge 6 ]; then
-                    echo "Pipeline has been fully idle for two minutes; production deploy may proceed"
-                    PIPELINE_SAFE=1
-                    break
-                  fi
-                fi
-              else
-                echo "Unable to verify delivery pipeline state; refusing unsafe deploy"
-                exit 1
-              fi
-              sleep 20
+            test -s .env
+            python3 - <<'PY'
+            from pathlib import Path
+            import json,urllib.request
+            values=dict(l.split("=",1) for l in Path(".env").read_text().splitlines() if "=" in l and not l.startswith("#"))
+            assert values.get("BEONMEET_STAGING_NO_POLL")=="1","Google recorder acceptance still required"
+            assert values.get("AUTOSCALE_ENABLED")=="false"
+            with urllib.request.urlopen("http://127.0.0.1:9124/capacity",timeout=10) as r:
+                data=json.load(r)
+            assert int((data.get("data") or data).get("runningJobs") or 0)==0,"Recorder busy"
+            print("SINGLE_WORKER_IDLE_NO_AUTOSCALE")
+            PY
+            stamp=$(date -u +%Y%m%dT%H%M%SZ)
+            cp -p .env ".env.before-controller-deploy-$stamp"
+            previous=$(git rev-parse HEAD)
+            git fetch origin ops/shared-vps-source-audit-20261022
+            git checkout --detach FETCH_HEAD
+            .venv/bin/python -m compileall -q app
+            systemctl restart beonmeet-controller
+            ready=0
+            for i in $(seq 1 20); do
+              if curl -fsS --max-time 3 http://127.0.0.1:8109/health >/dev/null; then ready=1;break;fi
+              sleep 2
             done
-
-            if [ "$PIPELINE_SAFE" != "1" ]; then
-              echo "Delivery pipeline did not reach a safe state within the deploy window"
-              exit 1
-            fi
-
-            echo "Server resources:"
-            free -h || true
-            df -h / || true
-            df -h /dev/shm || true
-            nproc || true
-
-            # The upstream TypeScript build can briefly exceed 1 GB. Add swap for small VPSes.
-            if ! swapon --show | grep -q '^/swapfile'; then
-              if [ ! -f /swapfile ]; then
-                fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
-                chmod 600 /swapfile
-                mkswap /swapfile
-              fi
-              swapon /swapfile || true
-            fi
-
-            if [ ! -f .internal_secret ]; then
-              openssl rand -hex 32 > .internal_secret
-              chmod 600 .internal_secret
-            fi
-            INTERNAL_SECRET="$(cat .internal_secret)"
-
-            if [ ! -f .postgres_password ]; then
-              openssl rand -hex 24 > .postgres_password
-              chmod 600 .postgres_password
-            fi
-            POSTGRES_PASSWORD="$(cat .postgres_password)"
-
-            cat > .env <<EOF
-            DOMAIN=beonmeet.smarbiz.sbs
-            BOT_EMAIL=meetrecorderbot@gmail.com
-            BOT_DISPLAY_NAME=BeOnMeet Recorder
-            GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
-            GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
-            GOOGLE_REDIRECT_URI=https://beonmeet.smarbiz.sbs/auth/google/callback
-            TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-            ADMINUSER=${ADMINUSER}
-            TELEGRAM_API_BASE=https://api.telegram.org
-            INTERNAL_SECRET=${INTERNAL_SECRET}
-            POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-            MEETING_BOT_URL=http://meeting-bot-free1:3000
-            CONTROLLER_UPLOAD_URL=http://controller:8000/internal/recording-ready
-            CONTROLLER_STREAM_UPLOAD_URL=http://controller:8000/internal/recording-upload
-            RECORDING_TMP_DIR=/recordings
-            CALENDAR_POLL_SECONDS=30
-            EOF
-            chmod 600 .env
-
-            cat > .autoscale.env <<EOF
-            HETZNER_API_TOKEN=${HETZNER_API_TOKEN}
-            EOF
-            chmod 600 .autoscale.env
-
-            if [ -n "${HETZNER_API_TOKEN:-}" ]; then
-              echo "Checking Hetzner API token..."
-              HETZNER_STATUS="$(curl -sS -o /tmp/hetzner-token-check.json -w '%{http_code}' \
-                -H "Authorization: Bearer ${HETZNER_API_TOKEN}" \
-                "https://api.hetzner.cloud/v1/servers?per_page=1" || true)"
-              case "$HETZNER_STATUS" in
-                200)
-                  echo "Hetzner API token verified"
-                  ;;
-                429)
-                  echo "Hetzner API rate limited token check; continuing deploy and letting readiness smoke retry later"
-                  ;;
-                401|403)
-                  echo "Hetzner API token authentication failed with HTTP $HETZNER_STATUS"
-                  cat /tmp/hetzner-token-check.json || true
-                  exit 1
-                  ;;
-                *)
-                  echo "Hetzner API token check returned HTTP $HETZNER_STATUS; continuing deploy"
-                  cat /tmp/hetzner-token-check.json || true
-                  ;;
-              esac
-            fi
-
-            UPSTREAM_COMMIT=1447ed3a38ce052a694872141a9b7085189e8513
-            if [ ! -d upstream/.git ]; then
-              rm -rf upstream
-              git clone https://github.com/screenappai/meeting-bot.git upstream
-            fi
-            cd upstream
-            git fetch --all --tags --prune
-            git reset --hard "${UPSTREAM_COMMIT}"
-            cd ..
-            cp patches/disk-uploader.ts upstream/src/middleware/disk-uploader.ts
-            cp patches/Dockerfile.chrome-cdp upstream/Dockerfile.chrome-cdp
-            cp patches/start-chrome-cdp.sh upstream/scripts/start-chrome-cdp.sh
-            cp patches/JobStore.ts upstream/src/lib/JobStore.ts
-            chmod +x upstream/scripts/start-chrome-cdp.sh
-            python3 patches/apply-upstream-fixes.py
-
-            # Build only Chromium and give TypeScript enough heap on small servers.
-            sed -i 's/npx playwright install --with-deps$/npx playwright install --with-deps chromium/' upstream/Dockerfile.production
-            sed -i 's/npx playwright install$/npx playwright install chromium/' upstream/Dockerfile.production
-            sed -i 's/RUN npm run build/RUN NODE_OPTIONS=--max-old-space-size=2048 npm run build/' upstream/Dockerfile.production
-
-            # Chrome profiles are bind-mounted. Never clear the host directory
-            # before docker cp, because that would delete the live source as well.
-            # Recover the primary profile from an isolated worker copy if an older
-            # deploy already emptied it.
-            mkdir -p /opt/beonmeet/chrome-profile
-            profile_has_data() {
-              [ -f "$1/Local State" ] || find "$1" -maxdepth 2 -name Preferences -type f -print -quit 2>/dev/null | grep -q .
-            }
-            if ! profile_has_data /opt/beonmeet/chrome-profile; then
-              for CANDIDATE in /opt/beonmeet/chrome-profile-free2 /opt/beonmeet/chrome-profile-premium1; do
-                if [ -d "$CANDIDATE" ] && profile_has_data "$CANDIDATE"; then
-                  echo "Recovering primary Chrome profile from $CANDIDATE"
-                  cp -a "$CANDIDATE"/. /opt/beonmeet/chrome-profile/
-                  break
-                fi
-              done
-            fi
-            rm -f /opt/beonmeet/chrome-profile/SingletonLock /opt/beonmeet/chrome-profile/SingletonSocket /opt/beonmeet/chrome-profile/SingletonCookie || true
-            chown -R 1001:1001 /opt/beonmeet/chrome-profile
-            chmod 700 /opt/beonmeet/chrome-profile
-
-            # Each recorder worker gets an isolated Chrome profile. Clone the known
-            # signed-in master only the first time; never overwrite an active worker
-            # profile during normal deploys.
-            for PROFILE in chrome-profile-free2 chrome-profile-premium1; do
-              if [ ! -d "/opt/beonmeet/$PROFILE/Default" ]; then
-                rm -rf "/opt/beonmeet/$PROFILE"
-                mkdir -p "/opt/beonmeet/$PROFILE"
-                cp -a /opt/beonmeet/chrome-profile/. "/opt/beonmeet/$PROFILE/"
-              fi
-              rm -f "/opt/beonmeet/$PROFILE/SingletonLock" "/opt/beonmeet/$PROFILE/SingletonSocket" "/opt/beonmeet/$PROFILE/SingletonCookie" || true
-              chown -R 1001:1001 "/opt/beonmeet/$PROFILE"
-              chmod 700 "/opt/beonmeet/$PROFILE"
-            done
-
-            mkdir -p /opt/beonmeet/recorder-accounts/recorder136
-            mkdir -p /opt/beonmeet/recorder-accounts/recorder802
-            chown -R 1001:1001 /opt/beonmeet/recorder-accounts
-            chmod 700 /opt/beonmeet/recorder-accounts
-            chmod 700 /opt/beonmeet/recorder-accounts/recorder136 /opt/beonmeet/recorder-accounts/recorder802
-            # Both secondary recorder profiles have completed their one-time Google sign-in.
-            # recorder136 -> meetrecorderbot136@gmail.com
-            # recorder802 -> ceramara67@gmail.com
-            touch /opt/beonmeet/recorder-accounts/recorder136/.beonmeet-ready
-            touch /opt/beonmeet/recorder-accounts/recorder802/.beonmeet-ready
-            chown 1001:1001 /opt/beonmeet/recorder-accounts/recorder136/.beonmeet-ready /opt/beonmeet/recorder-accounts/recorder802/.beonmeet-ready
-            mkdir -p /dev/shm/beonmeet
-            chmod 777 /dev/shm/beonmeet
-            # Keep a valid bind target for the controller while the runtime
-            # image bundle is rebuilt below.
-            touch /opt/beonmeet/autoscale-images.tar
-            if ! docker compose up -d --build --remove-orphans; then
-              docker compose ps -a || true
-              docker compose logs --tail=250 controller postgres redis meeting-bot-free1 meeting-bot-free2 meeting-bot-premium1 chrome-cdp-free1 chrome-cdp-free2 chrome-cdp-premium1 caddy || true
-              exit 1
-            fi
-            # Package already-built production images for fresh Hetzner workers.
-            # This avoids compiling Chromium/Playwright/TypeScript on every scale-up.
-            docker build -t beonmeet-worker-agent:latest -f worker/Dockerfile .
-            docker save \
-              beonmeet-meeting-bot:latest \
-              beonmeet-chrome-cdp:latest \
-              beonmeet-worker-agent:latest \
-              -o /opt/beonmeet/autoscale-images.tar
-            chmod 600 /opt/beonmeet/autoscale-images.tar
-            docker compose up -d --force-recreate caddy
-            # Keep the one-time Google login browsers reachable only while
-            # a secondary recorder profile still needs its first sign-in.
-            # Once both profiles are activated, stop the setup browsers so they
-            # do not consume production CPU/RAM.
-            if [ ! -f /opt/beonmeet/recorder-accounts/recorder136/.beonmeet-ready ] || [ ! -f /opt/beonmeet/recorder-accounts/recorder802/.beonmeet-ready ]; then
-              docker compose --profile recorder-setup up -d recorder-setup-136 recorder-setup-802
-            else
-              docker compose --profile recorder-setup stop recorder-setup-136 recorder-setup-802 || true
-            fi
-            docker compose ps
-
-            echo "Sending one-time full-file link for the interrupted meeting if its retained source still exists..."
-
-            for i in $(seq 1 30); do
-              if docker compose exec -T controller python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read().decode())"; then
-                docker compose exec -T controller python -c 'import json,os,redis; r=redis.Redis.from_url(os.environ.get("REDIS_URL","redis://redis:6379/0"),decode_responses=True); st=json.loads(r.get(os.environ.get("REDIS_STATE_KEY","beonmeet:controller:state")) or "{}"); items=list((st.get("premium_recoveries") or {}).values()); safe=[{"status":x.get("status"),"audio_delivered":bool(x.get("audio_delivered")),"transcript_delivered":bool(x.get("transcript_delivered")),"transcript_empty":bool(x.get("transcript_empty")),"last_error":bool(x.get("last_error")),"updated_at":x.get("updated_at")} for x in items]; print("PREMIUM_RECOVERY_STATUS="+json.dumps(safe,separators=(",",":")))'
-                exit 0
-              fi
-              sleep 5
-            done
-
-            echo "Controller health check failed"
-            docker compose logs --tail=200 controller postgres redis meeting-bot-free1 meeting-bot-free2 meeting-bot-premium1 chrome-cdp-free1 chrome-cdp-free2 chrome-cdp-premium1 caddy
-            exit 1
+            if [ "$ready" != 1 ]; then git checkout --detach "$previous";systemctl restart beonmeet-controller;exit 1;fi
+            curl -fsS --max-time 10 https://beonmeet.smarbiz.sbs/health >/dev/null
+            systemctl is-active --quiet rednotedownloader
+            nginx -t
+            echo BEONMEET_SINGLE_CONTROLLER_DEPLOYED_QUEUE_CLOSED_PENDING_GOOGLE_ACCEPTANCE
+            
