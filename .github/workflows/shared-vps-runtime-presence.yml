@@ -1,0 +1,23 @@
+name: Shared VPS runtime credential presence only
+on:
+  push:
+    branches: [ops/shared-vps-source-audit-20261022]
+    paths: [.github/workflows/shared-vps-runtime-presence.yml]
+permissions:
+  contents: read
+jobs:
+  presence:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Report names only
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ADMINUSER: ${{ secrets.ADMINUSER }}
+        run: |
+          python3 - <<'PY'
+          import os
+          for key in ["GOOGLE_CLIENT_ID","GOOGLE_CLIENT_SECRET","TELEGRAM_BOT_TOKEN","ADMINUSER"]:
+              print(key + ": " + ("PRESENT" if os.environ.get(key) else "NOT_CONFIGURED"))
+          PY
