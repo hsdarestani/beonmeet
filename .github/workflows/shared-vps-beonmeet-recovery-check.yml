@@ -91,14 +91,9 @@ jobs:
                     except Exception: pass
             PY
 
-            echo '=== ROOT DIRECTORIES MB ==='
-            du -xm --max-depth=1 / 2>/dev/null | sort -n | tail -15 || true
-            echo '=== VAR DIRECTORIES MB ==='
-            du -xm --max-depth=1 /var 2>/dev/null | sort -n | tail -15 || true
-            echo '=== USR DIRECTORIES MB ==='
-            du -xm --max-depth=1 /usr 2>/dev/null | sort -n | tail -15 || true
-            echo '=== MEMORY TOP RSS ==='
-            ps -eo comm,rss --sort=-rss | head -18 || true
-            echo '=== SSH AND BOT PRESENCE ==='
-            systemctl is-enabled beonmeet-controller || true
-            systemctl show -p Restart -p MemoryMax -p CPUQuota beonmeet-controller || true
+            echo '=== VAR LIB SUBDIRECTORIES MB ==='
+            du -xm --max-depth=1 /var/lib 2>/dev/null | sort -n | tail -20 || true
+            echo '=== SRV SUBDIRECTORIES MB ==='
+            du -xm --max-depth=1 /srv 2>/dev/null | sort -n | tail -20 || true
+            echo '=== CONTAINERD SUBDIRECTORIES MB ==='
+            du -xm --max-depth=1 /var/lib/containerd 2>/dev/null | sort -n | tail -20 || true
