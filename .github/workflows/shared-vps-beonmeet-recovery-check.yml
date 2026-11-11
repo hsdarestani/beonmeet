@@ -90,3 +90,15 @@ jobs:
                     try: print('table',t,'rows',con.execute('select count(*) from "'+t.replace('"','""')+'"').fetchone()[0])
                     except Exception: pass
             PY
+
+            echo '=== ROOT DIRECTORIES MB ==='
+            du -xm --max-depth=1 / 2>/dev/null | sort -n | tail -15 || true
+            echo '=== VAR DIRECTORIES MB ==='
+            du -xm --max-depth=1 /var 2>/dev/null | sort -n | tail -15 || true
+            echo '=== USR DIRECTORIES MB ==='
+            du -xm --max-depth=1 /usr 2>/dev/null | sort -n | tail -15 || true
+            echo '=== MEMORY TOP RSS ==='
+            ps -eo comm,rss --sort=-rss | head -18 || true
+            echo '=== SSH AND BOT PRESENCE ==='
+            systemctl is-enabled beonmeet-controller || true
+            systemctl show -p Restart -p MemoryMax -p CPUQuota beonmeet-controller || true
