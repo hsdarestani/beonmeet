@@ -1,0 +1,66 @@
+name: Verify activated BeOnMeet with CamCam
+on:
+  push:
+    branches: [ops/shared-vps-source-audit-20261022]
+    paths: [.github/workflows/verify-beonmeet-active-20261111.yml]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check configured runtime and external endpoints without user data
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 2m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            echo "=== RUNTIME CONFIG ==="
+            python3 - <<'PY'
+            from pathlib import Path
+            e=dict(line.split('=',1) for line in Path('.env').read_text().splitlines() if '=' in line and not line.startswith('#'))
+            for k in ('BEONMEET_STAGING_NO_POLL','FREE_MEETING_SLOTS','PREMIUM_MEETING_SLOTS','AUTOSCALE_ENABLED'):
+                print(k+'='+e.get(k,'UNSET'))
+            PY
+            echo "=== HEALTH ==="
+            python3 - <<'PY'
+            import json,urllib.request
+            urls=('http://127.0.0.1:8109/health','http://127.0.0.1:9124/capacity','https://beonmeet.smarbiz.sbs/health')
+            keys=('ok','calendar_connected','personal_calendar_connections','recorder_account_profiles','local_free_meeting_slots','local_premium_reserved_slots','redis_state','database_backend','healthy_free_workers','healthy_premium_workers','maxConcurrentJobs','runningJobs','availableSlots','free_queue','premium_queue')
+            for url in urls:
+                data=json.load(urllib.request.urlopen(url,timeout=8))
+                if 'capacity' in url: data=data.get('data') or data
+                print(url,{k:data[k] for k in keys if k in data})
+            PY
+            echo "=== TELEGRAM API ==="
+            python3 - <<'PY'
+            from pathlib import Path
+            import json,urllib.request
+            token=dict(line.split('=',1) for line in Path('.env').read_text().splitlines() if '=' in line and not line.startswith('#')).get('TELEGRAM_BOT_TOKEN')
+            for method in ('getMe','getWebhookInfo'):
+                try:
+                    data=json.load(urllib.request.urlopen('https://api.telegram.org/bot'+token+'/'+method,timeout=8))
+                    info=data.get('result') or {}
+                    if method=='getMe': print('bot_ok',data.get('ok'),'username',info.get('username'))
+                    else: print('webhook_ok',data.get('ok'),'webhook_enabled',bool(info.get('url')),'pending_updates',info.get('pending_update_count'))
+                except Exception as ex: print(method,type(ex).__name__)
+            PY
+            echo "=== SERVICE AND ERRORS ==="
+            systemctl is-active beonmeet-controller
+            python3 - <<'PY'
+            import subprocess
+            output=subprocess.run(['journalctl','-u','beonmeet-controller','--since','-5 min','--no-pager','-o','cat'],capture_output=True,text=True).stdout
+            print('recent_controller_log_lines',len(output.splitlines()))
+            for word in ('telegram_loop','Conflict','Unauthorized','Traceback','Error','Exception','startup'):
+                print('controller_log_'+word+'_count',output.count(word))
+            PY
+            echo "=== CAMCAM ==="
+            docker inspect -f '{{.Name}} {{.State.Health.Status}}' camcam-shared-api-1 camcam-shared-db-1
+            echo "=== STORAGE ==="
+            df -h /
+            echo BEONMEET_POST_ACTIVATION_VERIFIED
