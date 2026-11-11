@@ -49,3 +49,44 @@ jobs:
             getent ahostsv4 beonmeet.smarbiz.sbs | head -2 || true
             echo '=== NGINX ==='
             nginx -t 2>&1 | tail -3 || true
+
+            echo '=== DISK BREAKDOWN ==='
+            for p in /var/lib/docker /var/log /var/log/journal /opt /root /tmp /var/cache/apt /opt/beonmeet/data; do test -e "$p" && du -shx "$p" 2>/dev/null || true; done
+            echo '=== DOCKER DISK ==='
+            docker system df 2>/dev/null || true
+            echo '=== SHARED MEMORY ==='
+            df -h /dev/shm
+            echo '=== HEALTH FLAGS (NO TOKENS/USER INFO) ==='
+            python3 - <<'PY'
+            import json,urllib.request
+            for u in ('http://127.0.0.1:8109/health','http://127.0.0.1:9124/capacity'):
+                try:
+                    d=json.load(urllib.request.urlopen(u,timeout=5))
+                    allow=('ok','calendar_connected','redis_state','database_backend','free_meeting_slots','premium_reserved_slots','healthy_free_workers','healthy_premium_workers','recorder_account_profiles','active_recordings','runningJobs','maxConcurrentJobs','availableSlots','status','autoscaler_enabled','telegram_enabled')
+                    if 'capacity' in u: d=d.get('data') or d
+                    print(u, {k:d[k] for k in allow if k in d})
+                except Exception as e: print(u,type(e).__name__)
+            PY
+            echo '=== TELEGRAM TOKEN VALIDITY (NO TOKEN OUTPUT) ==='
+            python3 - <<'PY'
+            from pathlib import Path
+            import json,urllib.request
+            d=dict(l.split('=',1) for l in Path('.env').read_text().splitlines() if '=' in l and not l.startswith('#'))
+            t=d.get('TELEGRAM_BOT_TOKEN')
+            try:
+                ans=json.load(urllib.request.urlopen('https://api.telegram.org/bot'+t+'/getMe',timeout=8))
+                print('getMe_ok='+str(ans.get('ok')),'username='+str((ans.get('result') or {}).get('username')))
+            except Exception as e: print('getMe_failed='+type(e).__name__)
+            PY
+            echo '=== SQLITE COUNTS ONLY ==='
+            python3 - <<'PY'
+            import sqlite3
+            from pathlib import Path
+            p=Path('data/beonmeet.db')
+            if p.exists():
+                con=sqlite3.connect(str(p))
+                tables=[r[0] for r in con.execute("select name from sqlite_master where type='table' and name not like 'sqlite_%'")]
+                for t in tables:
+                    try: print('table',t,'rows',con.execute('select count(*) from "'+t.replace('"','""')+'"').fetchone()[0])
+                    except Exception: pass
+            PY
