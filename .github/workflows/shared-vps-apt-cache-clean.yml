@@ -1,0 +1,33 @@
+name: Safe apt cache cleanup on shared VPS
+on:
+  push:
+    branches: [ops/shared-vps-source-audit-20261022]
+    paths: [.github/workflows/shared-vps-apt-cache-clean.yml]
+permissions:
+  contents: read
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Reclaim only APT package cache and verify services
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 2m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
+            echo BEFORE
+            df -h /
+            apt-get clean
+            echo AFTER
+            df -h /
+            curl -fsS --max-time 5 http://127.0.0.1:8109/health >/dev/null
+            systemctl is-active --quiet beonmeet-controller
+            nginx -t
+            docker ps --format '{{.Names}} {{.Status}}' |grep 'camcam-shared-api-1'
+            echo SAFE_APT_CACHE_CLEANED_NO_APP_DATA_TOUCHED
