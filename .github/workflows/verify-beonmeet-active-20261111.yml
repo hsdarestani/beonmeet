@@ -64,3 +64,31 @@ jobs:
             echo "=== STORAGE ==="
             df -h /
             echo BEONMEET_POST_ACTIVATION_VERIFIED
+
+            echo "=== POST GOOGLE AUTH VALIDATION ==="
+            python3 - <<'PY'
+            import json, urllib.request, subprocess
+            from pathlib import Path
+            h=json.load(urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=8))
+            for k in ('ok','calendar_connected','personal_calendar_connections','recorder_account_profiles','free_meeting_slots','free_queue','premium_queue','redis_state'):
+                print(k, h.get(k))
+            conf={}
+            for line in Path('/opt/beonmeet/.env').read_text().splitlines():
+                if '=' in line and not line.startswith('#'):
+                    k,v=line.split('=',1)
+                    if k=='BEONMEET_DATA_DIR': conf[k]=v
+            data=Path(conf.get('BEONMEET_DATA_DIR','/opt/beonmeet/data'))
+            print('local_data_dir',str(data))
+            print('legacy_google_token_present',(data/'google-token.json').exists())
+            other=Path('/opt/beonmeet/data/google-token.json')
+            print('opt_data_google_token_present',other.exists())
+            print('personal_token_count', len(list((data/'google-tokens').glob('*.json'))) if (data/'google-tokens').is_dir() else 0)
+            log=subprocess.run(['journalctl','-u','beonmeet-controller','--since','-12 min','--no-pager','-o','cat'],capture_output=True,text=True).stdout
+            for needle in ('legacy shared Calendar unavailable','invalid_grant','telegram loop','Conflict','Traceback'):
+                print('log_indicator_'+needle.replace(' ','_'),log.lower().count(needle.lower()))
+            PY
+            echo "=== RECORDER CDP HTTP ==="
+            curl -fsS --max-time 5 http://127.0.0.1:9123/json/version >/dev/null && echo CDP_OK || echo CDP_UNREACHABLE
+            echo "=== CAMCAM HEALTH ==="
+            docker inspect -f '{{.Name}} {{.State.Health.Status}}' camcam-shared-api-1 camcam-shared-db-1
+            echo "CALENDAR_CHECK_COMPLETE"
