@@ -1,0 +1,40 @@
+name: Bring BeOnMeet Telegram online on shared VPS
+on:
+  push:
+    branches: [ops/shared-vps-source-audit-20261022]
+    paths: [.github/workflows/activate-telegram-20261111.yml]
+permissions:
+  contents: read
+jobs:
+  activate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Back up and activate existing BeOnMeet service
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 3m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            test "$(df -Pk / | awk 'NR==2 {print $4}')" -gt 5000000
+            install -d -m 700 /root/ops-backups
+            cp -p .env /root/ops-backups/beonmeet.env.before-activation-$(date -u +%Y%m%d%H%M%S)
+            python3 - <<'PY'
+            from pathlib import Path
+            p=Path(".env")
+            changes={"BEONMEET_STAGING_NO_POLL":"0","FREE_MEETING_SLOTS":"1","PREMIUM_MEETING_SLOTS":"0","AUTOSCALE_ENABLED":"false"}
+            lines=[s for s in p.read_text().splitlines() if s.split("=",1)[0] not in changes]
+            p.write_text("\n".join(lines+[f"{k}={v}" for k,v in changes.items()])+"\n")
+            p.chmod(0o600)
+            PY
+            systemctl restart beonmeet-controller
+            sleep 3
+            curl -fsS http://127.0.0.1:8109/health >/dev/null
+            curl -fsS https://beonmeet.smarbiz.sbs/health >/dev/null
+            docker inspect -f '{{.State.Health.Status}}' camcam-shared-api-1 | grep -qx healthy
+            docker inspect -f '{{.State.Health.Status}}' camcam-shared-db-1 | grep -qx healthy
+            echo BEONMEET_ACTIVATION_DONE
