@@ -1,0 +1,74 @@
+name: Extend BeOnMeet shared VPS ext4 root to upgraded 30GB
+on:
+  push:
+    branches: [ops/shared-vps-source-audit-20261022]
+    paths: [.github/workflows/shared-vps-extend-root-20261111.yml]
+permissions:
+  contents: read
+concurrency:
+  group: shared-vps-storage-grow
+  cancel-in-progress: false
+jobs:
+  grow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Save partition metadata and application settings then extend ext4
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 6m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 120 9
+            rootdev=$(findmnt -n -o SOURCE /)
+            fstype=$(findmnt -n -o FSTYPE /)
+            test "$rootdev" = /dev/vda1
+            test "$fstype" = ext4
+            disk_bytes=$(blockdev --getsize64 /dev/vda)
+            part_bytes=$(blockdev --getsize64 /dev/vda1)
+            test "$disk_bytes" -ge 32000000000
+            test "$part_bytes" -ge 19000000000
+            test "$part_bytes" -lt 32000000000
+            echo ROOT_VERIFIED DISK_BYTES="$disk_bytes" PART_BYTES="$part_bytes"
+            mkdir -p /root/ops-backups
+            stamp=$(date -u +%Y%m%dT%H%M%SZ)
+            back="/root/ops-backups/beonmeet-storage-grow-$stamp"
+            mkdir -m 700 "$back"
+            sfdisk --dump /dev/vda > "$back/partition-table.sfdisk"
+            cp -p /opt/beonmeet/.env "$back/beonmeet.env"
+            if test -f /opt/beonmeet/data/state.json; then cp -p /opt/beonmeet/data/state.json "$back/state.json"; fi
+            python3 - <<'PY'
+            import sqlite3
+            from pathlib import Path
+            src=Path('/opt/beonmeet/data/beonmeet.db')
+            out=Path('/root/ops-backups')
+            if src.is_file():
+                with sqlite3.connect(str(src)) as s:
+                    with sqlite3.connect(str(out/'beonmeet-db-before-disk-grow.sqlite')) as d:
+                        s.backup(d)
+                print('SQLITE_CONSISTENT_BACKUP_SAVED')
+            PY
+            echo '=== DRY RUN ==='
+            growpart -N /dev/vda 1 | tail -12
+            echo '=== GROW PARTITION ==='
+            growpart /dev/vda 1
+            udevadm settle || true
+            echo '=== GROW FILESYSTEM ==='
+            resize2fs /dev/vda1
+            echo '=== NEW CAPACITY ==='
+            lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
+            df -h /
+            test "$(df -Pk / | awk 'NR==2 {print $4}')" -gt 5000000
+            echo '=== POST-GROW HEALTH ==='
+            curl -fsS --max-time 8 http://127.0.0.1:8109/health >/dev/null
+            curl -fsS --max-time 8 https://beonmeet.smarbiz.sbs/health >/dev/null
+            docker inspect -f '{{.Name}} {{.State.Health.Status}}' camcam-shared-api-1 camcam-shared-db-1
+            nginx -t
+            echo ROOT_EXPANDED_AND_CAMCAM_HEALTHY
