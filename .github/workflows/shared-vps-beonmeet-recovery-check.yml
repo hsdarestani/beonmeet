@@ -1,0 +1,51 @@
+name: Read-only BeOnMeet shared VPS recovery check
+on:
+  push:
+    branches: [ops/shared-vps-source-audit-20261022]
+    paths: [.github/workflows/shared-vps-beonmeet-recovery-check.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Read server health without modifying services or secrets
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 3m
+          script: |
+            set -u
+            echo '=== RESOURCE STATUS ==='
+            uptime
+            free -m
+            df -h /
+            df -i /
+            echo '=== SYSTEM SERVICES ==='
+            for s in beonmeet-controller camcam rednotedownloader nginx docker; do printf '%s=' "$s";systemctl is-active "$s" || true;done
+            echo '=== BEONMEET CONFIG FLAGS ==='
+            cd /opt/beonmeet || exit 0
+            python3 - <<'PY'
+            from pathlib import Path
+            p=Path('.env')
+            if not p.exists(): print('env_file=MISSING')
+            else:
+                values=dict(line.split('=',1) for line in p.read_text().splitlines() if '=' in line and not line.startswith('#'))
+                for k in ('BEONMEET_STAGING_NO_POLL','FREE_MEETING_SLOTS','PREMIUM_MEETING_SLOTS','AUTOSCALE_ENABLED','GOOGLE_REDIRECT_URI'):
+                    print(k+'='+values.get(k,'NOT_SET'))
+                for k in ('TELEGRAM_BOT_TOKEN','GOOGLE_CLIENT_ID','GOOGLE_CLIENT_SECRET','ADMINUSER'):
+                    print(k+'='+('PRESENT' if values.get(k) else 'MISSING'))
+            print('sqlite_exists='+str(Path('data/beonmeet.db').exists()))
+            PY
+            echo '=== LOCAL CHECKS (HTTP CODES ONLY) ==='
+            for u in http://127.0.0.1:8109/health http://127.0.0.1:9124/health http://127.0.0.1:9124/capacity https://beonmeet.smarbiz.sbs/health; do printf '%s ' "$u"; curl -L -sS --max-time 8 -o /dev/null -w '%{http_code}\n' "$u" || true; done
+            echo '=== RELEVANT CONTAINERS ==='
+            docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null | grep -Ei 'beonmeet|camcam|redis' | head -25 || true
+            echo '=== DNS ==='
+            getent ahostsv4 beonmeet.smarbiz.sbs | head -2 || true
+            echo '=== NGINX ==='
+            nginx -t 2>&1 | tail -3 || true
