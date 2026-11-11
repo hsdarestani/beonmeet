@@ -1,4 +1,4 @@
-name: Read-only BeOnMeet shared VPS recovery check
+name: Read-only BeOnMeet shared VPS recovery check (post-upgrade)
 on:
   push:
     branches: [ops/shared-vps-source-audit-20261022]
@@ -97,3 +97,32 @@ jobs:
             du -xm --max-depth=1 /srv 2>/dev/null | sort -n | tail -20 || true
             echo '=== CONTAINERD SUBDIRECTORIES MB ==='
             du -xm --max-depth=1 /var/lib/containerd 2>/dev/null | sort -n | tail -20 || true
+
+            echo '=== OS / CGROUP MEMORY ==='
+            nproc
+            grep -E '^(MemTotal|MemAvailable|SwapTotal)' /proc/meminfo || true
+            echo '=== GOOGLE RECORDER ACCOUNT PROFILES (PRESENCE) ==='
+            for p in /opt/beonmeet/chrome-profile /opt/beonmeet/recorder-accounts /opt/beonmeet/data; do
+              if test -d "$p"; then echo "$p exists"; find "$p" -maxdepth 1 -mindepth 1 -printf '%f\n' | head -15; else echo "$p absent"; fi
+            done
+            echo '=== TELEGRAM WEBHOOK STATUS (NO TOKENS) ==='
+            python3 - <<'PY'
+            from pathlib import Path
+            import json,urllib.request
+            e=dict(l.split('=',1) for l in Path('/opt/beonmeet/.env').read_text().splitlines() if '=' in l and not l.startswith('#'))
+            token=e.get('TELEGRAM_BOT_TOKEN')
+            try:
+                x=json.load(urllib.request.urlopen('https://api.telegram.org/bot'+token+'/getWebhookInfo',timeout=8))
+                d=x.get('result') or {}
+                print('telegram_webhook_exists=',bool(d.get('url')),'pending_update_count=',d.get('pending_update_count'), 'has_custom_certificate=',d.get('has_custom_certificate'))
+            except Exception as exc:
+                print('telegram_webhook_check_failed=',type(exc).__name__)
+            PY
+            echo '=== GOOGLE LOCAL TOKEN STORES ONLY (PRESENCE) ==='
+            python3 - <<'PY'
+            from pathlib import Path
+            root=Path('/opt/beonmeet')
+            for p in ('token.json','google_token.json','credentials.json','.env','data','chrome-profile','recorder-accounts'):
+                x=root/p
+                print(p,'exists=',x.exists(),'type=', 'dir' if x.is_dir() else 'file')
+            PY
