@@ -1,0 +1,33 @@
+name: Inspect upgraded VPS disk block device
+on:
+  push:
+    branches: [ops/shared-vps-source-audit-20261022]
+    paths: [.github/workflows/shared-vps-block-disk-check.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 2m
+          script: |
+            set -eu
+            echo '=== DISKS ==='
+            lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
+            echo '=== ROOT PARTITION / FS ==='
+            findmnt -n -o SOURCE,FSTYPE,SIZE,AVAIL /
+            echo '=== PHYSICAL BLOCK SIZE ==='
+            for dev in /dev/vda /dev/vda1; do if test -b "$dev"; then printf '%s ' "$dev"; blockdev --getsize64 "$dev"; fi; done
+            echo '=== GROW TOOLS ==='
+            for t in growpart resize2fs xfs_growfs; do command -v "$t" || true; done
+            echo '=== BASELINE CAMCAM ==='
+            docker inspect -f '{{.Name}} {{.State.Health.Status}}' camcam-shared-api-1 camcam-shared-db-1 || true
+            echo '=== ON DISK SQL BACKUP EXISTS ==='
+            test -e /opt/beonmeet/data/beonmeet.db && echo yes
