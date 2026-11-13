@@ -2696,7 +2696,7 @@ def public_shell(title: str, body: str) -> str:
 <title>{title}</title><meta name="description" content="BeOnMeet automatically joins scheduled Google Meet meetings, records them, and delivers the result to Telegram.">
 <style>{PUBLIC_SITE_CSS}</style></head>
 <body><div class="wrap"><nav class="nav"><a class="brand" href="/"><span class="mark">B</span>BeOnMeet</a>
-<div class="links"><a href="/#how">How it works</a><a href="/#plans">Plans</a><a href="/#data">Google data</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div></nav></div>
+<div class="links"><a href="/fa">فارسی</a><a href="/#how">How it works</a><a href="/#plans">Plans</a><a href="/#data">Google data</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div></nav></div>
 {body}
 <footer><div class="wrap foot"><span>© 2026 BeOnMeet</span><span><a href="/privacy">Privacy Policy</a><a href="/terms">Terms of Service</a></span></div></footer>
 </body></html>"""
@@ -2757,6 +2757,59 @@ async def home() -> str:
     return public_shell(
         "BeOnMeet | Google Meet recording plans",
         body.replace("__BOT_CTA__", bot_cta).replace("__PRICE_CARDS__", price_cards),
+    )
+
+
+@app.get("/fa", response_class=HTMLResponse)
+async def home_fa() -> str:
+    """Campaign landing page for Persian-speaking customers; no invented bot links."""
+    bot_url = os.environ.get("TELEGRAM_BOT_URL", "").strip()
+    verified_bot_url = bot_url if re.fullmatch(r"https://t\.me/[A-Za-z0-9_]+(?:\?start=[A-Za-z0-9_]+)?", bot_url) else ""
+    bot_cta = (
+        f'<a class="button" href="{verified_bot_url}" rel="noopener noreferrer">شروع در تلگرام</a>'
+        if verified_bot_url else
+        '<a class="button" href="mailto:meetrecorderbot@gmail.com?subject=BeOnMeet%20access">درخواست دسترسی</a>'
+    )
+    plan_cards = "".join(
+        '<div class="card" style="text-align:right"><b>' + PUBLIC_PLANS[code]["label"] + '</b>'
+        + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>تومان / ۳۰ روز</small></div>'
+        + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' ساعت ضبط جلسه</div>'
+        + '<p>اعتبار مربوط به مجموع مدت ضبط در دوره اشتراک است. ضبط جدید بعد از پایان سهمیه پذیرفته نمی‌شود.</p>'
+        + '</div>'
+        for code in PUBLIC_PLAN_CODES
+    )
+    body = """
+<main lang="fa" dir="rtl">
+<section class="hero"><div class="wrap">
+<span class="eyebrow">ضبط و دریافت جلسات Google Meet در تلگرام</span>
+<h1>جلسه‌ات را از دست نده. BeOnMeet ضبطش می‌کند.</h1>
+<p>لینک Google Meet را به ربات بده یا تقویم Google را متصل کن. ربات در زمان جلسه برای ورود اقدام می‌کند و پس از پذیرفته‌شدن توسط میزبان، جلسه را ضبط و فایل را در تلگرام ارسال می‌کند.</p>
+<div class="cta">__BOT_CTA__<a class="button secondary" href="#plans">مشاهده قیمت‌ها</a></div>
+</div></section>
+<section id="plans" class="section"><div class="wrap">
+<h2>پلن‌های شفاف و ساعتی</h2>
+<p>هر خرید ۳۰ روز اعتبار دارد و تمدید خودکار نیست. هزینه اضافی بابت ساعت مازاد به‌صورت خودکار دریافت نمی‌شود. تغییر پلن در میانه دوره نیاز به هماهنگی پشتیبانی دارد.</p>
+<div class="grid prices">__PRICE_CARDS__</div>
+<div class="cta">__BOT_CTA__</div>
+</div></section>
+<section id="how" class="section"><div class="wrap">
+<h2>چطور کار می‌کند؟</h2>
+<div class="grid">
+<div class="card"><b>۱. لینک جلسه یا اتصال تقویم</b><p>لینک جلسه را بفرست. برای تشخیص خودکار جلسات، امکان اتصال Google Calendar هم وجود دارد.</p></div>
+<div class="card"><b>۲. ورود ربات به جلسه</b><p>بسته به تنظیمات Google Meet ممکن است میزبان لازم باشد ربات را تأیید و وارد کند.</p></div>
+<div class="card"><b>۳. دریافت فایل</b><p>ویدیو به تلگرام ارسال می‌شود. فایل صوتی و متن خودکار در شرایط پشتیبانی‌شده ارائه می‌شوند و ممکن است خطا داشته باشند.</p></div>
+</div>
+<div class="notice">پیش از ضبط، مطمئن شو که اجازه ضبط جلسه را داری و اطلاع‌رسانی یا رضایت لازم از شرکت‌کنندگان گرفته شده است. ورود و ضبط صددرصد تضمین‌شده نیست.</div>
+</div></section>
+<section class="section"><div class="wrap">
+<h2>حریم خصوصی و شرایط استفاده</h2>
+<p>برای زمان‌بندی خودکار فقط دسترسی خواندن تقویم درخواست می‌شود. درباره داده‌ها، زمان نگهداری فایل‌ها و شرایط استفاده بیشتر بخوان.</p>
+<div class="cta"><a class="button secondary" href="/privacy">حریم خصوصی</a><a class="button secondary" href="/terms">شرایط استفاده</a></div>
+</div></section>
+</main>"""
+    return public_shell(
+        "BeOnMeet | ضبط جلسه گوگل میت در تلگرام",
+        body.replace("__BOT_CTA__", bot_cta).replace("__PRICE_CARDS__", plan_cards),
     )
 
 
