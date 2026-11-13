@@ -26,7 +26,7 @@ from state_store import DurableStateStore
 from db_compat import is_postgres
 from hetzner_autoscaler import router as autoscaler_router, autoscale_loop, enabled as autoscaler_enabled, profile_status
 from scaling_policy import order_queue
-from billing_policy import PUBLIC_PLAN_CODES, plan_description
+from billing_policy import PUBLIC_PLAN_CODES, PUBLIC_PLANS, plan_description
 from i18n import (
     BUTTON_ACTIONS,
     LANGUAGE_BUTTONS,
@@ -2684,7 +2684,7 @@ async def health() -> dict[str, Any]:
 PUBLIC_SITE_CSS = """
 :root{color-scheme:dark;--bg:#07110f;--panel:#0d1c18;--text:#f4fbf8;--muted:#a9bbb5;--line:#1e3730;--accent:#65e6b5;--accent2:#8ca8ff}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% 0,#12352b 0,transparent 34rem),var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.6}
-a{color:inherit}.wrap{width:min(1120px,calc(100% - 40px));margin:auto}.nav{display:flex;align-items:center;justify-content:space-between;padding:26px 0}.brand{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:-.02em;text-decoration:none}.mark{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(145deg,var(--accent),var(--accent2));color:#06110e;font-weight:900}.links{display:flex;gap:22px;color:var(--muted);font-size:14px}.links a{text-decoration:none}.hero{padding:88px 0 58px}.eyebrow{display:inline-flex;padding:7px 12px;border:1px solid var(--line);border-radius:999px;color:var(--accent);background:#0a1714;font-size:13px}.hero h1{max-width:820px;font-size:clamp(44px,7vw,82px);line-height:1.02;letter-spacing:-.055em;margin:24px 0}.hero p{max-width:720px;font-size:20px;color:var(--muted);margin:0}.cta{margin-top:34px;display:flex;flex-wrap:wrap;gap:12px}.button{display:inline-flex;padding:13px 18px;border-radius:12px;text-decoration:none;font-weight:750;background:var(--accent);color:#05110d}.button.secondary{background:transparent;color:var(--text);border:1px solid var(--line)}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:28px 0 80px}.card{padding:24px;border:1px solid var(--line);border-radius:20px;background:linear-gradient(180deg,#0d1d19,#091512)}.card b{display:block;margin-bottom:8px;font-size:17px}.card p{margin:0;color:var(--muted)}.section{padding:70px 0;border-top:1px solid var(--line)}.section h2{font-size:34px;letter-spacing:-.035em;margin:0 0 14px}.section>div>p{max-width:760px;color:var(--muted)}.data{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:28px}.notice{padding:22px;border-radius:18px;background:#0a1714;border:1px solid var(--line);color:var(--muted)}.notice strong{color:var(--text)}.legal{max-width:820px;padding:60px 0 100px}.legal h1{font-size:48px;letter-spacing:-.04em;line-height:1.1}.legal h2{margin-top:38px;font-size:24px}.legal p,.legal li{color:var(--muted)}.legal a{color:var(--accent)}footer{border-top:1px solid var(--line);padding:30px 0 42px;color:var(--muted);font-size:14px}.foot{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}.foot a{margin-left:18px;text-decoration:none}
+a{color:inherit}.wrap{width:min(1120px,calc(100% - 40px));margin:auto}.nav{display:flex;align-items:center;justify-content:space-between;padding:26px 0}.brand{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:-.02em;text-decoration:none}.mark{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(145deg,var(--accent),var(--accent2));color:#06110e;font-weight:900}.links{display:flex;gap:22px;color:var(--muted);font-size:14px}.links a{text-decoration:none}.hero{padding:88px 0 58px}.eyebrow{display:inline-flex;padding:7px 12px;border:1px solid var(--line);border-radius:999px;color:var(--accent);background:#0a1714;font-size:13px}.hero h1{max-width:820px;font-size:clamp(44px,7vw,82px);line-height:1.02;letter-spacing:-.055em;margin:24px 0}.hero p{max-width:720px;font-size:20px;color:var(--muted);margin:0}.cta{margin-top:34px;display:flex;flex-wrap:wrap;gap:12px}.button{display:inline-flex;padding:13px 18px;border-radius:12px;text-decoration:none;font-weight:750;background:var(--accent);color:#05110d}.button.secondary{background:transparent;color:var(--text);border:1px solid var(--line)}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:28px 0 80px}.prices{padding-bottom:20px}.price{font-size:clamp(27px,3vw,38px);font-weight:850;color:var(--accent);letter-spacing:-.045em;margin:8px 0}.price small{font-size:15px;font-weight:600;color:var(--muted)}.limit{font-size:19px;font-weight:750;color:var(--text);margin:14px 0}.card{padding:24px;border:1px solid var(--line);border-radius:20px;background:linear-gradient(180deg,#0d1d19,#091512)}.card b{display:block;margin-bottom:8px;font-size:17px}.card p{margin:0;color:var(--muted)}.section{padding:70px 0;border-top:1px solid var(--line)}.section h2{font-size:34px;letter-spacing:-.035em;margin:0 0 14px}.section>div>p{max-width:760px;color:var(--muted)}.data{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:28px}.notice{padding:22px;border-radius:18px;background:#0a1714;border:1px solid var(--line);color:var(--muted)}.notice strong{color:var(--text)}.legal{max-width:820px;padding:60px 0 100px}.legal h1{font-size:48px;letter-spacing:-.04em;line-height:1.1}.legal h2{margin-top:38px;font-size:24px}.legal p,.legal li{color:var(--muted)}.legal a{color:var(--accent)}footer{border-top:1px solid var(--line);padding:30px 0 42px;color:var(--muted);font-size:14px}.foot{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}.foot a{margin-left:18px;text-decoration:none}
 @media(max-width:760px){.links{display:none}.hero{padding-top:56px}.grid,.data{grid-template-columns:1fr}.hero p{font-size:18px}.legal h1{font-size:38px}}
 """
 
@@ -2694,7 +2694,7 @@ def public_shell(title: str, body: str) -> str:
 <title>{title}</title><meta name="description" content="BeOnMeet automatically joins scheduled Google Meet meetings, records them, and delivers the result to Telegram.">
 <style>{PUBLIC_SITE_CSS}</style></head>
 <body><div class="wrap"><nav class="nav"><a class="brand" href="/"><span class="mark">B</span>BeOnMeet</a>
-<div class="links"><a href="/#how">How it works</a><a href="/#data">Google data</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div></nav></div>
+<div class="links"><a href="/#how">How it works</a><a href="/#plans">Plans</a><a href="/#data">Google data</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div></nav></div>
 {body}
 <footer><div class="wrap foot"><span>© 2026 BeOnMeet</span><span><a href="/privacy">Privacy Policy</a><a href="/terms">Terms of Service</a></span></div></footer>
 </body></html>"""
@@ -2702,13 +2702,36 @@ def public_shell(title: str, body: str) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def home() -> str:
+    # The bot's actual Telegram username must be configured before ads launch.
+    # Never invent a Telegram destination for paid marketing.
+    bot_url = os.environ.get("TELEGRAM_BOT_URL", "").strip()
+    verified_bot_url = bot_url if re.fullmatch(r"https://t\\.me/[A-Za-z0-9_]+(?:\\?start=[A-Za-z0-9_]+)?", bot_url) else ""
+    bot_cta = (
+        f'<a class="button" href="{verified_bot_url}" rel="noopener noreferrer">Start in Telegram</a>'
+        if verified_bot_url else
+        '<a class="button" href="mailto:meetrecorderbot@gmail.com?subject=BeOnMeet%20access">Request access</a>'
+    )
+    price_cards = "".join(
+        '<div class="card"><b>' + PUBLIC_PLANS[code]["label"] + '</b>'
+        + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>toman / 30 days</small></div>'
+        + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' hours recording</div>'
+        + '<p>Usage is measured across successfully recorded meetings in the subscription period. New recording requests are blocked when the allowance is used.</p>'
+        + '</div>'
+        for code in PUBLIC_PLAN_CODES
+    )
     body = """
 <main>
 <section class="hero"><div class="wrap">
 <span class="eyebrow">Automatic Google Meet recorder for Telegram</span>
 <h1>Your calendar knows the meeting. BeOnMeet handles the rest.</h1>
 <p>Connect Google Calendar once. BeOnMeet detects scheduled Google Meet events across your accessible calendars, joins at meeting time, records the session and delivers the result to your Telegram chat.</p>
-<div class="cta"><a class="button" href="#how">See how it works</a><a class="button secondary" href="/privacy">How Google data is used</a></div>
+<div class="cta">__BOT_CTA__<a class="button secondary" href="#plans">Compare plans</a></div>
+</div></section>
+<section id="plans" class="section"><div class="wrap">
+<h2>Simple plans, predictable recording hours</h2>
+<p>All plans are valid for 30 days. There is no promise of unlimited recordings or guaranteed entry to every meeting. Payment and activation happen through the bot.</p>
+<div class="grid prices">__PRICE_CARDS__</div>
+<div class="cta">__BOT_CTA__<a class="button secondary" href="/terms">Plan terms</a></div>
 </div></section>
 <section id="how"><div class="wrap grid">
 <div class="card"><b>1. Connect once with Premium</b><p>Premium users authorize read only access to Google Calendar from the BeOnMeet Telegram bot.</p></div>
@@ -2729,7 +2752,10 @@ async def home() -> str:
 <p>Meeting recordings and eligible Premium outputs such as separate audio and transcripts are delivered through Telegram. Temporary delivery files are retained only as needed to complete delivery and, depending on plan, may remain available for up to 72 hours before expiry.</p>
 </div></section>
 </main>"""
-    return public_shell("BeOnMeet | Automatic Google Meet recording", body)
+    return public_shell(
+        "BeOnMeet | Google Meet recording plans",
+        body.replace("__BOT_CTA__", bot_cta).replace("__PRICE_CARDS__", price_cards),
+    )
 
 
 @app.get("/privacy", response_class=HTMLResponse)
@@ -2784,7 +2810,8 @@ async def terms_of_service() -> str:
 <h2>Availability</h2>
 <p>We work to provide reliable automatic joining and delivery, but admission controls, network conditions, third party outages, capacity limits or meeting configuration can prevent or delay recording. A host may need to admit the recorder.</p>
 <h2>Plans and temporary files</h2>
-<p>Free and Premium plans can have different recording limits, quality, output and retention features. Temporary delivery and download files expire according to the applicable plan and service configuration.</p>
+<p>New Basic, Pro and Business subscriptions last 30 days and include respectively 2, 6 and 15 hours of recorded meetings. Usage is measured by the duration of completed recordings. When the recording allowance is exhausted, new recording requests are blocked until the next subscription period or a support-assisted upgrade. A recording that is already in progress is allowed to finish and may use more than the remaining allowance. No additional hourly charge is made automatically. A new purchase while an active subscription exists is scheduled after the existing paid period unless handled by support. These subscriptions are not automatically renewed.</p>
+<p>Some older customers retain their original plan terms until their existing entitlement expires. Temporary delivery and download files expire according to the applicable plan and service configuration.</p>
 <h2>Privacy</h2>
 <p>Our handling of personal information and Google user data is described in the <a href="/privacy">Privacy Policy</a>.</p>
 <h2>Suspension</h2>
