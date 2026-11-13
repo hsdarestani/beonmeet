@@ -26,6 +26,7 @@ from state_store import DurableStateStore
 from db_compat import is_postgres
 from hetzner_autoscaler import router as autoscaler_router, autoscale_loop, enabled as autoscaler_enabled, profile_status
 from scaling_policy import order_queue
+from billing_policy import PUBLIC_PLAN_CODES, PUBLIC_PLANS, plan_description
 from i18n import (
     BUTTON_ACTIONS,
     LANGUAGE_BUTTONS,
@@ -42,6 +43,7 @@ from admin_panel import (
     create_payment_intent,
     find_recording_for_artifact,
     free_recording_entitlement,
+    paid_recording_entitlement,
     get_payment_intent,
     init_db,
     is_premium,
@@ -267,7 +269,7 @@ async def tg_text(
 
 async def send_subscription_offer(chat_id: int | str, message_key: str = "premium_offer") -> None:
     intents: dict[str, dict[str, Any]] = {}
-    for plan_code in ("monthly", "quarterly", "halfyear"):
+    for plan_code in PUBLIC_PLAN_CODES:
         intents[plan_code] = await asyncio.to_thread(
             create_payment_intent, str(chat_id), plan_code
         )
@@ -276,16 +278,16 @@ async def send_subscription_offer(chat_id: int | str, message_key: str = "premiu
     keyboard = {
         "inline_keyboard": [
             [{
-                "text": i18n_tr(lang, "plan_monthly"),
-                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['monthly']['intent']}",
+                "text": i18n_tr(lang, "plan_basic"),
+                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['basic']['intent']}",
             }],
             [{
-                "text": i18n_tr(lang, "plan_quarterly"),
-                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['quarterly']['intent']}",
+                "text": i18n_tr(lang, "plan_pro"),
+                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['pro']['intent']}",
             }],
             [{
-                "text": i18n_tr(lang, "plan_halfyear"),
-                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['halfyear']['intent']}",
+                "text": i18n_tr(lang, "plan_business"),
+                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['business']['intent']}",
             }],
         ]
     }
@@ -737,6 +739,47 @@ async def _free_recording_allowed(
     return False
 
 
+async def _paid_recording_allowed(
+    chat_id: str,
+    *,
+    event_id: str = "",
+    notify: bool = True,
+) -> bool:
+    """Enforce paid recording-hour quotas before dispatch or queue activation.
+
+    Completed recordings are persisted in the DB. For jobs already accepted or
+    queued, conservatively reserve an hour each to reduce concurrent overspend.
+    The upstream recorder still has its own max-duration safety limit; existing
+    in-flight recordings are never silently stopped by this check.
+    """
+    quota = await asyncio.to_thread(paid_recording_entitlement, str(chat_id))
+    if not quota.get("premium"):
+        return True
+    remaining = quota.get("remaining_seconds")
+    if remaining is None:
+        return True  # protect grandfathered unlimited legacy subscriptions
+    busy_ids = set()
+    for item in state.get("join_queue", []):
+        req = item.get("req") or {}
+        eid = str(item.get("event_id") or "")
+        if eid and eid != event_id and str(req.get("chat_id") or "") == str(chat_id):
+            busy_ids.add(eid)
+    for eid, item in state.get("launched_events", {}).items():
+        if str(eid) != event_id and str((item or {}).get("chat_id") or "") == str(chat_id):
+            if str((item or {}).get("status") or "") in {"remote_claimed", "joining", "waiting_for_admission", "recording", "delivering"}:
+                busy_ids.add(str(eid))
+    reserved = len(busy_ids) * 3600
+    if remaining > reserved:
+        return True
+    if notify:
+        used = int(quota.get("used_seconds") or 0)
+        limit = int(quota.get("quota_seconds") or 0)
+        await tg_text(chat_id, t(chat_id, "paid_quota_reached",
+                                used=round(used / 60), limit=round(limit / 60)))
+        await send_subscription_offer(chat_id)
+    return False
+
+
 async def enqueue_meeting(
     event: dict[str, Any],
     req: dict[str, Any],
@@ -856,6 +899,8 @@ async def launch_meeting(
         notify=True,
     ):
         return False
+    if premium and not await _paid_recording_allowed(chat_id, event_id=event_id):
+        return False
 
     launched, busy, pool_name = await _dispatch_meeting(
         event, req, meet_url, premium
@@ -961,6 +1006,13 @@ async def queue_loop() -> None:
                         await tg_text(chat_id, t(chat_id, "queue_expired"))
                         continue
 
+                    if premium and not await _paid_recording_allowed(chat_id, event_id=event_id):
+                        state["join_queue"] = [
+                            q for q in state.get("join_queue", [])
+                            if str(q.get("event_id") or "") != event_id
+                        ]
+                        await save_state()
+                        continue
                     # Serialize local queue dispatch with remote worker claims.
                     # Without this lock, a remote worker and the local pool could
                     # pick the same meeting at exactly the same moment.
@@ -1372,11 +1424,20 @@ async def telegram_loop() -> None:
                 if text.startswith("/plans") or text.startswith("/premium"):
                     info = await asyncio.to_thread(subscription_info, str(chat_id))
                     if info.get("premium"):
-                        until = info.get("until")
+                        until = info.get("period_end") or info.get("until")
                         until_text = until.astimezone().strftime("%Y-%m-%d") if until else ""
+                        balance = await asyncio.to_thread(paid_recording_entitlement, str(chat_id))
+                        remain = balance.get("remaining_seconds")
+                        remaining_label = (
+                            t(chat_id, "quota_legacy") if remain is None
+                            else t(chat_id, "quota_remaining", minutes=int(remain // 60),
+                                   used=int(balance.get("used_seconds") or 0) // 60)
+                        )
                         await tg_text(
                             chat_id,
-                            t(chat_id, "premium_active", until=until_text),
+                            t(chat_id, "premium_active", until=until_text)
+                            + "\n\n" + plan_description(str(info.get("plan") or ""))
+                            + "\n" + remaining_label,
                             with_menu=True,
                         )
                     else:
@@ -1999,7 +2060,7 @@ async def billing_payment_intent(intent: str) -> dict[str, Any]:
         "status": row.get("status"),
         "plan": row.get("plan_code"),
         "amount_toman": int(row.get("amount_toman") or 0),
-        "label": f"پلن ویژه BeOnMeet، {plan['label']}",
+        "label": f"اشتراک BeOnMeet، {plan['label']}",
     }
 
 
@@ -2034,8 +2095,10 @@ async def billing_payment_return(payment: str = "", receipt: str = "", intent: s
     already_paid = row.get("status") == "paid"
     paid_row = await asyncio.to_thread(mark_payment_paid, intent, receipt)
     telegram_id = str((paid_row or row).get("telegram_id") or "")
+    # Apply even if the payment was marked paid during a previous attempt.
+    # activate_subscription deduplicates on the verified receipt.
+    until = await asyncio.to_thread(activate_subscription, telegram_id, expected_plan, f"Zibal receipt {receipt}")
     if not already_paid:
-        until = await asyncio.to_thread(activate_subscription, telegram_id, expected_plan, f"Zibal receipt {receipt}")
         await tg_text(
             telegram_id,
             t(
@@ -2138,6 +2201,10 @@ async def remote_worker_claim(
                 continue
             event_id = str(item.get("event_id") or "")
             if not event_id or not _is_queued(event_id):
+                continue
+            req = item.get("req") or {}
+            chat_id = str(req.get("chat_id") or "")
+            if premium and not await _paid_recording_allowed(chat_id, event_id=event_id, notify=False):
                 continue
             chosen = item
             state["join_queue"] = [
@@ -2619,7 +2686,7 @@ async def health() -> dict[str, Any]:
 PUBLIC_SITE_CSS = """
 :root{color-scheme:dark;--bg:#07110f;--panel:#0d1c18;--text:#f4fbf8;--muted:#a9bbb5;--line:#1e3730;--accent:#65e6b5;--accent2:#8ca8ff}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% 0,#12352b 0,transparent 34rem),var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.6}
-a{color:inherit}.wrap{width:min(1120px,calc(100% - 40px));margin:auto}.nav{display:flex;align-items:center;justify-content:space-between;padding:26px 0}.brand{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:-.02em;text-decoration:none}.mark{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(145deg,var(--accent),var(--accent2));color:#06110e;font-weight:900}.links{display:flex;gap:22px;color:var(--muted);font-size:14px}.links a{text-decoration:none}.hero{padding:88px 0 58px}.eyebrow{display:inline-flex;padding:7px 12px;border:1px solid var(--line);border-radius:999px;color:var(--accent);background:#0a1714;font-size:13px}.hero h1{max-width:820px;font-size:clamp(44px,7vw,82px);line-height:1.02;letter-spacing:-.055em;margin:24px 0}.hero p{max-width:720px;font-size:20px;color:var(--muted);margin:0}.cta{margin-top:34px;display:flex;flex-wrap:wrap;gap:12px}.button{display:inline-flex;padding:13px 18px;border-radius:12px;text-decoration:none;font-weight:750;background:var(--accent);color:#05110d}.button.secondary{background:transparent;color:var(--text);border:1px solid var(--line)}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:28px 0 80px}.card{padding:24px;border:1px solid var(--line);border-radius:20px;background:linear-gradient(180deg,#0d1d19,#091512)}.card b{display:block;margin-bottom:8px;font-size:17px}.card p{margin:0;color:var(--muted)}.section{padding:70px 0;border-top:1px solid var(--line)}.section h2{font-size:34px;letter-spacing:-.035em;margin:0 0 14px}.section>div>p{max-width:760px;color:var(--muted)}.data{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:28px}.notice{padding:22px;border-radius:18px;background:#0a1714;border:1px solid var(--line);color:var(--muted)}.notice strong{color:var(--text)}.legal{max-width:820px;padding:60px 0 100px}.legal h1{font-size:48px;letter-spacing:-.04em;line-height:1.1}.legal h2{margin-top:38px;font-size:24px}.legal p,.legal li{color:var(--muted)}.legal a{color:var(--accent)}footer{border-top:1px solid var(--line);padding:30px 0 42px;color:var(--muted);font-size:14px}.foot{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}.foot a{margin-left:18px;text-decoration:none}
+a{color:inherit}.wrap{width:min(1120px,calc(100% - 40px));margin:auto}.nav{display:flex;align-items:center;justify-content:space-between;padding:26px 0}.brand{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:-.02em;text-decoration:none}.mark{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(145deg,var(--accent),var(--accent2));color:#06110e;font-weight:900}.links{display:flex;gap:22px;color:var(--muted);font-size:14px}.links a{text-decoration:none}.hero{padding:88px 0 58px}.eyebrow{display:inline-flex;padding:7px 12px;border:1px solid var(--line);border-radius:999px;color:var(--accent);background:#0a1714;font-size:13px}.hero h1{max-width:820px;font-size:clamp(44px,7vw,82px);line-height:1.02;letter-spacing:-.055em;margin:24px 0}.hero p{max-width:720px;font-size:20px;color:var(--muted);margin:0}.cta{margin-top:34px;display:flex;flex-wrap:wrap;gap:12px}.button{display:inline-flex;padding:13px 18px;border-radius:12px;text-decoration:none;font-weight:750;background:var(--accent);color:#05110d}.button.secondary{background:transparent;color:var(--text);border:1px solid var(--line)}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:28px 0 80px}.prices{padding-bottom:20px}.price{font-size:clamp(27px,3vw,38px);font-weight:850;color:var(--accent);letter-spacing:-.045em;margin:8px 0}.price small{font-size:15px;font-weight:600;color:var(--muted)}.limit{font-size:19px;font-weight:750;color:var(--text);margin:14px 0}.card{padding:24px;border:1px solid var(--line);border-radius:20px;background:linear-gradient(180deg,#0d1d19,#091512)}.card b{display:block;margin-bottom:8px;font-size:17px}.card p{margin:0;color:var(--muted)}.section{padding:70px 0;border-top:1px solid var(--line)}.section h2{font-size:34px;letter-spacing:-.035em;margin:0 0 14px}.section>div>p{max-width:760px;color:var(--muted)}.data{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:28px}.notice{padding:22px;border-radius:18px;background:#0a1714;border:1px solid var(--line);color:var(--muted)}.notice strong{color:var(--text)}.legal{max-width:820px;padding:60px 0 100px}.legal h1{font-size:48px;letter-spacing:-.04em;line-height:1.1}.legal h2{margin-top:38px;font-size:24px}.legal p,.legal li{color:var(--muted)}.legal a{color:var(--accent)}footer{border-top:1px solid var(--line);padding:30px 0 42px;color:var(--muted);font-size:14px}.foot{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}.foot a{margin-left:18px;text-decoration:none}
 @media(max-width:760px){.links{display:none}.hero{padding-top:56px}.grid,.data{grid-template-columns:1fr}.hero p{font-size:18px}.legal h1{font-size:38px}}
 """
 
@@ -2629,7 +2696,7 @@ def public_shell(title: str, body: str) -> str:
 <title>{title}</title><meta name="description" content="BeOnMeet automatically joins scheduled Google Meet meetings, records them, and delivers the result to Telegram.">
 <style>{PUBLIC_SITE_CSS}</style></head>
 <body><div class="wrap"><nav class="nav"><a class="brand" href="/"><span class="mark">B</span>BeOnMeet</a>
-<div class="links"><a href="/#how">How it works</a><a href="/#data">Google data</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div></nav></div>
+<div class="links"><a href="/fa">فارسی</a><a href="/#how">How it works</a><a href="/#plans">Plans</a><a href="/#data">Google data</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div></nav></div>
 {body}
 <footer><div class="wrap foot"><span>© 2026 BeOnMeet</span><span><a href="/privacy">Privacy Policy</a><a href="/terms">Terms of Service</a></span></div></footer>
 </body></html>"""
@@ -2637,13 +2704,36 @@ def public_shell(title: str, body: str) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def home() -> str:
+    # The bot's actual Telegram username must be configured before ads launch.
+    # Never invent a Telegram destination for paid marketing.
+    bot_url = os.environ.get("TELEGRAM_BOT_URL", "").strip()
+    verified_bot_url = bot_url if re.fullmatch(r"https://t\.me/[A-Za-z0-9_]+(?:\?start=[A-Za-z0-9_]+)?", bot_url) else ""
+    bot_cta = (
+        f'<a class="button" href="{verified_bot_url}" rel="noopener noreferrer">Start in Telegram</a>'
+        if verified_bot_url else
+        '<a class="button" href="mailto:meetrecorderbot@gmail.com?subject=BeOnMeet%20access">Request access</a>'
+    )
+    price_cards = "".join(
+        '<div class="card"><b>' + PUBLIC_PLANS[code]["label"] + '</b>'
+        + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>toman / 30 days</small></div>'
+        + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' hours recording</div>'
+        + '<p>Usage is measured across successfully recorded meetings in the subscription period. New recording requests are blocked when the allowance is used.</p>'
+        + '</div>'
+        for code in PUBLIC_PLAN_CODES
+    )
     body = """
 <main>
 <section class="hero"><div class="wrap">
 <span class="eyebrow">Automatic Google Meet recorder for Telegram</span>
 <h1>Your calendar knows the meeting. BeOnMeet handles the rest.</h1>
 <p>Connect Google Calendar once. BeOnMeet detects scheduled Google Meet events across your accessible calendars, joins at meeting time, records the session and delivers the result to your Telegram chat.</p>
-<div class="cta"><a class="button" href="#how">See how it works</a><a class="button secondary" href="/privacy">How Google data is used</a></div>
+<div class="cta">__BOT_CTA__<a class="button secondary" href="#plans">Compare plans</a></div>
+</div></section>
+<section id="plans" class="section"><div class="wrap">
+<h2>Simple plans, predictable recording hours</h2>
+<p>All plans are valid for 30 days. There is no promise of unlimited recordings or guaranteed entry to every meeting. Payment and activation happen through the bot.</p>
+<div class="grid prices">__PRICE_CARDS__</div>
+<div class="cta">__BOT_CTA__<a class="button secondary" href="/terms">Plan terms</a></div>
 </div></section>
 <section id="how"><div class="wrap grid">
 <div class="card"><b>1. Connect once with Premium</b><p>Premium users authorize read only access to Google Calendar from the BeOnMeet Telegram bot.</p></div>
@@ -2664,7 +2754,63 @@ async def home() -> str:
 <p>Meeting recordings and eligible Premium outputs such as separate audio and transcripts are delivered through Telegram. Temporary delivery files are retained only as needed to complete delivery and, depending on plan, may remain available for up to 72 hours before expiry.</p>
 </div></section>
 </main>"""
-    return public_shell("BeOnMeet | Automatic Google Meet recording", body)
+    return public_shell(
+        "BeOnMeet | Google Meet recording plans",
+        body.replace("__BOT_CTA__", bot_cta).replace("__PRICE_CARDS__", price_cards),
+    )
+
+
+@app.get("/fa", response_class=HTMLResponse)
+async def home_fa() -> str:
+    """Campaign landing page for Persian-speaking customers; no invented bot links."""
+    bot_url = os.environ.get("TELEGRAM_BOT_URL", "").strip()
+    verified_bot_url = bot_url if re.fullmatch(r"https://t\.me/[A-Za-z0-9_]+(?:\?start=[A-Za-z0-9_]+)?", bot_url) else ""
+    bot_cta = (
+        f'<a class="button" href="{verified_bot_url}" rel="noopener noreferrer">شروع در تلگرام</a>'
+        if verified_bot_url else
+        '<a class="button" href="mailto:meetrecorderbot@gmail.com?subject=BeOnMeet%20access">درخواست دسترسی</a>'
+    )
+    plan_cards = "".join(
+        '<div class="card" style="text-align:right"><b>' + PUBLIC_PLANS[code]["label"] + '</b>'
+        + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>تومان / ۳۰ روز</small></div>'
+        + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' ساعت ضبط جلسه</div>'
+        + '<p>اعتبار مربوط به مجموع مدت ضبط در دوره اشتراک است. ضبط جدید بعد از پایان سهمیه پذیرفته نمی‌شود.</p>'
+        + '</div>'
+        for code in PUBLIC_PLAN_CODES
+    )
+    body = """
+<main lang="fa" dir="rtl">
+<section class="hero"><div class="wrap">
+<span class="eyebrow">ضبط و دریافت جلسات Google Meet در تلگرام</span>
+<h1>جلسه‌ات را از دست نده. BeOnMeet ضبطش می‌کند.</h1>
+<p>لینک Google Meet را به ربات بده یا تقویم Google را متصل کن. ربات در زمان جلسه برای ورود اقدام می‌کند و پس از پذیرفته‌شدن توسط میزبان، جلسه را ضبط و فایل را در تلگرام ارسال می‌کند.</p>
+<div class="cta">__BOT_CTA__<a class="button secondary" href="#plans">مشاهده قیمت‌ها</a></div>
+</div></section>
+<section id="plans" class="section"><div class="wrap">
+<h2>پلن‌های شفاف و ساعتی</h2>
+<p>هر خرید ۳۰ روز اعتبار دارد و تمدید خودکار نیست. هزینه اضافی بابت ساعت مازاد به‌صورت خودکار دریافت نمی‌شود. تغییر پلن در میانه دوره نیاز به هماهنگی پشتیبانی دارد.</p>
+<div class="grid prices">__PRICE_CARDS__</div>
+<div class="cta">__BOT_CTA__</div>
+</div></section>
+<section id="how" class="section"><div class="wrap">
+<h2>چطور کار می‌کند؟</h2>
+<div class="grid">
+<div class="card"><b>۱. لینک جلسه یا اتصال تقویم</b><p>لینک جلسه را بفرست. برای تشخیص خودکار جلسات، امکان اتصال Google Calendar هم وجود دارد.</p></div>
+<div class="card"><b>۲. ورود ربات به جلسه</b><p>بسته به تنظیمات Google Meet ممکن است میزبان لازم باشد ربات را تأیید و وارد کند.</p></div>
+<div class="card"><b>۳. دریافت فایل</b><p>ویدیو به تلگرام ارسال می‌شود. فایل صوتی و متن خودکار در شرایط پشتیبانی‌شده ارائه می‌شوند و ممکن است خطا داشته باشند.</p></div>
+</div>
+<div class="notice">پیش از ضبط، مطمئن شو که اجازه ضبط جلسه را داری و اطلاع‌رسانی یا رضایت لازم از شرکت‌کنندگان گرفته شده است. ورود و ضبط صددرصد تضمین‌شده نیست.</div>
+</div></section>
+<section class="section"><div class="wrap">
+<h2>حریم خصوصی و شرایط استفاده</h2>
+<p>برای زمان‌بندی خودکار فقط دسترسی خواندن تقویم درخواست می‌شود. درباره داده‌ها، زمان نگهداری فایل‌ها و شرایط استفاده بیشتر بخوان.</p>
+<div class="cta"><a class="button secondary" href="/privacy">حریم خصوصی</a><a class="button secondary" href="/terms">شرایط استفاده</a></div>
+</div></section>
+</main>"""
+    return public_shell(
+        "BeOnMeet | ضبط جلسه گوگل میت در تلگرام",
+        body.replace("__BOT_CTA__", bot_cta).replace("__PRICE_CARDS__", plan_cards),
+    )
 
 
 @app.get("/privacy", response_class=HTMLResponse)
@@ -2719,7 +2865,8 @@ async def terms_of_service() -> str:
 <h2>Availability</h2>
 <p>We work to provide reliable automatic joining and delivery, but admission controls, network conditions, third party outages, capacity limits or meeting configuration can prevent or delay recording. A host may need to admit the recorder.</p>
 <h2>Plans and temporary files</h2>
-<p>Free and Premium plans can have different recording limits, quality, output and retention features. Temporary delivery and download files expire according to the applicable plan and service configuration.</p>
+<p>New Basic, Pro and Business subscriptions last 30 days and include respectively 2, 6 and 15 hours of recorded meetings. Usage is measured by the duration of completed recordings. When the recording allowance is exhausted, new recording requests are blocked until the next subscription period or a support-assisted upgrade. A recording that is already in progress is allowed to finish and may use more than the remaining allowance. No additional hourly charge is made automatically. A new purchase while an active subscription exists is scheduled after the existing paid period unless handled by support. These subscriptions are not automatically renewed.</p>
+<p>Some older customers retain their original plan terms until their existing entitlement expires. Temporary delivery and download files expire according to the applicable plan and service configuration.</p>
 <h2>Privacy</h2>
 <p>Our handling of personal information and Google user data is described in the <a href="/privacy">Privacy Policy</a>.</p>
 <h2>Suspension</h2>
@@ -2925,13 +3072,18 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                 pending_state["video_delivered_at"] = datetime.now(timezone.utc).isoformat()
                 pending_state["updated_at"] = datetime.now(timezone.utc).isoformat()
                 await save_state()
+        reported_seconds = max(0, int(data.get("duration") or 0))
+        if reported_seconds == 0:
+            # Upstream callbacks sometimes omit duration. Read the real WebM
+            # metadata so a missing field cannot silently bypass paid quotas.
+            reported_seconds = max(0, int(await asyncio.to_thread(_audio_duration_seconds, raw_path)))
         await asyncio.to_thread(
             record_recording,
             chat_id,
             meeting_link,
             delivery_filename,
             int(delivery_path.stat().st_size),
-            int(data.get("duration") or 0),
+            reported_seconds,
         )
 
         if premium_active:
