@@ -2095,8 +2095,10 @@ async def billing_payment_return(payment: str = "", receipt: str = "", intent: s
     already_paid = row.get("status") == "paid"
     paid_row = await asyncio.to_thread(mark_payment_paid, intent, receipt)
     telegram_id = str((paid_row or row).get("telegram_id") or "")
+    # Apply even if the payment was marked paid during a previous attempt.
+    # activate_subscription deduplicates on the verified receipt.
+    until = await asyncio.to_thread(activate_subscription, telegram_id, expected_plan, f"Zibal receipt {receipt}")
     if not already_paid:
-        until = await asyncio.to_thread(activate_subscription, telegram_id, expected_plan, f"Zibal receipt {receipt}")
         await tg_text(
             telegram_id,
             t(
