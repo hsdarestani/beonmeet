@@ -49,6 +49,25 @@ jobs:
             df -Pk /dev/shm | awk 'NR==2 {printf "shm_total_gb=%.2f shm_avail_gb=%.2f\n",$2/1048576,$4/1048576}'
             printf 'controller_service='
             systemctl is-active beonmeet-controller || true
+            if [ -d /opt/beonmeet/.git ]; then
+              printf 'deployed_git_head='
+              git -C /opt/beonmeet rev-parse --short=12 HEAD
+              printf 'deployed_git_branch='
+              git -C /opt/beonmeet branch --show-current
+            fi
+            if [ -f /opt/beonmeet/.env ]; then
+              python3 - <<'PY'
+            from pathlib import Path
+            wanted={'AUTOSCALE_ENABLED','BEONMEET_STAGING_NO_POLL','FREE_RECORDING_LIMIT','TRANSCRIPTION_CONCURRENCY'}
+            d={}
+            for line in Path('/opt/beonmeet/.env').read_text().splitlines():
+                if '=' in line and not line.lstrip().startswith('#'):
+                    k,v=line.split('=',1)
+                    if k in wanted:d[k]=v
+                    if k=='TELEGRAM_BOT_URL':d['TELEGRAM_BOT_URL_configured']=str(bool(v.strip()))
+            for key in sorted(d):print(f'{key}={d[key]}')
+            PY
+            fi
             echo health_report_begin
             curl -fsS --max-time 12 http://127.0.0.1:8109/health | python3 -c '
             import sys,json
