@@ -26,6 +26,7 @@ from state_store import DurableStateStore
 from db_compat import is_postgres
 from hetzner_autoscaler import router as autoscaler_router, autoscale_loop, enabled as autoscaler_enabled, profile_status
 from scaling_policy import order_queue
+from billing_policy import PUBLIC_PLAN_CODES, plan_description
 from i18n import (
     BUTTON_ACTIONS,
     LANGUAGE_BUTTONS,
@@ -42,6 +43,7 @@ from admin_panel import (
     create_payment_intent,
     find_recording_for_artifact,
     free_recording_entitlement,
+    paid_recording_entitlement,
     get_payment_intent,
     init_db,
     is_premium,
@@ -267,7 +269,7 @@ async def tg_text(
 
 async def send_subscription_offer(chat_id: int | str, message_key: str = "premium_offer") -> None:
     intents: dict[str, dict[str, Any]] = {}
-    for plan_code in ("monthly", "quarterly", "halfyear"):
+    for plan_code in PUBLIC_PLAN_CODES:
         intents[plan_code] = await asyncio.to_thread(
             create_payment_intent, str(chat_id), plan_code
         )
@@ -276,16 +278,16 @@ async def send_subscription_offer(chat_id: int | str, message_key: str = "premiu
     keyboard = {
         "inline_keyboard": [
             [{
-                "text": i18n_tr(lang, "plan_monthly"),
-                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['monthly']['intent']}",
+                "text": i18n_tr(lang, "plan_basic"),
+                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['basic']['intent']}",
             }],
             [{
-                "text": i18n_tr(lang, "plan_quarterly"),
-                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['quarterly']['intent']}",
+                "text": i18n_tr(lang, "plan_pro"),
+                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['pro']['intent']}",
             }],
             [{
-                "text": i18n_tr(lang, "plan_halfyear"),
-                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['halfyear']['intent']}",
+                "text": i18n_tr(lang, "plan_business"),
+                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['business']['intent']}",
             }],
         ]
     }
@@ -737,6 +739,47 @@ async def _free_recording_allowed(
     return False
 
 
+async def _paid_recording_allowed(
+    chat_id: str,
+    *,
+    event_id: str = "",
+    notify: bool = True,
+) -> bool:
+    """Enforce paid recording-hour quotas before dispatch or queue activation.
+
+    Completed recordings are persisted in the DB. For jobs already accepted or
+    queued, conservatively reserve an hour each to reduce concurrent overspend.
+    The upstream recorder still has its own max-duration safety limit; existing
+    in-flight recordings are never silently stopped by this check.
+    """
+    quota = await asyncio.to_thread(paid_recording_entitlement, str(chat_id))
+    if not quota.get("premium"):
+        return True
+    remaining = quota.get("remaining_seconds")
+    if remaining is None:
+        return True  # protect grandfathered unlimited legacy subscriptions
+    busy_ids = set()
+    for item in state.get("join_queue", []):
+        req = item.get("req") or {}
+        eid = str(item.get("event_id") or "")
+        if eid and eid != event_id and str(req.get("chat_id") or "") == str(chat_id):
+            busy_ids.add(eid)
+    for eid, item in state.get("launched_events", {}).items():
+        if str(eid) != event_id and str((item or {}).get("chat_id") or "") == str(chat_id):
+            if str((item or {}).get("status") or "") in {"remote_claimed", "joining", "waiting_for_admission", "recording", "delivering"}:
+                busy_ids.add(str(eid))
+    reserved = len(busy_ids) * 3600
+    if remaining > reserved:
+        return True
+    if notify:
+        used = int(quota.get("used_seconds") or 0)
+        limit = int(quota.get("quota_seconds") or 0)
+        await tg_text(chat_id, t(chat_id, "paid_quota_reached",
+                                used=round(used / 60), limit=round(limit / 60)))
+        await send_subscription_offer(chat_id)
+    return False
+
+
 async def enqueue_meeting(
     event: dict[str, Any],
     req: dict[str, Any],
@@ -856,6 +899,8 @@ async def launch_meeting(
         notify=True,
     ):
         return False
+    if premium and not await _paid_recording_allowed(chat_id, event_id=event_id):
+        return False
 
     launched, busy, pool_name = await _dispatch_meeting(
         event, req, meet_url, premium
@@ -961,6 +1006,13 @@ async def queue_loop() -> None:
                         await tg_text(chat_id, t(chat_id, "queue_expired"))
                         continue
 
+                    if premium and not await _paid_recording_allowed(chat_id, event_id=event_id):
+                        state["join_queue"] = [
+                            q for q in state.get("join_queue", [])
+                            if str(q.get("event_id") or "") != event_id
+                        ]
+                        await save_state()
+                        continue
                     # Serialize local queue dispatch with remote worker claims.
                     # Without this lock, a remote worker and the local pool could
                     # pick the same meeting at exactly the same moment.
@@ -1372,11 +1424,20 @@ async def telegram_loop() -> None:
                 if text.startswith("/plans") or text.startswith("/premium"):
                     info = await asyncio.to_thread(subscription_info, str(chat_id))
                     if info.get("premium"):
-                        until = info.get("until")
+                        until = info.get("period_end") or info.get("until")
                         until_text = until.astimezone().strftime("%Y-%m-%d") if until else ""
+                        balance = await asyncio.to_thread(paid_recording_entitlement, str(chat_id))
+                        remain = balance.get("remaining_seconds")
+                        remaining_label = (
+                            t(chat_id, "quota_legacy") if remain is None
+                            else t(chat_id, "quota_remaining", minutes=int(remain // 60),
+                                   used=int(balance.get("used_seconds") or 0) // 60)
+                        )
                         await tg_text(
                             chat_id,
-                            t(chat_id, "premium_active", until=until_text),
+                            t(chat_id, "premium_active", until=until_text)
+                            + "\n\n" + plan_description(str(info.get("plan") or ""))
+                            + "\n" + remaining_label,
                             with_menu=True,
                         )
                     else:
@@ -1999,7 +2060,7 @@ async def billing_payment_intent(intent: str) -> dict[str, Any]:
         "status": row.get("status"),
         "plan": row.get("plan_code"),
         "amount_toman": int(row.get("amount_toman") or 0),
-        "label": f"پلن ویژه BeOnMeet، {plan['label']}",
+        "label": f"اشتراک BeOnMeet، {plan['label']}",
     }
 
 
@@ -2138,6 +2199,10 @@ async def remote_worker_claim(
                 continue
             event_id = str(item.get("event_id") or "")
             if not event_id or not _is_queued(event_id):
+                continue
+            req = item.get("req") or {}
+            chat_id = str(req.get("chat_id") or "")
+            if premium and not await _paid_recording_allowed(chat_id, event_id=event_id, notify=False):
                 continue
             chosen = item
             state["join_queue"] = [
@@ -2925,13 +2990,18 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                 pending_state["video_delivered_at"] = datetime.now(timezone.utc).isoformat()
                 pending_state["updated_at"] = datetime.now(timezone.utc).isoformat()
                 await save_state()
+        reported_seconds = max(0, int(data.get("duration") or 0))
+        if reported_seconds == 0:
+            # Upstream callbacks sometimes omit duration. Read the real WebM
+            # metadata so a missing field cannot silently bypass paid quotas.
+            reported_seconds = max(0, int(await asyncio.to_thread(_audio_duration_seconds, raw_path)))
         await asyncio.to_thread(
             record_recording,
             chat_id,
             meeting_link,
             delivery_filename,
             int(delivery_path.stat().st_size),
-            int(data.get("duration") or 0),
+            reported_seconds,
         )
 
         if premium_active:
