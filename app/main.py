@@ -2705,7 +2705,7 @@ async def home() -> str:
     # The bot's actual Telegram username must be configured before ads launch.
     # Never invent a Telegram destination for paid marketing.
     bot_url = os.environ.get("TELEGRAM_BOT_URL", "").strip()
-    verified_bot_url = bot_url if re.fullmatch(r"https://t\\.me/[A-Za-z0-9_]+(?:\\?start=[A-Za-z0-9_]+)?", bot_url) else ""
+    verified_bot_url = bot_url if re.fullmatch(r"https://t\.me/[A-Za-z0-9_]+(?:\?start=[A-Za-z0-9_]+)?", bot_url) else ""
     bot_cta = (
         f'<a class="button" href="{verified_bot_url}" rel="noopener noreferrer">Start in Telegram</a>'
         if verified_bot_url else
