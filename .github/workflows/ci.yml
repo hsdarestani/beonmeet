@@ -19,6 +19,7 @@ jobs:
           python3 tests/premium_delivery_test.py
           python3 tests/i18n_test.py
           python3 tests/billing_tier_test.py
+          python3 tests/billing_usage_behavior_test.py
           python3 tests/free_plan_limit_test.py
           python3 tests/public_oauth_pages_test.py
           python3 tests/recorder_end_guard_test.py
