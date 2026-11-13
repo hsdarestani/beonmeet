@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from db_compat import connect_db, is_postgres
 from state_store import DurableStateStore
+from billing_policy import PLANS, PUBLIC_PLANS, PUBLIC_PLAN_CODES, plan_quota_seconds, remaining_seconds
 
 router = APIRouter()
 DB_PATH = Path(os.environ.get("BEONMEET_DB_PATH", "/data/beonmeet.db"))
@@ -36,12 +37,6 @@ INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
 ADMINUSER = os.environ.get("ADMINUSER", "").strip()
 DOMAIN = os.environ.get("DOMAIN", "beonmeet.smarbiz.sbs")
 FREE_RECORDING_LIMIT = max(0, int(os.environ.get("FREE_RECORDING_LIMIT", "5")))
-
-PLANS = {
-    "monthly": {"label": "یک ماهه", "months": 1, "price": 198_000},
-    "quarterly": {"label": "سه ماهه", "months": 3, "price": 499_000},
-    "halfyear": {"label": "شش ماهه", "months": 6, "price": 799_000},
-}
 
 PREMIUM_FEATURES = [
     ("کیفیت بالاتر ضبط", "ضبط با کیفیت بالاتر نسبت به پلن رایگان، تا سقف کیفیت واقعی دریافتی از Google Meet", "ready"),
@@ -436,12 +431,18 @@ def record_request(telegram_id: str, meet_url: str, mode: str) -> None:
 def record_recording(telegram_id: str, meet_url: str, filename: str, size_bytes: int, duration_seconds: int) -> None:
     now = utcnow().isoformat()
     with _db() as db:
+        duplicate = db.execute(
+            "SELECT id FROM recordings WHERE telegram_id=? AND filename=? LIMIT 1",
+            (str(telegram_id), filename or ""),
+        ).fetchone()
+        if duplicate:
+            return
         db.execute(
             """
             INSERT INTO recordings (telegram_id, meet_url, filename, size_bytes, duration_seconds, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (str(telegram_id), meet_url or "", filename or "", int(size_bytes or 0), int(duration_seconds or 0), now),
+            (str(telegram_id), meet_url or "", filename or "", int(size_bytes or 0), max(0, int(duration_seconds or 0)), now),
         )
         db.execute(
             "UPDATE users SET total_recordings = total_recordings + 1, last_seen=? WHERE telegram_id=?",
@@ -551,18 +552,71 @@ def was_premium_at(telegram_id: str, when_iso: str) -> bool:
 
 
 def subscription_info(telegram_id: str) -> dict:
+    """Return the plan active *now*, even if a renewal is queued for later."""
     with _db() as db:
         row = db.execute(
             "SELECT premium_until, premium_plan FROM users WHERE telegram_id=?",
             (str(telegram_id),),
         ).fetchone()
+        periods = db.execute(
+            """SELECT plan_code, starts_at, ends_at FROM subscriptions
+               WHERE telegram_id=? AND status='active' ORDER BY starts_at DESC LIMIT 100""",
+            (str(telegram_id),),
+        ).fetchall()
     if not row:
-        return {"premium": False, "until": None, "plan": None}
+        return {"premium": False, "until": None, "plan": None, "period_start": None, "period_end": None}
+    now = utcnow()
     until = _parse_dt(row["premium_until"])
+    active = bool(until and until > now)
+    plan = str(row["premium_plan"] or "")
+    period_start = None
+    period_end = until
+    if active:
+        for period in periods:
+            start = _parse_dt(period["starts_at"])
+            end = _parse_dt(period["ends_at"])
+            if start and end and start <= now < end:
+                plan = str(period["plan_code"])
+                period_start = start
+                period_end = end
+                break
     return {
-        "premium": bool(until and until > utcnow()),
+        "premium": active,
         "until": until,
-        "plan": row["premium_plan"],
+        "plan": plan if active else None,
+        "period_start": period_start,
+        "period_end": period_end,
+    }
+
+
+def paid_recording_entitlement(telegram_id: str) -> dict:
+    """Paid recording usage is counted only in the current subscription period.
+
+    None for remaining_seconds means an existing legacy unlimited plan; the new
+    public plans always have finite quotas. This function does not infer usage
+    from an older paid period or give away hours on an early renewal.
+    """
+    info = subscription_info(telegram_id)
+    if not info["premium"]:
+        return {"premium": False, "allowed": False, "plan": None, "used_seconds": 0, "remaining_seconds": 0, "quota_seconds": 0}
+    plan = info["plan"]
+    quota = plan_quota_seconds(plan)
+    if quota is None:
+        return {"premium": True, "allowed": True, "plan": plan, "used_seconds": 0, "remaining_seconds": None, "quota_seconds": None}
+    period_end = info.get("period_end") or info["until"]
+    period_start = info.get("period_start") or (period_end - timedelta(days=30))
+    with _db() as db:
+        row = db.execute(
+            """SELECT COALESCE(SUM(duration_seconds), 0) AS total
+               FROM recordings WHERE telegram_id=? AND created_at>=? AND created_at<?""",
+            (str(telegram_id), period_start.isoformat(), period_end.isoformat()),
+        ).fetchone()
+    used = max(0, int(row["total"] or 0)) if row else 0
+    remaining = remaining_seconds(plan, used)
+    return {
+        "premium": True, "allowed": remaining is None or remaining > 0,
+        "plan": plan, "used_seconds": used, "remaining_seconds": remaining,
+        "quota_seconds": quota,
     }
 
 
@@ -624,7 +678,7 @@ def create_payment_intent(telegram_id: str, plan_code: str) -> dict:
         "telegram_id": str(telegram_id),
         "plan": plan_code,
         "amount_toman": int(plan["price"]),
-        "label": f"پلن ویژه BeOnMeet، {plan['label']}",
+        "label": f"اشتراک BeOnMeet، {plan['label']}",
         "expires_at": expires,
     }
 
@@ -1066,9 +1120,9 @@ async def dashboard(request: Request):
       <div class="card"><div class="section-head"><h2>درخواست های ۷ روز اخیر</h2><span class="pill">Activity</span></div><div class="chart">{bars}</div></div>
       <div class="card"><div class="section-head"><h2>قیمت پلن ویژه</h2><a class="pill" href="/admin/plans" style="text-decoration:none">مدیریت پلن</a></div>
         <div style="display:grid;gap:10px;margin-top:12px">
-          <div><span class="muted">یک ماهه</span><b style="float:left">{_money(PLANS["monthly"]["price"])} تومان</b></div>
-          <div><span class="muted">سه ماهه</span><b style="float:left">{_money(PLANS["quarterly"]["price"])} تومان</b></div>
-          <div><span class="muted">شش ماهه</span><b style="float:left">{_money(PLANS["halfyear"]["price"])} تومان</b></div>
+          <div><span class="muted">Basic · ۲ ساعت</span><b style="float:left">{_money(PLANS["basic"]["price"])} تومان</b></div>
+          <div><span class="muted">Pro · ۶ ساعت</span><b style="float:left">{_money(PLANS["pro"]["price"])} تومان</b></div>
+          <div><span class="muted">Business · ۱۵ ساعت</span><b style="float:left">{_money(PLANS["business"]["price"])} تومان</b></div>
         </div>
       </div>
     </div>
@@ -1142,7 +1196,7 @@ async def user_page(request: Request, telegram_id: str):
     </div>
     <div class="card section subscription-card"><div class="section-head"><h2>مدیریت اشتراک</h2><span class="pill">Premium controls</span></div>
       <form class="inline" method="post" action="/admin/users/{_esc(telegram_id)}/activate">
-        <select name="plan_code"><option value="monthly">یک ماهه · ۱۹۸٬۰۰۰</option><option value="quarterly">سه ماهه · ۴۹۹٬۰۰۰</option><option value="halfyear">شش ماهه · ۷۹۹٬۰۰۰</option></select>
+        <select name="plan_code"><option value="basic">Basic · ۲ ساعت · ۲۹۸٬۰۰۰</option><option value="pro">Pro · ۶ ساعت · ۴۹۸٬۰۰۰</option><option value="business">Business · ۱۵ ساعت · ۹۹۸٬۰۰۰</option></select>
         <input name="note" placeholder="یادداشت اختیاری">
         <button class="btn primary">فعال کردن / تمدید</button>
       </form>
@@ -1318,9 +1372,9 @@ async def plans_page(request: Request):
     )
     body=f"""<div class="top"><div><h1>پلن ویژه</h1><div class="sub">قیمت گذاری و نقشه قابلیت های پولی</div></div><span class="badge premium">Premium</span></div>
     <div class="plan-grid">
-      <div class="card plan"><span class="badge premium">یک ماهه</span><div class="price">{_money(PLANS["monthly"]["price"])}</div><div class="muted">تومان · ۳۰ روز</div></div>
-      <div class="card plan"><span class="badge premium">سه ماهه</span><div class="price">{_money(PLANS["quarterly"]["price"])}</div><div class="muted">تومان · حدود ۱۶٪ به صرفه تر</div></div>
-      <div class="card plan"><span class="badge premium">شش ماهه</span><div class="price">{_money(PLANS["halfyear"]["price"])}</div><div class="muted">تومان · حدود ۳۳٪ به صرفه تر</div></div>
+      <div class="card plan"><span class="badge premium">Basic</span><div class="price">{_money(PLANS["basic"]["price"])}</div><div class="muted">تومان · ۳۰ روز · ۲ ساعت ضبط</div></div>
+      <div class="card plan"><span class="badge premium">Pro</span><div class="price">{_money(PLANS["pro"]["price"])}</div><div class="muted">تومان · ۳۰ روز · ۶ ساعت ضبط</div></div>
+      <div class="card plan"><span class="badge premium">Business</span><div class="price">{_money(PLANS["business"]["price"])}</div><div class="muted">تومان · ۳۰ روز · ۱۵ ساعت ضبط</div></div>
     </div>
     <div class="two section"><div class="card"><div class="section-head"><h2>قابلیت های ویژه</h2><span class="pill">قابل توسعه</span></div>{feature_html}</div>
     <div class="card"><div class="section-head"><h2>پلن رایگان</h2></div>
