@@ -626,6 +626,14 @@ def activate_subscription(telegram_id: str, plan_code: str, note: str = "") -> d
     plan = PLANS[plan_code]
     now = utcnow()
     with _db() as db:
+        # Retried payment callbacks must never extend the same purchase twice.
+        if note.startswith("Zibal receipt "):
+            existing = db.execute(
+                "SELECT ends_at FROM subscriptions WHERE telegram_id=? AND note=? ORDER BY id DESC LIMIT 1",
+                (str(telegram_id), note),
+            ).fetchone()
+            if existing:
+                return _parse_dt(existing["ends_at"]) or now
         row = db.execute("SELECT premium_until FROM users WHERE telegram_id=?", (str(telegram_id),)).fetchone()
         current = _parse_dt(row["premium_until"]) if row else None
         start = current if current and current > now else now
