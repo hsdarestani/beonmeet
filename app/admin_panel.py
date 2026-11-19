@@ -1234,7 +1234,15 @@ def _stats():
             """SELECT telegram_id FROM credit_entries GROUP BY telegram_id
                HAVING SUM(seconds_delta)>0"""
         ).fetchall()
-        premium=len({str(row["telegram_id"]) for row in wallets})
+        members={str(row["telegram_id"]) for row in wallets}
+        legacy=db.execute(
+            """SELECT DISTINCT telegram_id FROM subscriptions
+               WHERE status='active' AND plan_code IN ('monthly','quarterly','halfyear')
+                 AND starts_at<=? AND ends_at>?""",
+            (utcnow().isoformat(),utcnow().isoformat()),
+        ).fetchall()
+        members.update(str(row["telegram_id"]) for row in legacy)
+        premium=len(members)
         recordings = db.execute("SELECT COUNT(*) c FROM recordings").fetchone()["c"]
         requests = db.execute("SELECT COUNT(*) c FROM meeting_requests").fetchone()["c"]
         recent = db.execute("SELECT * FROM users ORDER BY last_seen DESC LIMIT 8").fetchall()
@@ -1356,7 +1364,7 @@ async def user_page(request: Request, telegram_id: str):
     sub_rows="".join(f'<tr><td>{_esc(PLANS.get(s["plan_code"], {"label": s["plan_code"]})["label"])}</td><td>{_money(s["price_toman"])}</td><td>{_fa_date(s["starts_at"])}</td><td>{_fa_date(s["ends_at"])}</td><td>{_esc(s["status"])}</td></tr>' for s in subs) or '<tr><td colspan="5" class="empty">اشتراکی ندارد</td></tr>'
     rec_rows="".join(f'<tr><td>{_fa_date(r["created_at"])}</td><td>{_esc(r["meet_url"])}</td><td>{round(r["size_bytes"]/1024/1024,1)} MB</td><td>{round(r["duration_seconds"]/60,1)} دقیقه</td></tr>' for r in recs) or '<tr><td colspan="4" class="empty">ضبطی ندارد</td></tr>'
     body=f"""<div class="top"><div><h1>{_esc(name)}</h1><div class="sub">{_esc("@"+u["username"] if u["username"] else telegram_id)}</div></div>
-      {'<span class="badge premium">پلن ویژه فعال تا '+_fa_date(u["premium_until"])+'</span>' if active else '<span class="badge free">پلن رایگان</span>'}</div>
+      {'<span class="badge premium">اعتبار ساعت ضبط فعال</span>' if active else '<span class="badge free">بدون اعتبار ضبط</span>'}</div>
     <div class="grid">
       <div class="card metric"><div class="label">درخواست ها</div><div class="num">{u["total_requests"]}</div></div>
       <div class="card metric"><div class="label">ضبط ها</div><div class="num">{u["total_recordings"]}</div></div>
@@ -1379,7 +1387,7 @@ async def user_page(request: Request, telegram_id: str):
       </form>
       {'<form style="margin-top:10px" method="post" action="/admin/users/'+_esc(telegram_id)+'/deactivate"><button class="btn danger">لغو دسترسی و صفرکردن اعتبار</button></form>' if active else ''}
     </div>
-    <div class="two section"><div class="card"><div class="section-head"><h2>سابقه اشتراک</h2></div><table><thead><tr><th>پلن</th><th>مبلغ</th><th>شروع</th><th>پایان</th><th>وضعیت</th></tr></thead><tbody>{sub_rows}</tbody></table></div>
+    <div class="two section"><div class="card"><div class="section-head"><h2>سابقه اشتراک‌های قبلی (صرفاً آرشیو)</h2></div><table><thead><tr><th>پلن</th><th>مبلغ</th><th>شروع</th><th>پایان</th><th>وضعیت</th></tr></thead><tbody>{sub_rows}</tbody></table></div>
     <div class="card"><div class="section-head"><h2>ضبط های اخیر</h2></div><table><thead><tr><th>زمان</th><th>Meet</th><th>حجم</th><th>مدت</th></tr></thead><tbody>{rec_rows}</tbody></table></div></div>"""
     return _layout(name, body, "users")
 
