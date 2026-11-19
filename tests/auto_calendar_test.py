@@ -41,7 +41,7 @@ assert I18N.count('"auto_disabled"') == 3
 assert I18N.count('"auto_connect"') == 3
 assert I18N.count('"auto_premium_only"') == 3
 assert I18N.count('"auto_premium_status"') == 3
-assert I18N.count('"auto":') >= 6
+assert I18N.count('"auto":') == 3, "old keyboard labels are retained only to handle stale Telegram keyboards"
 assert 'BUTTON_ACTIONS[_labels["auto"]] = "/auto"' in I18N
 
 print("AUTO_CALENDAR_TEST_PASS")
