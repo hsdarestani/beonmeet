@@ -107,4 +107,30 @@ jobs:
             systemctl list-units --no-pager --no-legend --type=service --state=running | cut -d' ' -f1 | grep -Ei 'cam|beon|mediamtx|nginx|redis|rednote|postgres' | head -25 || true
             echo ACTIVE_RECORDER_STATUS
             curl -fsS --max-time 5 http://127.0.0.1:9124/capacity | python3 -c 'import sys,json;d=json.load(sys.stdin);v=d.get("data") or d;print({"running":v.get("runningJobs"),"available":v.get("availableSlots")})'
+
+            echo RECORDER_DOCKER_NETWORK_AND_COMPOSE
+            python3 - <<'PY'
+            import json,subprocess
+            for name in ('beonmeet-worker-single','beonmeet-chrome-single'):
+                d=json.loads(subprocess.check_output(['docker','inspect',name],text=True))[0]
+                config=d.get('Config') or {}
+                net=d.get('NetworkSettings') or {}
+                hc=d.get('HostConfig') or {}
+                labels=config.get('Labels') or {}
+                out={
+                  'name':name,'host_network_mode':hc.get('NetworkMode'),
+                  'network_names':list((net.get('Networks') or {}).keys()),
+                  'network_aliases':{k:v.get('Aliases') for k,v in (net.get('Networks') or {}).items()},
+                  'published_port_keys':list((hc.get('PortBindings') or {}).keys()),
+                  'compose_project':labels.get('com.docker.compose.project'),
+                  'compose_file':labels.get('com.docker.compose.project.config_files'),
+                  'compose_service':labels.get('com.docker.compose.service'),
+                  'mount_source_dest':[{'Source':m.get('Source'),'Destination':m.get('Destination')} for m in d.get('Mounts') or []],
+                }
+                print(json.dumps(out))
+            PY
+            echo PARENT_PROCESS_AND_ACTIVE_LOAD
+            ps -eo comm,%cpu,%mem,rss --sort=-rss | head -18
+            echo RECORDER_RELEVANT_COMPOSE_RESOURCES
+            grep -nE 'beonmeet-(worker|chrome)-single|MAX_CONCURRENT_MEETINGS|CHROME_WINDOW_SIZE|mem_limit|cpus:|shm_size|pids_limit' /opt/beonmeet/worker/docker-compose.yml | head -60 || true
             echo AUDIT_COMPLETE
