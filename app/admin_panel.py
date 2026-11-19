@@ -36,7 +36,10 @@ _GOOGLE_ACCOUNT_CACHE: dict[str, tuple[float, dict]] = {}
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
 ADMINUSER = os.environ.get("ADMINUSER", "").strip()
 DOMAIN = os.environ.get("DOMAIN", "beonmeet.smarbiz.sbs")
-FREE_RECORDING_LIMIT = max(0, int(os.environ.get("FREE_RECORDING_LIMIT", "5")))
+FREE_RECORDING_LIMIT = max(0, int(os.environ.get("FREE_RECORDING_LIMIT", "1")))
+# Single-VPS capacity caps: no extra servers, no per-user unlimited recording.
+PAID_SALES_MAX_ACTIVE_USERS = max(0, int(os.environ.get("PAID_SALES_MAX_ACTIVE_USERS", "12")))
+PAID_SALES_MAX_SOLD_HOURS = max(0, int(os.environ.get("PAID_SALES_MAX_SOLD_HOURS", "60")))
 
 PREMIUM_FEATURES = [
     ("کیفیت بالاتر ضبط", "ضبط با کیفیت بالاتر نسبت به پلن رایگان، تا سقف کیفیت واقعی دریافتی از Google Meet", "ready"),
@@ -667,9 +670,52 @@ def deactivate_subscription(telegram_id: str) -> None:
         )
 
 
+def paid_sales_capacity(plan_code: str, telegram_id: str = "") -> dict:
+    """Conservative soft capacity gate for new paid 30-day subscriptions.
+
+    Count the advertised hours of active paid users, including conservative
+    15-hour reservations for older unlimited subscriptions. No new servers are
+    created. This is not a substitute for real peak-concurrency load testing.
+    """
+    requested = plan_quota_seconds(plan_code)
+    if requested == 0 or plan_code not in PUBLIC_PLAN_CODES:
+        return {"allowed": False, "reason": "unknown plan"}
+    now = utcnow().isoformat()
+    with _db() as db:
+        active = db.execute(
+            """SELECT telegram_id, premium_plan FROM users
+               WHERE premium_until IS NOT NULL AND premium_until > ?""",
+            (now,),
+        ).fetchall()
+    members = {str(u["telegram_id"]) for u in active}
+    sold = 0
+    for item in active:
+        allocated = plan_quota_seconds(str(item["premium_plan"] or ""))
+        sold += allocated if allocated is not None else 15 * 3600
+    # Renewals by already active members do not consume an additional concurrent
+    # subscription seat; nevertheless count the new quota if it is higher.
+    already_active = str(telegram_id) in members
+    projected_users = len(members) + (0 if already_active else 1)
+    projected_sold = sold + requested
+    return {
+        "allowed": (
+            PAID_SALES_MAX_ACTIVE_USERS > 0
+            and PAID_SALES_MAX_SOLD_HOURS > 0
+            and projected_users <= PAID_SALES_MAX_ACTIVE_USERS
+            and projected_sold <= PAID_SALES_MAX_SOLD_HOURS * 3600
+        ),
+        "active_users": len(members), "sold_hours": round(sold / 3600, 2),
+        "limit_users": PAID_SALES_MAX_ACTIVE_USERS,
+        "limit_sold_hours": PAID_SALES_MAX_SOLD_HOURS,
+        "requested_hours": round(requested / 3600, 2),
+    }
+
+
 def create_payment_intent(telegram_id: str, plan_code: str) -> dict:
-    if plan_code not in PLANS:
-        raise ValueError("invalid plan")
+    if plan_code not in PUBLIC_PLAN_CODES:
+        raise ValueError("plan is not available for sale")
+    if not paid_sales_capacity(plan_code, telegram_id).get("allowed"):
+        raise ValueError("paid recorder capacity reached; new sales paused")
     plan = PLANS[plan_code]
     now = utcnow()
     intent = secrets.token_urlsafe(24)
