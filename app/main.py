@@ -2111,44 +2111,43 @@ async def billing_payment_return(payment: str = "", receipt: str = "", intent: s
     already_paid = row.get("status") == "paid"
     paid_row = await asyncio.to_thread(mark_payment_paid, intent, receipt)
     telegram_id = str((paid_row or row).get("telegram_id") or "")
-    before = await asyncio.to_thread(subscription_info, telegram_id)
-    # A second purchase is a FUTURE 30-day term, not a top-up of this term.
-    # Retried callbacks are deduplicated by the verified Zibal receipt.
-    until = await asyncio.to_thread(activate_subscription, telegram_id, expected_plan, f"Zibal receipt {receipt}")
-    scheduled = bool(before.get("premium") and before.get("until") and before["until"] > datetime.now(timezone.utc))
-    label = str(PLANS[expected_plan].get("label") or expected_plan)
+    purchased_seconds = int(PUBLIC_PLANS[expected_plan]["quota_minutes"]) * 60
+    # An independently verified Zibal receipt is credited once. Callback retries
+    # do not top up twice. Previously credited subscription receipts are
+    # recognized and preserved by credit_purchase.
+    wallet = await asyncio.to_thread(credit_purchase, telegram_id, expected_plan, receipt)
+    remaining = max(0, int(wallet["remaining_seconds"]))
     if not already_paid:
-        if expected_plan not in PUBLIC_PLAN_CODES:
-            confirmation = t(telegram_id, "payment_confirmed_legacy", plan=label, until=until.astimezone().strftime("%Y-%m-%d"))
-        elif scheduled:
-            confirmation = t(
-                telegram_id, "payment_scheduled", plan=label,
-                starts=before["until"].astimezone().strftime("%Y-%m-%d"),
-                until=until.astimezone().strftime("%Y-%m-%d"),
-                hours=int(PUBLIC_PLANS[expected_plan]["quota_minutes"] // 60),
-            )
-        else:
-            confirmation = t(
-                telegram_id, "payment_confirmed", plan=label,
-                until=until.astimezone().strftime("%Y-%m-%d"),
-                hours=int(PUBLIC_PLANS[expected_plan]["quota_minutes"] // 60),
-            )
         try:
-            await tg_text(telegram_id, confirmation)
-        except Exception as exc:
-            print("payment confirmation Telegram delivery failed:", type(exc).__name__, flush=True)
-        if ADMINUSER and ADMINUSER != telegram_id:
             await tg_text(
-                ADMINUSER,
-                f"💳 خرید پلن ویژه\nکاربر: {telegram_id}\nپلن: {expected_plan}\nمبلغ: {expected_amount:,} تومان\nرسید: {receipt}"
+                telegram_id,
+                t(
+                    telegram_id, "wallet_payment_confirmed",
+                    hours=purchased_seconds // 3600,
+                    balance_hours=remaining // 3600,
+                    balance_minutes=(remaining % 3600 + 59) // 60,
+                ),
+                with_menu=True,
             )
-
+        except Exception as exc:
+            print("credit purchase Telegram delivery failed:", type(exc).__name__, flush=True)
+        if ADMINUSER and ADMINUSER != telegram_id:
+            try:
+                await tg_text(
+                    ADMINUSER,
+                    f"💳 شارژ ساعت ضبط\nکاربر: {telegram_id}\n"
+                    f"ساعت: {purchased_seconds // 3600}\n"
+                    f"مبلغ: {expected_amount:,} تومان\nرسید: {receipt}",
+                )
+            except Exception as exc:
+                print("admin credit purchase notification failed:", type(exc).__name__, flush=True)
     return (
-        "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;"
-        "background:#0b0e17;color:white;display:grid;place-items:center;min-height:100vh;margin:0'>"
-        "<div style='text-align:center'><h2>پرداخت موفق بود ✅</h2><p>"
-        + ("دوره بعدی خریداری شد؛ ساعت‌های دوره فعلی افزایش پیدا نکرد." if scheduled else "اشتراک فعلی فعال شد.")
-        + " می‌تونی صفحه رو ببندی و به تلگرام برگردی.</p></div></body></html>"
+        "<html lang='fa' dir='rtl'><meta charset='utf-8'>"
+        "<body style='font-family:tahoma;background:#0b0e17;color:#fff;"
+        "display:grid;place-items:center;min-height:100vh'>"
+        "<div style='text-align:center'><h2>شارژ ساعت ضبط موفق بود ✅</h2>"
+        "<p>اعتبار خریداری‌شده به موجودی قبلی اضافه شد و تاریخ انقضا ندارد."
+        " موجودی را در تلگرام از بخش شارژ ساعت ببین.</p></div></body></html>"
     )
 
 
