@@ -22,8 +22,17 @@ for port in (9126,9124):
     assert int((d.get('data') or d).get('runningJobs') or 0)==0,'recording is active'
 print('BOT_SAFE_IDLE_PRECHECK_PASS')
 PY
-[ -z "$(git status --porcelain -- app/main.py app/admin_panel.py app/i18n.py)" ] || { echo LOCAL_APP_EDITS_DETECTED; exit 1; }
-SOURCE=d8091f301750a8f294e553d576629f88f812f721
+# The previous controlled deploy intentionally left three files dirty relative
+# to the original detached git HEAD. Require byte-for-byte equality with the
+# *known deployed commit* rather than trusting an empty git status.
+PREVIOUS_REVIEWED=1e6319bd41d848d75c1659074640aa0b02d8f906
+for name in main.py admin_panel.py i18n.py;do
+  cmp -s <(git show "$PREVIOUS_REVIEWED:app/$name") "app/$name" || {
+    echo UNEXPECTED_LOCAL_APP_CHANGE_$name
+    exit 1
+  }
+done
+SOURCE=18099aca6d727baddd26700828da74aeaf932fe4
 git fetch --quiet origin refs/heads/fix/hide-auto-and-clarify-subscription-20261119
 git merge-base --is-ancestor "$SOURCE" FETCH_HEAD || { echo REVIEWED_COMMIT_NOT_FOUND; exit 1; }
 STAGE=$(mktemp -d /opt/beonmeet/.stage-hidemeet.XXXXXXXX)
