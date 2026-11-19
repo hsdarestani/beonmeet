@@ -32,12 +32,20 @@ def add_entry(db, telegram_id: str, seconds_delta: int, reference: str, kind: st
             raise ValueError("Wallet transaction reference collision")
         return False
     # Unique reference remains a hard invariant under simultaneous callbacks.
-    db.execute(
+    cursor=db.execute(
         """INSERT INTO credit_entries(reference, telegram_id, seconds_delta, kind, created_at)
            VALUES(?,?,?,?,?) ON CONFLICT(reference) DO NOTHING""",
         (reference, str(telegram_id), delta, kind, datetime.now(timezone.utc).isoformat()),
     )
-    return True
+    # Verify the persisted row even under simultaneous callbacks, where a
+    # conflicting transaction may have inserted between our check and write.
+    stored=db.execute(
+        "SELECT telegram_id, seconds_delta, kind FROM credit_entries WHERE reference=?",
+        (reference,),
+    ).fetchone()
+    if not stored or (str(stored["telegram_id"]),int(stored["seconds_delta"]),str(stored["kind"])) != (str(telegram_id),delta,kind):
+        raise ValueError("Wallet transaction reference collision")
+    return cursor.rowcount == 1
 
 def balance(db, telegram_id: str) -> dict:
     row=db.execute(
