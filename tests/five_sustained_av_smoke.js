@@ -105,7 +105,15 @@ async function main() {
         frames:vals.map(x=>x.frames),bytes:received.map(x=>x.bytes)}));
     }catch(e){ console.log('QA_PROGRESS_ERROR '+e.message); }
   },30000);
-  await new Promise(resolve=>setTimeout(resolve,SECONDS*1000));
+  await new Promise((resolve,reject)=>{
+    const timeout=setTimeout(()=>{clearInterval(checker);resolve();},SECONDS*1000);
+    const checker=setInterval(()=>{
+      if(fs.existsSync('/tmp/beonmeet-five-sustained-abort-20261119')){
+        clearTimeout(timeout);clearInterval(checker);
+        reject(Error('Host health guard requested abort'));
+      }
+    },2000);
+  });
   clearInterval(progress);
   const results=await Promise.all(pages.map(p=>p.evaluate(()=>window.__qa.stop())));
   const stats=results.map((v,i)=>({...v,bytes:fs.statSync(paths[i]).size, receivedChunks:received[i].chunks}));
