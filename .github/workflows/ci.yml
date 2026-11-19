@@ -22,6 +22,7 @@ jobs:
           python3 tests/billing_usage_behavior_test.py
           python3 tests/hamooncloud_payment_patch_test.py
           python3 -m py_compile patches/fix_hamooncloud_beonmeet_plans.py
+          bash -n scripts/deploy_hamooncloud_payment_plan_fix.sh
           python3 tests/free_plan_limit_test.py
           python3 tests/public_oauth_pages_test.py
           python3 tests/recorder_end_guard_test.py
@@ -217,3 +218,27 @@ jobs:
             print('GATEWAY_GIT_PRESENT=',git.exists())
             PY
             echo PAYMENT_AUDIT_END
+
+  one-time-gateway-plan-fix:
+    if: github.event_name == 'pull_request' && github.head_ref == 'fix/payment-intent-gateway-20261119'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - name: Patch only HamoonCloud BeOnMeet allowlist with rollback and verify valid checkout redirect
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 4m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST; exit 1;; esac
+            git -C /opt/beonmeet fetch --quiet origin refs/heads/fix/payment-intent-gateway-20261119
+            TEMP=$(mktemp /tmp/beonmeet-gateway-hotfix.XXXXXXXX.sh)
+            trap 'rm -f "$TEMP"' EXIT
+            git -C /opt/beonmeet show 6cff455825d178ebf6c65d99bb89f4f24a71a59d:scripts/deploy_hamooncloud_payment_plan_fix.sh > "$TEMP"
+            bash -n "$TEMP"
+            bash "$TEMP"
