@@ -185,8 +185,18 @@ jobs:
             (async () => {
               const browser=await chromium.connectOverCDP('http://beonmeet-five-synthetic-smoke:9223',{timeout:15000});
               const context=browser.contexts()[0] || await browser.newContext();
-              const pages=await Promise.all(Array.from({length:5},()=>context.newPage()));
+              const pages=[];
               try {
+                console.log('CDP_CONNECTED');
+                for (let i=0; i<5; i++) {
+                  console.log('OPEN_PAGE_'+i);
+                  const page=await Promise.race([
+                    context.newPage(),
+                    new Promise((_,reject)=>setTimeout(()=>reject(Error('page '+i+' timed out')),10000))
+                  ]);
+                  pages.push(page);
+                  console.log('PAGE_OPENED_'+i);
+                }
                 const results=await Promise.all(pages.map((p,i)=>p.evaluate(async (idx)=>{
                   const can=document.createElement('canvas');
                   can.width=640;can.height=360;document.body.appendChild(can);
@@ -215,7 +225,7 @@ jobs:
                 if(results.length!==5 || results.some(x=>x.bytes<3000 || x.frames<6))process.exitCode=2;
               } finally {
                 await Promise.all(pages.map(p=>p.close().catch(()=>{})));
-                await browser.close().catch(()=>{});
+                await Promise.race([browser.close().catch(()=>{}),new Promise(resolve=>setTimeout(resolve,5000))]);
               }
             })().catch(e=>{console.error('SYNTHETIC_FIVE_FAILURE='+e.message);process.exitCode=3});
             NODE
