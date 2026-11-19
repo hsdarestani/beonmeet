@@ -941,8 +941,8 @@ def _layout(title: str, body: str, active: str = "dashboard") -> str:
         ("users", "/admin/users", "کاربران", "◉"),
         ("recordings", "/admin/recordings", "ضبط ها", "◍"),
         ("auto", "/admin/auto-meetings", "همه جلسات", "◎"),
-        ("subscriptions", "/admin/subscriptions", "اشتراک ها", "◆"),
-        ("plans", "/admin/plans", "پلن ویژه", "✦"),
+        ("subscriptions", "/admin/subscriptions", "اشتراک‌های قبلی", "◆"),
+        ("plans", "/admin/plans", "قیمت شارژ ساعت", "✦"),
         ("system", "/admin/system", "سیستم", "◫"),
     ]
     nav_html = "".join(
@@ -1544,7 +1544,7 @@ async def subscriptions_page(request: Request):
     with _db() as db:
         rows=db.execute("""SELECT s.*,u.username,u.first_name,u.last_name FROM subscriptions s LEFT JOIN users u ON u.telegram_id=s.telegram_id ORDER BY s.id DESC LIMIT 300""").fetchall()
     trs="".join(f'<tr><td>{_esc((str(r["first_name"] or "")+" "+str(r["last_name"] or "")).strip() or r["username"] or r["telegram_id"])}</td><td>{_esc(PLANS.get(r["plan_code"], {"label": r["plan_code"]})["label"])}</td><td>{_money(r["price_toman"])} تومان</td><td>{_fa_date(r["starts_at"])}</td><td>{_fa_date(r["ends_at"])}</td><td>{_esc(r["status"])}</td></tr>' for r in rows) or '<tr><td colspan="6" class="empty">هنوز اشتراکی ثبت نشده</td></tr>'
-    body=f'<div class="top"><div><h1>اشتراک ها</h1><div class="sub">سابقه فعال سازی و تمدید پلن ویژه</div></div></div><div class="card"><table><thead><tr><th>کاربر</th><th>پلن</th><th>مبلغ</th><th>شروع</th><th>پایان</th><th>وضعیت</th></tr></thead><tbody>{trs}</tbody></table></div>'
+    body=f'<div class="top"><div><h1>اشتراک‌های قدیمی</h1><div class="sub">آرشیو دوره‌های خریداری‌شده قبل از کیف پول ساعت ضبط</div></div></div><div class="card"><table><thead><tr><th>کاربر</th><th>پلن</th><th>مبلغ</th><th>شروع</th><th>پایان</th><th>وضعیت</th></tr></thead><tbody>{trs}</tbody></table></div>'
     return _layout("اشتراک ها", body, "subscriptions")
 
 
@@ -1555,11 +1555,11 @@ async def plans_page(request: Request):
         f'<div class="feature"><span class="dot {status}"></span><div><b>{_esc(name)}</b><div class="muted" style="margin-top:4px">{_esc(desc)}</div></div></div>'
         for name,desc,status in PREMIUM_FEATURES
     )
-    body=f"""<div class="top"><div><h1>پلن ویژه</h1><div class="sub">قیمت گذاری و نقشه قابلیت های پولی</div></div><span class="badge premium">Premium</span></div>
+    body=f"""<div class="top"><div><h1>خرید ساعت ضبط</h1><div class="sub">شارژ اعتباری یک‌باره، بدون انقضا و بدون اشتراک</div></div><span class="badge premium">Premium</span></div>
     <div class="plan-grid">
-      <div class="card plan"><span class="badge premium">Basic</span><div class="price">{_money(PLANS["basic"]["price"])}</div><div class="muted">تومان · ۳۰ روز · ۲ ساعت ضبط</div></div>
-      <div class="card plan"><span class="badge premium">Pro</span><div class="price">{_money(PLANS["pro"]["price"])}</div><div class="muted">تومان · ۳۰ روز · ۶ ساعت ضبط</div></div>
-      <div class="card plan"><span class="badge premium">Business</span><div class="price">{_money(PLANS["business"]["price"])}</div><div class="muted">تومان · ۳۰ روز · ۱۵ ساعت ضبط</div></div>
+      <div class="card plan"><span class="badge premium">۲ ساعت</span><div class="price">{_money(PLANS["basic"]["price"])}</div><div class="muted">تومان · شارژ ۲ ساعت بدون انقضا</div></div>
+      <div class="card plan"><span class="badge premium">۶ ساعت</span><div class="price">{_money(PLANS["pro"]["price"])}</div><div class="muted">تومان · شارژ ۶ ساعت بدون انقضا</div></div>
+      <div class="card plan"><span class="badge premium">۱۵ ساعت</span><div class="price">{_money(PLANS["business"]["price"])}</div><div class="muted">تومان · شارژ ۱۵ ساعت بدون انقضا</div></div>
     </div>
     <div class="two section"><div class="card"><div class="section-head"><h2>قابلیت های ویژه</h2><span class="pill">قابل توسعه</span></div>{feature_html}</div>
     <div class="card"><div class="section-head"><h2>پلن رایگان</h2></div>
@@ -1568,7 +1568,7 @@ async def plans_page(request: Request):
       <div class="feature"><span class="dot"></span><div><b>ارسال در تلگرام</b><div class="muted">مستقیم برای درخواست دهنده</div></div></div>
       <div class="alert" style="margin-top:15px">پرداخت آنلاین زیبال از مسیر HamoonCloud برای خرید کاربرها در حال استفاده است. فعال سازی دستی هم همچنان از صفحه کاربر در دسترسه.</div>
     </div></div>"""
-    return _layout("پلن ویژه", body, "plans")
+    return _layout("خرید ساعت ضبط", body, "plans")
 
 
 
