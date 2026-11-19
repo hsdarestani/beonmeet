@@ -19,7 +19,7 @@ assert 'state.setdefault("auto_join_all", {})[str(chat_id)] = False' in main
 assert '"command": "auto", "description":' not in main
 assert '{"text": labels["auto"]}' not in main
 assert 'AUTO_ALL_MEETINGS_ENABLED and bool(state.setdefault("auto_join_all", {}).get(str(chat_id)))' in main
-assert 'if not AUTO_ALL_MEETINGS_ENABLED:' in main[main.find('async def auth_google_callback'):]
+assert 'if oauth_chat_id and not AUTO_ALL_MEETINGS_ENABLED:' in main[main.find('async def auth_google_callback'):]
 
 spec=importlib.util.spec_from_file_location('i18n', root/'app/i18n.py')
 lang=importlib.util.module_from_spec(spec)
