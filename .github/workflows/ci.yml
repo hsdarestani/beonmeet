@@ -35,3 +35,86 @@ jobs:
 
 
 
+
+  payment-readonly-production-audit:
+    if: github.event_name == 'pull_request' && github.head_ref == 'fix/payment-intent-gateway-20261119'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Read-only payment-intent routing diagnosis (no purchase or changes)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 2m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1;; esac
+            echo PAYMENT_AUDIT_BEGIN
+            date -u +'%Y-%m-%dT%H:%M:%SZ'
+            systemctl is-active beonmeet-controller
+            python3 - <<'PY'
+            import sqlite3, pathlib, datetime, os, json, urllib.request, urllib.error, urllib.parse
+            p=pathlib.Path('/opt/beonmeet/data/beonmeet.db')
+            now=datetime.datetime.now(datetime.timezone.utc)
+            print('database_exists=',p.exists(),'database_size_bytes=',p.stat().st_size if p.exists() else 0)
+            assert p.exists()
+            db=sqlite3.connect('file:'+str(p)+'?mode=ro',uri=True)
+            db.row_factory=sqlite3.Row
+            tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            print('has_payment_intents_table=', 'payment_intents' in tables)
+            if 'payment_intents' in tables:
+                for row in db.execute('SELECT status, count(*) as ct FROM payment_intents GROUP BY status'):
+                    print('intent_status_count=',row['status'],row['ct'])
+                candidates=list(db.execute("""SELECT intent,plan_code,amount_toman,status,created_at,expires_at
+                   FROM payment_intents ORDER BY created_at DESC LIMIT 10"""))
+                print('recent_intent_count=',len(candidates))
+                for i,r in enumerate(candidates):
+                    date=datetime.datetime.fromisoformat(r['created_at'].replace('Z','+00:00'))
+                    exp=datetime.datetime.fromisoformat(r['expires_at'].replace('Z','+00:00'))
+                    print('intent_summary=',i,'plan=',r['plan_code'],'amount_toman=',r['amount_toman'],
+                          'status=',r['status'],'age_minutes=',round((now-date).total_seconds()/60,1),
+                          'expired_now=',exp<=now,'ttl_minutes=',round((exp-date).total_seconds()/60,2))
+                usable=next((r for r in candidates if r['status']=='pending' and
+                    datetime.datetime.fromisoformat(r['expires_at'].replace('Z','+00:00'))>now),None)
+                if usable:
+                    def probe(url):
+                        try:
+                            req=urllib.request.Request(url,headers={'User-Agent':'BeOnMeet-internal-ops-healthcheck'})
+                            with urllib.request.urlopen(req,timeout=12) as response:
+                                raw=response.read(12000)
+                                ct=response.headers.get('content-type','')
+                                try:
+                                    ob=json.loads(raw) if 'json' in ct else None
+                                    view={k:ob.get(k) for k in ('ok','status','plan','amount_toman','detail') if k in ob} if isinstance(ob,dict) else {}
+                                except Exception:view={}
+                                print('HTTP_PROBE=',urllib.parse.urlsplit(url).netloc, response.status,'content_type=',ct.split(';')[0],'json_fields=',view)
+                        except urllib.error.HTTPError as e:
+                            try:
+                                raw=e.read(3000)
+                                ct=e.headers.get('content-type','')
+                                data=json.loads(raw) if 'json' in ct else {}
+                                detail=data.get('detail') if isinstance(data,dict) else None
+                            except Exception:detail=None
+                            print('HTTP_PROBE=',urllib.parse.urlsplit(url).netloc, e.code, 'detail=',str(detail)[:120])
+                        except Exception as e:
+                            print('HTTP_PROBE_ERROR=',urllib.parse.urlsplit(url).netloc,type(e).__name__,str(e)[:180])
+                    token=urllib.parse.quote(usable['intent'],safe='')
+                    probe('http://127.0.0.1:8109/api/billing/payment-intent?intent='+token)
+                    probe('https://beonmeet.smarbiz.sbs/api/billing/payment-intent?intent='+token)
+                else:
+                    print('NO_LIVE_PENDING_INTENT_TO_PROBE')
+            try:
+                with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=8) as response:
+                    o=json.load(response)
+                    print('service_health=',{k:o.get(k) for k in ('ok','database_backend','max_concurrent_meetings')})
+            except Exception as e:print('HEALTH_ERROR=',type(e).__name__)
+            PY
+            echo PUBLIC_PAYMENT_ROUTES
+            for url in 'https://pay.hamooncloud.ir/payments/beonmeet/start' 'https://pay.hamooncloud.ir/payments/beonmeet/status';do
+              curl -sS -o /dev/null -w 'gateway_http=%{http_code} redirect=%{redirect_url}\n' --max-time 10 "$url" || true
+            done
+            echo PAYMENT_AUDIT_END
