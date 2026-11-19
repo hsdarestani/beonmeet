@@ -174,27 +174,3 @@ jobs:
             echo AUDIT_COMPLETE
 
 
-  controlled-five-slot-pilot-release:
-    if: github.event_name == 'pull_request' && github.head_ref == 'feat/five-concurrent-recorder-capacity-20261119'
-    needs: validate
-    runs-on: ubuntu-24.04
-    timeout-minutes: 7
-    steps:
-      - name: Controlled same-host five-slot pilot (keeps original 1-slot worker)
-        uses: appleboy/ssh-action@v1
-        with:
-          host: 143.20.60.195
-          port: 9011
-          username: root
-          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
-          command_timeout: 5m
-          script: |
-            set -eu
-            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST;exit 1;; esac
-            cd /opt/beonmeet
-            git fetch --quiet origin refs/heads/feat/five-concurrent-recorder-capacity-20261119
-            TEMP=$(mktemp /tmp/beonmeet-five-slot-release.XXXXXXXX.sh)
-            trap 'rm -f "$TEMP"' EXIT
-            git show 1392b17de6528ec17a02e7d9b2e3d9e3e80dfbbf:scripts/activate_five_on_shared_vps.sh > "$TEMP"
-            bash -n "$TEMP"
-            bash "$TEMP"
