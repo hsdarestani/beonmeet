@@ -44,6 +44,7 @@ from admin_panel import (
     find_recording_for_artifact,
     free_recording_entitlement,
     paid_recording_entitlement,
+    paid_sales_capacity,
     get_payment_intent,
     init_db,
     is_premium,
@@ -268,38 +269,32 @@ async def tg_text(
 
 
 async def send_subscription_offer(chat_id: int | str, message_key: str = "premium_offer") -> None:
-    intents: dict[str, dict[str, Any]] = {}
-    for plan_code in PUBLIC_PLAN_CODES:
-        intents[plan_code] = await asyncio.to_thread(
-            create_payment_intent, str(chat_id), plan_code
-        )
-
     lang = user_language(chat_id)
-    keyboard = {
-        "inline_keyboard": [
-            [{
-                "text": i18n_tr(lang, "plan_basic"),
-                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['basic']['intent']}",
-            }],
-            [{
-                "text": i18n_tr(lang, "plan_pro"),
-                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['pro']['intent']}",
-            }],
-            [{
-                "text": i18n_tr(lang, "plan_business"),
-                "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intents['business']['intent']}",
-            }],
-        ]
-    }
+    rows = []
+    for code, text_key in (
+        ("basic", "plan_basic"), ("pro", "plan_pro"), ("business", "plan_business")
+    ):
+        # The tiny shared VPS has a finite paid subscription budget. Do not
+        # show clickable checkout links after it has been sold.
+        try:
+            intent = await asyncio.to_thread(create_payment_intent, str(chat_id), code)
+        except ValueError:
+            continue
+        rows.append([{
+            "text": i18n_tr(lang, text_key),
+            "url": f"https://pay.hamooncloud.ir/payments/beonmeet/start?intent={intent['intent']}",
+        }])
+    if not rows:
+        await tg_text(chat_id, t(chat_id, "sales_paused"), with_menu=True)
+        return
     await telegram(
         "sendMessage",
         {
             "chat_id": str(chat_id),
             "text": t(chat_id, message_key),
-            "reply_markup": json.dumps(keyboard, ensure_ascii=False),
+            "reply_markup": json.dumps({"inline_keyboard": rows}, ensure_ascii=False),
         },
     )
-
 
 async def setup_telegram_profile() -> None:
     try:
@@ -2054,6 +2049,16 @@ async def billing_payment_intent(intent: str) -> dict[str, Any]:
     plan = PLANS.get(str(row.get("plan_code") or ""))
     if not plan:
         raise HTTPException(status_code=409, detail="Unknown plan")
+    if (
+        row.get("status") == "pending"
+        and str(row.get("plan_code") or "") in PUBLIC_PLAN_CODES
+        and not (await asyncio.to_thread(
+            paid_sales_capacity,
+            str(row.get("plan_code") or ""),
+            str(row.get("telegram_id") or ""),
+        )).get("allowed")
+    ):
+        raise HTTPException(status_code=409, detail="Recorder capacity sold out; checkout temporarily paused")
     return {
         "ok": True,
         "intent": intent,
