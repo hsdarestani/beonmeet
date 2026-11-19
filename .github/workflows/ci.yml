@@ -97,3 +97,160 @@ jobs:
             echo 'public_health_subset='
             curl -fsS --max-time 8 http://127.0.0.1:8109/health | python3 -c 'import sys,json;d=json.load(sys.stdin);print({k:d.get(k) for k in ("max_concurrent_meetings","premium_reserved_slots","free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs","database_backend")})'
             echo PREFLIGHT_END
+
+  controlled-single-vps-release:
+    if: github.event_name == 'pull_request' && github.head_ref == 'feat/ad-launch-tiered-billing-20261113'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Deploy only BeOnMeet Python files with automatic rollback on failure
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 8m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo 'Wrong host, refusing'; exit 1 ;; esac
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 60 9
+            cd /opt/beonmeet
+            SOURCE=280e44f72e1c0e01a4cb28ddb3eea91539390837
+            test -s .env
+            [ -z "$(git status --porcelain -- app/main.py app/admin_panel.py app/i18n.py app/billing_policy.py)" ] || { echo 'Locally edited target files, refusing'; exit 1; }
+            test "$(nproc)" -le 4 || { echo 'Host changed, re-review deployment'; exit 1; }
+            python3 - <<'PY'
+            import json,urllib.request
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=10) as r:
+                d=json.load(r)
+            assert d.get('max_concurrent_meetings')==1, 'single-recorder guard'
+            assert not d.get('autoscaler_enabled'), 'external autoscaler not allowed'
+            for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'):
+                assert int(d.get(k) or 0)==0, f'{k} is nonempty'
+            with urllib.request.urlopen('http://127.0.0.1:9124/capacity',timeout=10) as r:
+                c=json.load(r)
+            assert int((c.get('data') or c).get('runningJobs') or 0)==0, 'recorder currently active'
+            print('SAFE_SINGLE_RECORDER_IDLE')
+            PY
+            git fetch --quiet origin refs/heads/feat/ad-launch-tiered-billing-20261113
+            git merge-base --is-ancestor "$SOURCE" FETCH_HEAD || { echo 'Expected reviewed source not found'; exit 1; }
+            BACKUP_DIR="/opt/beonmeet/.launch-backup-$(date -u +%Y%m%dT%H%M%S)"
+            mkdir -m 700 "$BACKUP_DIR"
+            STAGE=$(mktemp -d /opt/beonmeet/.launch-stage.XXXXXXXX)
+            export STAGE
+            for name in main.py admin_panel.py i18n.py billing_policy.py; do
+              git show "$SOURCE:app/$name" > "$STAGE/$name"
+              chmod 644 "$STAGE/$name"
+            done
+            .venv/bin/python -m py_compile "$STAGE/main.py" "$STAGE/admin_panel.py" "$STAGE/i18n.py" "$STAGE/billing_policy.py"
+            tar -czf "$BACKUP_DIR/previous-app-env.tar.gz" .env app/main.py app/admin_panel.py app/i18n.py data/state.json
+            chmod 600 "$BACKUP_DIR/previous-app-env.tar.gz"
+            python3 - <<'PY'
+            import sqlite3
+            from pathlib import Path
+            import os
+            source=sqlite3.connect('file:/opt/beonmeet/data/beonmeet.db?mode=ro',uri=True)
+            dst=sqlite3.connect(os.environ['STAGE']+'/db-before-launch.sqlite')
+            source.backup(dst)
+            dst.close();source.close()
+            print('DATABASE_BACKUP_COMPLETE')
+            PY
+            mv "$STAGE/db-before-launch.sqlite" "$BACKUP_DIR/beonmeet-before-launch.sqlite"
+            [ ! -f app/billing_policy.py ] && HAD_BILLING=0 || HAD_BILLING=1
+            export HAD_BILLING
+            python3 - <<'PY'
+            from pathlib import Path
+            import json,os,re,urllib.request
+            env_path=Path('/opt/beonmeet/.env')
+            old=env_path.read_text()
+            current={}
+            for line in old.splitlines():
+                if '=' in line and not line.lstrip().startswith('#'):
+                    k,v=line.split('=',1);current[k.strip()]=v.strip().strip('"').strip("'")
+            token=current.get('TELEGRAM_BOT_TOKEN','')
+            if not token:raise SystemExit('Telegram token missing; refusing deployment')
+            try:
+                with urllib.request.urlopen('https://api.telegram.org/bot'+token+'/getMe',timeout=15) as r:
+                    response=json.load(r)
+            except Exception:raise SystemExit('Telegram getMe unavailable; refusing deployment')
+            username=(response.get('result') or {}).get('username','') if response.get('ok') else ''
+            if not re.fullmatch(r'[A-Za-z0-9_]{5,32}',username):
+                raise SystemExit('Telegram bot username not verified')
+            desired={
+                'TELEGRAM_BOT_URL':'https://t.me/'+username,
+                'FREE_RECORDING_LIMIT':'1',
+                'PAID_SALES_MAX_ACTIVE_USERS':'12',
+                'PAID_SALES_MAX_SOLD_HOURS':'60',
+                'WHISPER_MODEL':'small',
+                'RECOVERY_WHISPER_MODEL':'base',
+                'WHISPER_CPU_THREADS':'2',
+                'TRANSCRIPTION_CONCURRENCY':'1',
+                'SEND_ADMIN_RECORDING_COPIES':'false'
+            }
+            updated=[]
+            for line in old.splitlines():
+                key=line.split('=',1)[0].strip()
+                if key in desired and not line.lstrip().startswith('#'):
+                    updated.append(key+'='+desired.pop(key))
+                else:updated.append(line)
+            updated.extend(k+'='+v for k,v in desired.items())
+            dst=Path(os.environ['STAGE'])/'desired.env'
+            dst.write_text('\n'.join(updated)+'\n')
+            dst.chmod(0o600)
+            print('BOT_USERNAME_VERIFIED_AND_SINGLE_VPS_FLAGS_STAGED')
+            PY
+            INSTALLED=0
+            SUCCESS=0
+            rollback() {
+              if [ "$INSTALLED" = "1" ] && [ "$SUCCESS" = "0" ]; then
+                echo 'ROLLBACK_BEGIN'
+                tar -xzf "$BACKUP_DIR/previous-app-env.tar.gz" -C /opt/beonmeet || true
+                if [ "$HAD_BILLING" = "0" ]; then rm -f /opt/beonmeet/app/billing_policy.py; fi
+                systemctl restart beonmeet-controller || true
+                echo 'ROLLBACK_FINISHED'
+              fi
+            }
+            trap rollback EXIT
+            # Confirm no recording began while source was staged.
+            python3 - <<'PY'
+            import json,urllib.request
+            with urllib.request.urlopen('http://127.0.0.1:9124/capacity',timeout=8) as r:d=json.load(r)
+            assert int((d.get('data') or d).get('runningJobs') or 0)==0
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=8) as r:d=json.load(r)
+            assert int(d.get('active_delivery_jobs') or 0)==0
+            assert int(d.get('pending_delivery_jobs') or 0)==0
+            PY
+            INSTALLED=1
+            for name in main.py admin_panel.py i18n.py billing_policy.py; do
+              install -m 644 "$STAGE/$name" "app/$name"
+            done
+            install -m 600 "$STAGE/desired.env" .env
+            systemctl restart beonmeet-controller
+            READY=0
+            for i in $(seq 1 25); do
+              if curl -fsS --max-time 3 http://127.0.0.1:8109/health >/dev/null 2>&1; then READY=1; break; fi
+              sleep 2
+            done
+            [ "$READY" = "1" ] || { echo 'Health not ready'; exit 1; }
+            python3 - <<'PY'
+            import json,urllib.request
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=8) as r:d=json.load(r)
+            assert int(d.get('max_concurrent_meetings') or 0)==1, 'must remain one recorder'
+            assert not d.get('autoscaler_enabled'),'autoscaling must remain disabled'
+            assert d.get('database_backend')=='sqlite','must retain existing database'
+            with urllib.request.urlopen('http://127.0.0.1:8109/fa',timeout=8) as r:html=r.read().decode('utf-8')
+            for label in ('298,000','498,000','998,000','https://t.me/'):
+                assert label in html, f'landing not ready: {label}'
+            print('SINGLE_VPS_PUBLIC_PLANS_AND_BOT_LINK_OK')
+            PY
+            curl -fsS --max-time 15 https://beonmeet.smarbiz.sbs/fa >/dev/null
+            systemctl is-active --quiet rednotedownloader
+            nginx -t >/dev/null 2>&1
+            SUCCESS=1
+            echo 'BEONMEET_SINGLE_VPS_RELEASE_OK'
+            echo "ROLLBACK_FILES=$BACKUP_DIR"
+            rm -rf "$STAGE"
