@@ -2750,9 +2750,9 @@ async def home() -> str:
     )
     price_cards = "".join(
         '<div class="card"><b>' + PUBLIC_PLANS[code]["label"] + '</b>'
-        + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>toman / 30 days</small></div>'
+        + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>toman · one-time purchase</small></div>'
         + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' hours recording</div>'
-        + '<p>This is a TOTAL allowance shared across meetings, not per meeting. Unused minutes expire after 30 days; another purchase schedules a future period, not an immediate top-up.</p>'
+        + '<p>Purchased recording hours are added to your balance immediately, never expire, and can be used across all meetings.</p>'
         + '</div>'
         for code in PUBLIC_PLAN_CODES
     )
@@ -2762,18 +2762,18 @@ async def home() -> str:
 <span class="eyebrow">Google Meet recording in Telegram</span>
 <h1>Send your meeting link. Get the recording in Telegram.</h1>
 <p>Send the Google Meet link to our Telegram bot. For scheduled meetings, invite the recorder to the meeting event; for an ongoing meeting use Join now. The host may need to admit the recorder before recording begins.</p>
-<div class="cta">__BOT_CTA__<a class="button secondary" href="#plans">Compare plans</a></div>
+<div class="cta">__BOT_CTA__<a class="button secondary" href="#credits">Buy hours</a></div>
 </div></section>
-<section id="plans" class="section"><div class="wrap">
-<h2>Simple plans, predictable recording hours</h2>
-<p>Each purchase gives a total allowance of 2, 6 or 15 recorded hours over a 30-day period starting at activation. Hours can be spread across meetings. Unused hours do not roll over, and there is no automatic renewal or automatic overage charge. If you run out early, another plan purchase starts only after the current paid period; contact support for immediate extra hours.</p>
+<section id="credits" class="section"><div class="wrap">
+<h2>Buy recording hours, not subscriptions</h2>
+<p>Choose 2, 6 or 15 hours of recording credit. Each purchase instantly adds hours to your existing balance, even if you already have credit. Hours never expire, there are no monthly subscriptions, and no automatic renewal. Completed recordings consume the corresponding time. If a recording runs beyond your balance, the excess is deducted from your next purchase.</p>
 <div class="grid prices">__PRICE_CARDS__</div>
-<div class="cta">__BOT_CTA__<a class="button secondary" href="/terms">Plan terms</a></div>
+<div class="cta">__BOT_CTA__<a class="button secondary" href="/terms">Credit terms</a></div>
 </div></section>
 <section id="how"><div class="wrap grid">
 <div class="card"><b>1. Send the link</b><p>Send a Google Meet link directly in the bot. For a future meeting, invite the recorder email to the calendar event.</p></div>
 <div class="card"><b>2. Admit the recorder</b><p>The recorder attempts to join the requested meeting. The host may need to admit it.</p></div>
-<div class="card"><b>3. Receive the result</b><p>After recording, the bot sends the files to your Telegram chat, subject to available capacity and plan.</p></div>
+<div class="card"><b>3. Receive the result</b><p>After recording, the bot sends the files to your Telegram chat, subject to available capacity and your available credit.</p></div>
 </div></section>
 <section class="section" id="data"><div class="wrap">
 <h2>Data access and privacy</h2>
@@ -2786,11 +2786,11 @@ async def home() -> str:
 </div></section>
 <section class="section"><div class="wrap">
 <h2>Recordings delivered where you already work</h2>
-<p>Meeting recordings and eligible Premium outputs such as separate audio and transcripts are delivered through Telegram. Temporary delivery files are retained only as needed to complete delivery and, depending on plan, may remain available for up to 72 hours before expiry.</p>
+<p>Meeting recordings and available outputs such as separate audio and transcripts are delivered through Telegram. Temporary delivery files are retained only as needed to complete delivery and may remain available for up to 72 hours. Purchased recording hours never expire.</p>
 </div></section>
 </main>"""
     return public_shell(
-        "BeOnMeet | Google Meet recording plans",
+        "BeOnMeet | Prepaid Google Meet recording hours",
         body.replace("__BOT_CTA__", bot_cta).replace("__PRICE_CARDS__", price_cards),
     )
 
@@ -2807,9 +2807,9 @@ async def home_fa() -> str:
     )
     plan_cards = "".join(
         '<div class="card" style="text-align:right"><b>' + PUBLIC_PLANS[code]["label"] + '</b>'
-        + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>تومان / ۳۰ روز</small></div>'
+        + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>تومان · خرید یک‌باره</small></div>'
         + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' ساعت ضبط جلسه</div>'
-        + '<p>این سهمیه، مجموع ضبط تمام جلسه‌ها در ۳۰ روز است، نه سهمیه هر جلسه. ساعت باقی‌مانده منتقل نمی‌شود؛ خرید مجدد، دوره بعدی را فعال می‌کند نه شارژ فوری.</p>'
+        + '<p>هر خرید فوراً به موجودی ساعت ضبط اضافه می‌شود؛ ساعت‌ها تاریخ انقضا ندارند.</p>'
         + '</div>'
         for code in PUBLIC_PLAN_CODES
     )
@@ -2819,11 +2819,11 @@ async def home_fa() -> str:
 <span class="eyebrow">ضبط و دریافت جلسات Google Meet در تلگرام</span>
 <h1>جلسه‌ات را از دست نده. BeOnMeet ضبطش می‌کند.</h1>
 <p>لینک Google Meet را داخل ربات بفرست. برای جلسه آینده، ایمیل رکوردر را به رویداد تقویم دعوت کن؛ برای جلسه‌ای که شروع شده «ورود فوری» را بزن. پس از تأیید میزبان، ضبط انجام می‌شود و فایل در تلگرام ارسال می‌شود.</p>
-<div class="cta">__BOT_CTA__<a class="button secondary" href="#plans">مشاهده قیمت‌ها</a></div>
+<div class="cta">__BOT_CTA__<a class="button secondary" href="#credits">خرید ساعت</a></div>
 </div></section>
-<section id="plans" class="section"><div class="wrap">
-<h2>پلن‌های شفاف و ساعتی</h2>
-<p>هر پلن مجموعاً ۲، ۶ یا ۱۵ ساعت ضبط در ۳۰ روز از شروع دوره دارد؛ می‌توانی این ساعت‌ها را بین چند جلسه تقسیم کنی. ساعت باقی‌مانده در پایان دوره می‌سوزد. تمدید خودکار و برداشت خودکار بابت مازاد نداریم. اگر ساعت‌ها زودتر تمام شد، خرید دوباره سهمیه همان دوره را افزایش نمی‌دهد و برای ۳۰ روز بعد رزرو می‌شود؛ برای ساعت اضافه فوری باید با پشتیبانی هماهنگ کنی.</p>
+<section id="credits" class="section"><div class="wrap">
+<h2>فقط خرید ساعت ضبط؛ بدون اشتراک</h2>
+<p>فقط ساعت ضبط می‌خری: ۲، ۶ یا ۱۵ ساعت. هر خرید بلافاصله به موجودی قبلی‌ات اضافه می‌شود، تاریخ انقضا ندارد و برای تمام جلسه‌ها قابل استفاده است. به‌اندازه مدت ضبط موفق از اعتبار کم می‌شود؛ اگر جلسه از موجودی بیشتر طول بکشد، مازاد از شارژ بعدی کسر می‌شود. تمدید خودکار یا هزینه اضافه خودکار نداریم.</p>
 <div class="grid prices">__PRICE_CARDS__</div>
 <div class="cta">__BOT_CTA__</div>
 </div></section>
