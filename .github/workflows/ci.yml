@@ -117,4 +117,44 @@ jobs:
             for url in 'https://pay.hamooncloud.ir/payments/beonmeet/start' 'https://pay.hamooncloud.ir/payments/beonmeet/status';do
               curl -sS -o /dev/null -w 'gateway_http=%{http_code} redirect=%{redirect_url}\n' --max-time 10 "$url" || true
             done
+
+            echo GATEWAY_LATEST_LIVE_INTENT_PROBE
+            python3 - <<'PY'
+            import sqlite3,urllib.request,urllib.error,urllib.parse,json,datetime
+            now=datetime.datetime.now(datetime.timezone.utc)
+            db=sqlite3.connect('file:/opt/beonmeet/data/beonmeet.db?mode=ro',uri=True);db.row_factory=sqlite3.Row
+            r=db.execute("""SELECT intent,plan_code,status,created_at,expires_at
+                FROM payment_intents WHERE status='pending' ORDER BY created_at DESC LIMIT 1""").fetchone()
+            if not r:
+                print('GATEWAY_PROBE_SKIPPED no pending intent');raise SystemExit()
+            expiry=datetime.datetime.fromisoformat(r['expires_at'].replace('Z','+00:00'))
+            if now>=expiry:
+                print('GATEWAY_PROBE_SKIPPED latest intent expired');raise SystemExit()
+            t=urllib.parse.quote(r['intent'],safe='')
+            url='https://pay.hamooncloud.ir/payments/beonmeet/start?intent='+t
+            req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 (compatible; BeOnMeetQA/1.0)'})
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self,request,fp,code,msg,headers,newurl):return None
+            try:
+                with urllib.request.build_opener(NoRedirect()).open(req,timeout=15) as result:
+                    body=result.read(12000).decode('utf-8',errors='replace')
+                    code=result.status;ctype=result.headers.get('Content-Type','')
+                    redirect=result.headers.get('Location','')
+            except urllib.error.HTTPError as e:
+                body=e.read(12000).decode('utf-8',errors='replace')
+                code=e.code;ctype=e.headers.get('Content-Type','')
+                redirect=e.headers.get('Location','')
+            except Exception as e:
+                print('GATEWAY_PROBE_EXCEPTION=',type(e).__name__,str(e)[:150]);raise SystemExit()
+            print('GATEWAY_VALID_INTENT_HTTP=',code)
+            print('GATEWAY_VALID_INTENT_CT=',ctype[:70])
+            print('GATEWAY_VALID_INTENT_REDIRECT_HOST=',urllib.parse.urlsplit(redirect).netloc)
+            for phrase in ('پرداخت قابل انجام نیست','درخواست منقضی یا نامعتبره','از داخل BeOnMeet دوباره تلاش کن','طرح پرداخت','مبلغ','خطا','منقضی','نامعتبر'):
+                print('GATEWAY_BODY_CONTAINS',repr(phrase),phrase in body)
+            print('GATEWAY_BODY_SIZE=',len(body))
+            print('GATEWAY_PROBE_PLAN=',r['plan_code'])
+            PY
+            echo GATEWAY_DNS_AND_HEADERS
+            getent ahostsv4 pay.hamooncloud.ir | awk 'NR==1 {print "gateway_ip="$1}'
+            curl -sSI --max-time 8 https://pay.hamooncloud.ir/payments/beonmeet/start | grep -Ei '^(server|via|x-powered-by|content-type|HTTP/|location):?' | head -8 || true
             echo PAYMENT_AUDIT_END
