@@ -1427,36 +1427,18 @@ async def telegram_loop() -> None:
                         await tg_text(chat_id, t(chat_id, "admin_only"))
                     continue
 
-                if text.startswith("/plans") or text.startswith("/premium"):
+                if text.startswith(("/credits", "/balance", "/plans", "/premium")):
+                    wallet = await asyncio.to_thread(recording_credit_info, str(chat_id))
+                    remaining = max(0, int(wallet.get("remaining_seconds") or 0))
+                    message = t(chat_id, "wallet_balance", hours=remaining // 3600,
+                                minutes=(remaining % 3600 + 59) // 60)
                     info = await asyncio.to_thread(subscription_info, str(chat_id))
-                    if info.get("premium"):
-                        until = info.get("period_end") or info.get("until")
-                        until_text = until.astimezone().strftime("%Y-%m-%d") if until else ""
-                        balance = await asyncio.to_thread(paid_recording_entitlement, str(chat_id))
-                        remain = balance.get("remaining_seconds")
-                        remaining_label = (
-                            t(chat_id, "quota_legacy") if remain is None
-                            else t(chat_id, "quota_remaining", minutes=int(remain // 60),
-                                   used=int(balance.get("used_seconds") or 0) // 60)
-                        )
-                        upcoming = await asyncio.to_thread(next_subscription_period, str(chat_id))
-                        upcoming_text = ""
-                        if upcoming and upcoming.get("starts") and upcoming.get("until"):
-                            upcoming_text = "\n\n" + t(
-                                chat_id, "renewal_scheduled",
-                                plan=plan_description(str(upcoming.get("plan") or "")),
-                                starts=upcoming["starts"].astimezone().strftime("%Y-%m-%d"),
-                                until=upcoming["until"].astimezone().strftime("%Y-%m-%d"),
-                            )
-                        await tg_text(
-                            chat_id,
-                            t(chat_id, "premium_active", until=until_text)
-                            + "\n\n" + plan_description(str(info.get("plan") or ""))
-                            + "\n" + remaining_label + upcoming_text,
-                            with_menu=True,
-                        )
-                    else:
-                        await send_subscription_offer(chat_id)
+                    if info.get("premium") and str(info.get("plan") or "") in ("monthly","quarterly","halfyear"):
+                        end = info.get("period_end") or info.get("until")
+                        until = end.astimezone().strftime("%Y-%m-%d") if end else ""
+                        message += "\n\n" + t(chat_id, "quota_legacy") + " " + until
+                    await tg_text(chat_id, message, with_menu=True)
+                    await send_subscription_offer(chat_id)
                     continue
 
                 if text.startswith("/auto"):
