@@ -170,4 +170,20 @@ jobs:
             echo PAYMENT_ERROR_SOURCE_FILE_MATCHES
             find /opt /srv /var/www -maxdepth 6 -type f \( -name '*.py' -o -name '*.js' -o -name '*.ts' \) ! -path '*/node_modules/*' ! -path '*/.venv/*' ! -path '*/.git/*' -print0 2>/dev/null |
               xargs -0 -r grep -Fl 'درخواست منقضی یا نامعتبره' 2>/dev/null | head -15 || true
+
+            echo HAMOON_DASHBOARD_ORIGIN_DISCOVERY
+            systemctl show hamoon-dashboard.service -p WorkingDirectory -p FragmentPath -p User --no-pager
+            systemctl cat hamoon-dashboard.service | grep -E '^WorkingDirectory=|^ExecStart=' | sed -E 's/(TOKEN|SECRET|PASSWORD|API_KEY|MERCHANT|AUTH|KEY)=[^ ]+/\1=[REDACTED]/g' | cut -c1-200
+            echo LISTENING_PID_8108
+            ss -ltnp | grep -F ':8108' | cut -c1-180
+            echo HAMOON_EXECUTABLE_WORKDIR
+            pid=$(ss -ltnp | sed -n 's/.*:8108.*pid=\([0-9]*\).*/\1/p' | head -1)
+            if [ -n "$pid" ];then
+              readlink -f "/proc/$pid/cwd" || true
+              readlink -f "/proc/$pid/exe" || true
+            fi
+            echo PAYMENT_GATEWAY_SOURCE_LOCATIONS
+            for p in /root /home /usr/local/bin /opt /srv;do
+              find "$p" -maxdepth 4 -type f \( -name '*payment*.py' -o -name '*dashboard*.py' -o -name '*gateway*.py' -o -name '*zibal*.py' -o -name '*payment*.js' \) ! -path '*/node_modules/*' ! -path '*/.venv/*' 2>/dev/null | head -30
+            done
             echo PAYMENT_AUDIT_END
