@@ -104,6 +104,8 @@ FREE_DOWNLOAD_TTL_HOURS = max(
 PREMIUM_DOWNLOAD_TTL_HOURS = max(1, int(os.environ.get("PREMIUM_DOWNLOAD_TTL_HOURS", "72")))
 BOT_DISPLAY_NAME = os.environ.get("BOT_DISPLAY_NAME", "BeOnMeet Recorder")
 CALENDAR_POLL_SECONDS = int(os.environ.get("CALENDAR_POLL_SECONDS", "30"))
+# Closed until genuine end-to-end automatic-calendar QA has passed.
+AUTO_ALL_MEETINGS_ENABLED = os.environ.get("AUTO_ALL_MEETINGS_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
 PAYMENT_STATUS_URL = os.environ.get(
     "PAYMENT_STATUS_URL",
     "https://pay.hamooncloud.ir/payments/beonmeet/status",
@@ -168,6 +170,13 @@ def load_state() -> None:
     state.setdefault("recording_downloads", {})
     state.setdefault("premium_recoveries", {})
     state.setdefault("free_limit_notified", {})
+    if not AUTO_ALL_MEETINGS_ENABLED:
+        prior_auto = state.setdefault("auto_join_all", {})
+        if any(prior_auto.values()):
+            for key in prior_auto:
+                prior_auto[key] = False
+            STATE_STORE.save(state)
+            print("Previously enabled All Meetings settings were disabled; Google tokens preserved", flush=True)
     print(f"controller state loaded from {source}", flush=True)
 
 
@@ -225,8 +234,8 @@ def telegram_reply_keyboard(chat_id: int | str) -> dict[str, Any]:
     labels = i18n_menu(user_language(chat_id))
     rows = [
         [{"text": labels["new"]}, {"text": labels["premium"]}],
-        [{"text": labels["now"]}, {"text": labels["auto"]}],
-        [{"text": labels["help"]}, {"text": labels["language"]}],
+        [{"text": labels["now"]}, {"text": labels["help"]}],
+        [{"text": labels["language"]}],
     ]
     if ADMINUSER and str(chat_id) == ADMINUSER:
         rows.append([{"text": labels["admin"]}])
@@ -313,7 +322,6 @@ async def setup_telegram_profile() -> None:
                 {"command": "start", "description": profile["commands"]["start"]},
                 {"command": "plans", "description": profile["commands"]["plans"]},
                 {"command": "now", "description": profile["commands"]["now"]},
-                {"command": "auto", "description": profile["commands"]["auto"]},
                 {"command": "language", "description": profile["commands"]["language"]},
             ]
             await telegram("setMyCommands", {
@@ -334,7 +342,6 @@ async def setup_telegram_profile() -> None:
             {"command": "start", "description": default_profile["commands"]["start"]},
             {"command": "plans", "description": default_profile["commands"]["plans"]},
             {"command": "now", "description": default_profile["commands"]["now"]},
-            {"command": "auto", "description": default_profile["commands"]["auto"]},
             {"command": "language", "description": default_profile["commands"]["language"]},
         ]
         await telegram("setMyCommands", {
@@ -352,7 +359,6 @@ async def setup_telegram_profile() -> None:
                     {"command": "start", "description": profile["commands"]["start"]},
                     {"command": "plans", "description": profile["commands"]["plans"]},
                     {"command": "now", "description": profile["commands"]["now"]},
-                    {"command": "auto", "description": profile["commands"]["auto"]},
                     {"command": "language", "description": profile["commands"]["language"]},
                     {"command": "admin", "description": profile["commands"]["admin"]},
                 ]
@@ -432,7 +438,7 @@ def calendar_connected(chat_id: int | str | None = None) -> bool:
 
 
 def auto_join_enabled(chat_id: int | str) -> bool:
-    return bool(state.setdefault("auto_join_all", {}).get(str(chat_id)))
+    return AUTO_ALL_MEETINGS_ENABLED and bool(state.setdefault("auto_join_all", {}).get(str(chat_id)))
 
 
 def calendar_auth_url(chat_id: int | str) -> str:
@@ -1242,7 +1248,7 @@ async def calendar_loop() -> None:
 
             # Personal auto mode: once enabled, every Google Meet on that user's
             # connected calendar is discovered and launched without sending links.
-            auto_settings = dict(state.setdefault("auto_join_all", {}))
+            auto_settings = dict(state.setdefault("auto_join_all", {})) if AUTO_ALL_MEETINGS_ENABLED else {}
             for chat_id, enabled in auto_settings.items():
                 if not enabled:
                     calendar_scan_status[chat_id] = {"status": "disabled"}
@@ -1443,6 +1449,13 @@ async def telegram_loop() -> None:
                     parts = text.strip().lower().split(maxsplit=1)
                     explicit = parts[1] if len(parts) > 1 else ""
 
+                    if not AUTO_ALL_MEETINGS_ENABLED:
+                        if explicit in {"off", "0", "false", "disable"}:
+                            state.setdefault("auto_join_all", {})[str(chat_id)] = False
+                            await save_state()
+                        await tg_text(chat_id, t(chat_id, "auto_unavailable"), with_menu=True)
+                        continue
+
                     if explicit in {"status", "check"}:
                         await tg_text(chat_id, auto_calendar_status_message(chat_id), with_menu=True)
                         continue
@@ -1479,7 +1492,9 @@ async def telegram_loop() -> None:
 
                 if text.startswith("/start"):
                     premium_active = await asyncio.to_thread(is_premium, str(chat_id))
-                    if not premium_active:
+                    if not AUTO_ALL_MEETINGS_ENABLED:
+                        auth_status = t(chat_id, "manual_mode_notice")
+                    elif not premium_active:
                         auth_status = t(chat_id, "auto_premium_status")
                     elif calendar_connected(chat_id):
                         auth_status = t(chat_id, "calendar_connected")
@@ -2698,7 +2713,7 @@ a{color:inherit}.wrap{width:min(1120px,calc(100% - 40px));margin:auto}.nav{displ
 def public_shell(title: str, body: str) -> str:
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title><meta name="description" content="BeOnMeet automatically joins scheduled Google Meet meetings, records them, and delivers the result to Telegram.">
+<title>{title}</title><meta name="description" content="Send a Google Meet link for scheduled or immediate recording and Telegram delivery.">
 <style>{PUBLIC_SITE_CSS}</style></head>
 <body><div class="wrap"><nav class="nav"><a class="brand" href="/"><span class="mark">B</span>BeOnMeet</a>
 <div class="links"><a href="/fa">فارسی</a><a href="/#how">How it works</a><a href="/#plans">Plans</a><a href="/#data">Google data</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div></nav></div>
@@ -2729,9 +2744,9 @@ async def home() -> str:
     body = """
 <main>
 <section class="hero"><div class="wrap">
-<span class="eyebrow">Automatic Google Meet recorder for Telegram</span>
-<h1>Your calendar knows the meeting. BeOnMeet handles the rest.</h1>
-<p>Connect Google Calendar once. BeOnMeet detects scheduled Google Meet events across your accessible calendars, joins at meeting time, records the session and delivers the result to your Telegram chat.</p>
+<span class="eyebrow">Google Meet recording in Telegram</span>
+<h1>Send your meeting link. Get the recording in Telegram.</h1>
+<p>Send the Google Meet link to our Telegram bot. For scheduled meetings, invite the recorder to the meeting event; for an ongoing meeting use Join now. The host may need to admit the recorder before recording begins.</p>
 <div class="cta">__BOT_CTA__<a class="button secondary" href="#plans">Compare plans</a></div>
 </div></section>
 <section id="plans" class="section"><div class="wrap">
@@ -2741,16 +2756,16 @@ async def home() -> str:
 <div class="cta">__BOT_CTA__<a class="button secondary" href="/terms">Plan terms</a></div>
 </div></section>
 <section id="how"><div class="wrap grid">
-<div class="card"><b>1. Connect once with Premium</b><p>Premium users authorize read only access to Google Calendar from the BeOnMeet Telegram bot.</p></div>
-<div class="card"><b>2. Meetings are detected</b><p>Google Meet events are found automatically whether you organize them or are invited to them. Cancelled and declined events are ignored.</p></div>
-<div class="card"><b>3. Receive the result</b><p>The recorder joins at the scheduled time and sends the recording back to the Telegram user who connected the calendar.</p></div>
+<div class="card"><b>1. Send the link</b><p>Send a Google Meet link directly in the bot. For a future meeting, invite the recorder email to the calendar event.</p></div>
+<div class="card"><b>2. Admit the recorder</b><p>The recorder attempts to join the requested meeting. The host may need to admit it.</p></div>
+<div class="card"><b>3. Receive the result</b><p>After recording, the bot sends the files to your Telegram chat, subject to available capacity and plan.</p></div>
 </div></section>
 <section class="section" id="data"><div class="wrap">
-<h2>Designed around minimum Google access</h2>
-<p>BeOnMeet requests read only Calendar permissions. It does not create, edit or delete your Google Calendar events.</p>
+<h2>Data access and privacy</h2>
+<p>Manual recording requires your meeting link. Previously connected Calendar permissions remain read-only; personal automatic recording of all meetings is temporarily unavailable.</p>
 <div class="data">
-<div class="notice"><strong>Calendar list</strong><br>Used to discover the calendars available to your Google account so meetings are not limited to the primary calendar.</div>
-<div class="notice"><strong>Calendar events</strong><br>Used to identify Google Meet links, event timing and whether an event is cancelled or declined so the recorder can join at the correct time.</div>
+<div class="notice"><strong>Meeting links</strong><br>Used only to find and record the meetings you explicitly request.</div>
+<div class="notice"><strong>Read-only Google access</strong><br>Existing authorizations do not let BeOnMeet modify your Calendar events. You can revoke access from your Google Account.</div>
 </div>
 <div class="notice" style="margin-top:16px"><strong>No advertising use of Google user data.</strong><br>Google user data obtained through Google APIs is used only to provide BeOnMeet's user facing meeting automation. It is not sold and is not used for advertising or ad targeting. See the <a href="/privacy">Privacy Policy</a> for full details.</div>
 </div></section>
@@ -2788,7 +2803,7 @@ async def home_fa() -> str:
 <section class="hero"><div class="wrap">
 <span class="eyebrow">ضبط و دریافت جلسات Google Meet در تلگرام</span>
 <h1>جلسه‌ات را از دست نده. BeOnMeet ضبطش می‌کند.</h1>
-<p>لینک Google Meet را به ربات بده یا تقویم Google را متصل کن. ربات در زمان جلسه برای ورود اقدام می‌کند و پس از پذیرفته‌شدن توسط میزبان، جلسه را ضبط و فایل را در تلگرام ارسال می‌کند.</p>
+<p>لینک Google Meet را داخل ربات بفرست. برای جلسه آینده، ایمیل رکوردر را به رویداد تقویم دعوت کن؛ برای جلسه‌ای که شروع شده «ورود فوری» را بزن. پس از تأیید میزبان، ضبط انجام می‌شود و فایل در تلگرام ارسال می‌شود.</p>
 <div class="cta">__BOT_CTA__<a class="button secondary" href="#plans">مشاهده قیمت‌ها</a></div>
 </div></section>
 <section id="plans" class="section"><div class="wrap">
@@ -2800,7 +2815,7 @@ async def home_fa() -> str:
 <section id="how" class="section"><div class="wrap">
 <h2>چطور کار می‌کند؟</h2>
 <div class="grid">
-<div class="card"><b>۱. لینک جلسه یا اتصال تقویم</b><p>لینک جلسه را بفرست. برای تشخیص خودکار جلسات، امکان اتصال Google Calendar هم وجود دارد.</p></div>
+<div class="card"><b>۱. ارسال لینک جلسه</b><p>لینک جلسه را در ربات بفرست. برای جلسه‌های آینده ایمیل رکوردر را به دعوت جلسه اضافه کن.</p></div>
 <div class="card"><b>۲. ورود ربات به جلسه</b><p>بسته به تنظیمات Google Meet ممکن است میزبان لازم باشد ربات را تأیید و وارد کند.</p></div>
 <div class="card"><b>۳. دریافت فایل</b><p>ویدیو به تلگرام ارسال می‌شود. فایل صوتی و متن خودکار در شرایط پشتیبانی‌شده ارائه می‌شوند و ممکن است خطا داشته باشند.</p></div>
 </div>
@@ -2808,7 +2823,7 @@ async def home_fa() -> str:
 </div></section>
 <section class="section"><div class="wrap">
 <h2>حریم خصوصی و شرایط استفاده</h2>
-<p>برای زمان‌بندی خودکار فقط دسترسی خواندن تقویم درخواست می‌شود. درباره داده‌ها، زمان نگهداری فایل‌ها و شرایط استفاده بیشتر بخوان.</p>
+<p>درباره داده‌های جلسه، دسترسی‌های قبلی Google، زمان نگهداری فایل‌ها و شرایط استفاده بیشتر بخوان.</p>
 <div class="cta"><a class="button secondary" href="/privacy">حریم خصوصی</a><a class="button secondary" href="/terms">شرایط استفاده</a></div>
 </div></section>
 </main>"""
@@ -2893,6 +2908,8 @@ async def auth_google(chat_id: str | None = None) -> RedirectResponse:
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid Telegram chat id")
 
+    if normalized_chat_id and not AUTO_ALL_MEETINGS_ENABLED:
+        raise HTTPException(status_code=404, detail="Personal automatic Calendar recording is temporarily unavailable")
     if normalized_chat_id and not await asyncio.to_thread(is_premium, normalized_chat_id):
         raise HTTPException(status_code=403, detail="Premium required for All meetings")
 
@@ -2923,6 +2940,8 @@ async def auth_google_callback(request: Request, state: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
     oauth_chat_id = str((oauth_entry or {}).get("chat_id") or "")
+    if oauth_chat_id and not AUTO_ALL_MEETINGS_ENABLED:
+        return "<html><body><h2>Automatic Calendar recording is temporarily unavailable</h2><p>Send the meeting link directly to BeOnMeet in Telegram.</p></body></html>"
     if oauth_chat_id and not await asyncio.to_thread(is_premium, oauth_chat_id):
         raise HTTPException(status_code=403, detail="Premium required for All meetings")
 
