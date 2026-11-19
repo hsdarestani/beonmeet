@@ -779,6 +779,9 @@ def activate_subscription(telegram_id: str, plan_code: str, note: str = "") -> d
 def deactivate_subscription(telegram_id: str) -> None:
     now = utcnow().isoformat()
     with _db() as db:
+        net=wallet_balance(db,str(telegram_id))["signed_balance_seconds"]
+        if net>0:
+            add_entry(db,str(telegram_id),-net,"admin:revoke:"+secrets.token_urlsafe(16),"admin")
         db.execute(
             "UPDATE users SET premium_until=NULL, premium_plan=NULL WHERE telegram_id=?",
             (str(telegram_id),),
@@ -1227,10 +1230,11 @@ a:focus-visible,.btn:focus-visible,input:focus-visible,select:focus-visible{{out
 def _stats():
     with _db() as db:
         users = db.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-        premium = db.execute(
-            "SELECT COUNT(*) c FROM users WHERE premium_until IS NOT NULL AND premium_until > ?",
-            (utcnow().isoformat(),),
-        ).fetchone()["c"]
+        wallets = db.execute(
+            """SELECT telegram_id FROM credit_entries GROUP BY telegram_id
+               HAVING SUM(seconds_delta)>0"""
+        ).fetchall()
+        premium=len({str(row["telegram_id"]) for row in wallets})
         recordings = db.execute("SELECT COUNT(*) c FROM recordings").fetchone()["c"]
         requests = db.execute("SELECT COUNT(*) c FROM meeting_requests").fetchone()["c"]
         recent = db.execute("SELECT * FROM users ORDER BY last_seen DESC LIMIT 8").fetchall()
@@ -1284,31 +1288,31 @@ async def dashboard(request: Request):
     <div class="top"><div><h1>سلام، مدیر 👋</h1><div class="sub">وضعیت BeOnMeet در یک نگاه</div></div><span class="pill">● سیستم آنلاین</span></div>
     <div class="grid">
       <div class="card metric"><div class="label">کل کاربران</div><div class="num cyan">{users}</div><div class="hint">کاربر ثبت شده</div></div>
-      <div class="card metric"><div class="label">پلن ویژه فعال</div><div class="num purple">{premium}</div><div class="hint">مشترک فعال</div></div>
+      <div class="card metric"><div class="label">کاربران دارای اعتبار</div><div class="num purple">{premium}</div><div class="hint">موجودی ضبط یا دسترسی قدیمی</div></div>
       <div class="card metric"><div class="label">درخواست ضبط</div><div class="num">{requests}</div><div class="hint">از ابتدای فعالیت</div></div>
       <div class="card metric"><div class="label">ضبط تکمیل شده</div><div class="num good">{recordings}</div><div class="hint">فایل تحویل شده</div></div>
     </div>
     <div class="two section">
       <div class="card"><div class="section-head"><h2>درخواست های ۷ روز اخیر</h2><span class="pill">Activity</span></div><div class="chart">{bars}</div></div>
-      <div class="card"><div class="section-head"><h2>قیمت پلن ویژه</h2><a class="pill" href="/admin/plans" style="text-decoration:none">مدیریت پلن</a></div>
+      <div class="card"><div class="section-head"><h2>قیمت شارژ ساعت ضبط</h2><a class="pill" href="/admin/plans" style="text-decoration:none">تنظیمات قیمت</a></div>
         <div style="display:grid;gap:10px;margin-top:12px">
-          <div><span class="muted">Basic · ۲ ساعت</span><b style="float:left">{_money(PLANS["basic"]["price"])} تومان</b></div>
-          <div><span class="muted">Pro · ۶ ساعت</span><b style="float:left">{_money(PLANS["pro"]["price"])} تومان</b></div>
-          <div><span class="muted">Business · ۱۵ ساعت</span><b style="float:left">{_money(PLANS["business"]["price"])} تومان</b></div>
+          <div><span class="muted">خرید ۲ ساعت</span><b style="float:left">{_money(PLANS["basic"]["price"])} تومان</b></div>
+          <div><span class="muted">خرید ۶ ساعت</span><b style="float:left">{_money(PLANS["pro"]["price"])} تومان</b></div>
+          <div><span class="muted">خرید ۱۵ ساعت</span><b style="float:left">{_money(PLANS["business"]["price"])} تومان</b></div>
         </div>
       </div>
     </div>
     <div class="card section"><div class="section-head"><h2>کاربران اخیر</h2><a class="pill" href="/admin/users" style="text-decoration:none">همه کاربران</a></div>
-      <table><thead><tr><th>کاربر</th><th>پلن</th><th>درخواست</th><th>ضبط</th><th>آخرین فعالیت</th><th>مدیریت</th></tr></thead><tbody>{rows}</tbody></table>
+      <table><thead><tr><th>کاربر</th><th>اعتبار ضبط</th><th>درخواست</th><th>ضبط</th><th>آخرین فعالیت</th><th>مدیریت</th></tr></thead><tbody>{rows}</tbody></table>
     </div>"""
     return _layout("داشبورد", body, "dashboard")
 
 
 def _user_row(r) -> str:
-    active = bool(r["premium_until"] and (_parse_dt(r["premium_until"]) or utcnow()-timedelta(days=1)) > utcnow())
+    active = is_premium(str(r["telegram_id"]))
     name = (f'{r["first_name"]} {r["last_name"]}').strip() or "بدون نام"
     uname = f'@{r["username"]}' if r["username"] else r["telegram_id"]
-    plan = '<span class="badge premium">ویژه</span>' if active else '<span class="badge free">رایگان</span>'
+    plan = '<span class="badge premium">اعتبار دارد</span>' if active else '<span class="badge free">بدون اعتبار</span>'
     initial = _esc((name[:1] or "U").upper())
     return f"""<tr>
       <td><div class="user"><div class="avatar">{initial}</div><div><b>{_esc(name)}</b><div class="muted">{_esc(uname)}</div></div></div></td>
@@ -1331,7 +1335,7 @@ async def users_page(request: Request, q: str = ""):
     table="".join(_user_row(r) for r in rows) or '<tr><td colspan="6" class="empty">چیزی پیدا نشد</td></tr>'
     body=f"""<div class="top"><div><h1>کاربران</h1><div class="sub">{len(rows)} نتیجه</div></div>
     <form><input class="search" name="q" value="{_esc(q)}" placeholder="نام، یوزرنیم یا Telegram ID"><button class="btn primary">جستجو</button></form></div>
-    <div class="card"><table><thead><tr><th>کاربر</th><th>پلن</th><th>درخواست</th><th>ضبط</th><th>آخرین فعالیت</th><th>مدیریت</th></tr></thead><tbody>{table}</tbody></table></div>"""
+    <div class="card"><table><thead><tr><th>کاربر</th><th>اعتبار ضبط</th><th>درخواست</th><th>ضبط</th><th>آخرین فعالیت</th><th>مدیریت</th></tr></thead><tbody>{table}</tbody></table></div>"""
     return _layout("کاربران", body, "users")
 
 
@@ -1344,6 +1348,7 @@ async def user_page(request: Request, telegram_id: str):
         recs=db.execute("SELECT * FROM recordings WHERE telegram_id=? ORDER BY id DESC LIMIT 10", (telegram_id,)).fetchall()
     if not u: raise HTTPException(404, "کاربر پیدا نشد")
     active=is_premium(telegram_id)
+    wallet=recording_credit_info(telegram_id)
     controller_state = _controller_state()
     auto_enabled = bool(controller_state.get("auto_join_all", {}).get(str(telegram_id)))
     google_info = await asyncio.to_thread(_google_account_info, str(telegram_id))
@@ -1366,13 +1371,13 @@ async def user_page(request: Request, telegram_id: str):
         <div><div class="muted">وضعیت اتصال</div><div style="margin-top:7px">{'<span class="badge premium">Calendar متصل</span>' if google_info.get("connected") else '<span class="badge free">نیاز به بررسی</span>'}<div class="muted" style="margin-top:6px">{_esc(google_info.get("error") or "مجوزهای لازم فعال است")}</div></div></div>
       </div>
     </div>
-    <div class="card section subscription-card"><div class="section-head"><h2>مدیریت اشتراک</h2><span class="pill">Premium controls</span></div>
+    <div class="card section subscription-card"><div class="section-head"><h2>مدیریت موجودی ساعت ضبط</h2><span class="pill">{wallet["remaining_seconds"]//3600} ساعت و {(wallet["remaining_seconds"]%3600)//60} دقیقه · بدون انقضا</span></div>
       <form class="inline" method="post" action="/admin/users/{_esc(telegram_id)}/activate">
-        <select name="plan_code"><option value="basic">Basic · ۲ ساعت · ۲۹۸٬۰۰۰</option><option value="pro">Pro · ۶ ساعت · ۴۹۸٬۰۰۰</option><option value="business">Business · ۱۵ ساعت · ۹۹۸٬۰۰۰</option></select>
+        <select name="plan_code"><option value="basic">شارژ ۲ ساعت</option><option value="pro">شارژ ۶ ساعت</option><option value="business">شارژ ۱۵ ساعت</option></select>
         <input name="note" placeholder="یادداشت اختیاری">
-        <button class="btn primary">فعال کردن / تمدید</button>
+        <button class="btn primary">افزودن اعتبار بدون انقضا</button>
       </form>
-      {'<form style="margin-top:10px" method="post" action="/admin/users/'+_esc(telegram_id)+'/deactivate"><button class="btn danger">غیرفعال کردن پلن ویژه</button></form>' if active else ''}
+      {'<form style="margin-top:10px" method="post" action="/admin/users/'+_esc(telegram_id)+'/deactivate"><button class="btn danger">لغو دسترسی و صفرکردن اعتبار</button></form>' if active else ''}
     </div>
     <div class="two section"><div class="card"><div class="section-head"><h2>سابقه اشتراک</h2></div><table><thead><tr><th>پلن</th><th>مبلغ</th><th>شروع</th><th>پایان</th><th>وضعیت</th></tr></thead><tbody>{sub_rows}</tbody></table></div>
     <div class="card"><div class="section-head"><h2>ضبط های اخیر</h2></div><table><thead><tr><th>زمان</th><th>Meet</th><th>حجم</th><th>مدت</th></tr></thead><tbody>{rec_rows}</tbody></table></div></div>"""
@@ -1386,7 +1391,7 @@ async def activate_user(request: Request, telegram_id: str):
     form=parse_qs(raw)
     plan=(form.get("plan_code") or [""])[0]
     note=(form.get("note") or [""])[0]
-    activate_subscription(telegram_id, plan, note)
+    admin_credit_hours(telegram_id, plan, note)
     return RedirectResponse(f"/admin/users/{telegram_id}", status_code=303)
 
 
