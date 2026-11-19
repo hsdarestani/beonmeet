@@ -17,8 +17,10 @@ jobs:
 
       - name: Validate Python before production
         run: |
-          python3 -m py_compile app/main.py app/i18n.py app/hetzner_autoscaler.py app/autoscaler_smoke.py
+          python3 -m py_compile app/main.py app/i18n.py app/hetzner_autoscaler.py app/autoscaler_smoke.py app/admin_panel.py app/billing_policy.py
           python3 tests/i18n_test.py
+          python3 tests/billing_tier_test.py
+          python3 tests/billing_usage_behavior_test.py
           python3 tests/free_plan_limit_test.py
           python3 tests/auto_calendar_test.py
           python3 tests/calendar_legacy_isolation_test.py
