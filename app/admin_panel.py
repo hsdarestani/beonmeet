@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from db_compat import connect_db, is_postgres
 from state_store import DurableStateStore
 from billing_policy import PLANS, PUBLIC_PLANS, PUBLIC_PLAN_CODES, plan_quota_seconds, remaining_seconds
+from credit_wallet import create_wallet_schema, add_entry, balance as wallet_balance, has_wallet_history
 
 router = APIRouter()
 DB_PATH = Path(os.environ.get("BEONMEET_DB_PATH", "/data/beonmeet.db"))
@@ -337,6 +338,9 @@ def init_db() -> None:
         with _db() as db:
             db.executescript(schema)
         _migrate_sqlite_to_postgres_once()
+        with _db() as db:
+            create_wallet_schema(db)
+        migrate_public_subscriptions_to_wallet()
         return
 
     with _db() as db:
@@ -395,6 +399,9 @@ def init_db() -> None:
             );
             """
         )
+    with _db() as db:
+        create_wallet_schema(db)
+    migrate_public_subscriptions_to_wallet()
 
 
 def utcnow() -> datetime:
@@ -499,6 +506,94 @@ def _parse_dt(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value)
     except Exception:
         return None
+
+
+def migrate_public_subscriptions_to_wallet() -> None:
+    """One-time conversion of still-owned public subscription allowances.
+
+    Current 30-day periods: keep only unspent recorded seconds.
+    Previously prepaid future periods: credit their full advertised hours.
+    Past expired periods are not revived. Historical rows stay for audit.
+    Unique ledger references prevent double conversion after restarts.
+    """
+    now=utcnow()
+    with _db() as db:
+        rows=db.execute(
+            """SELECT id, telegram_id, plan_code, starts_at, ends_at
+               FROM subscriptions WHERE status='active'
+                 AND plan_code IN ('basic','pro','business')"""
+        ).fetchall()
+        converted=0
+        for row in rows:
+            start=_parse_dt(row["starts_at"])
+            end=_parse_dt(row["ends_at"])
+            if not start or not end:
+                continue
+            if start.tzinfo is None: start=start.replace(tzinfo=timezone.utc)
+            if end.tzinfo is None: end=end.replace(tzinfo=timezone.utc)
+            if end <= now:
+                continue
+            quota=plan_quota_seconds(str(row["plan_code"]))
+            if not quota:
+                continue
+            used=0
+            if start <= now:
+                usage=db.execute(
+                    """SELECT COALESCE(SUM(duration_seconds),0) AS total
+                       FROM recordings WHERE telegram_id=? AND created_at>=? AND created_at<?""",
+                    (str(row["telegram_id"]),start.isoformat(),end.isoformat()),
+                ).fetchone()
+                used=int(usage["total"] or 0)
+            leftover=max(0,int(quota)-used)
+            if leftover:
+                changed=add_entry(db,str(row["telegram_id"]),leftover,
+                    f"migration:subscription:{row['id']}","migration")
+                converted+=int(bool(changed))
+        if converted:
+            print(f"wallet migration credited {converted} previous paid period(s)",flush=True)
+
+
+def recording_credit_info(telegram_id: str) -> dict:
+    with _db() as db:
+        return wallet_balance(db,str(telegram_id))
+
+
+def _active_legacy_subscription(telegram_id: str) -> dict | None:
+    info=subscription_info(str(telegram_id))
+    if info.get("premium") and str(info.get("plan") or "") in {"monthly","quarterly","halfyear"}:
+        return info
+    return None
+
+
+def credit_purchase(telegram_id: str, code: str, receipt: str) -> dict:
+    """Activate verified Zibal payment as immediate, non-expiring hours.
+
+    Existing legacy subscription receipts must not be credited again after
+    migration from the previous subscription implementation.
+    """
+    if code not in PUBLIC_PLAN_CODES or not receipt:
+        raise ValueError("Invalid recording-hour credit purchase")
+    seconds=plan_quota_seconds(code)
+    if not seconds:
+        raise ValueError("Invalid hours")
+    with _db() as db:
+        old=db.execute(
+            "SELECT id FROM subscriptions WHERE telegram_id=? AND note=? LIMIT 1",
+            (str(telegram_id),f"Zibal receipt {receipt}"),
+        ).fetchone()
+        if not old:
+            add_entry(db,str(telegram_id),int(seconds),f"zibal:{receipt}","purchase")
+        result=wallet_balance(db,str(telegram_id))
+    return result
+
+
+def admin_credit_hours(telegram_id: str, code: str, note: str = "") -> dict:
+    if code not in PUBLIC_PLAN_CODES:
+        raise ValueError("Unknown recording-hour quantity")
+    with _db() as db:
+        add_entry(db,str(telegram_id),plan_quota_seconds(code),
+                  "admin:"+secrets.token_urlsafe(18),"admin")
+        return wallet_balance(db,str(telegram_id))
 
 
 def free_recording_entitlement(telegram_id: str) -> dict:
