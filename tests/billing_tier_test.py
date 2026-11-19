@@ -48,6 +48,15 @@ for needle in (
 ):
     assert needle in main, needle
 assert "intents['monthly']" not in main, "Do not offer old duration plans"
+assert 'next_subscription_period,' in main
+assert 't(chat_id, "premium_active", until=until_text)' in main
+assert '"payment_scheduled"' in main and '"payment_confirmed"' in main
+assert 'خرید دوباره سهمیه همان دوره را افزایش نمی‌دهد' in main
+assert 'Unused hours do not roll over' in main
+assert 'contact support for immediate extra hours' in main.lower()
+for key in ('"payment_scheduled":', '"renewal_scheduled":', '"plan_rules_short":'):
+    assert i18n.count(key) == 3, key
+
 assert "ضبط نامحدود در مدت اشتراک" not in i18n
 assert "Unlimited recordings while subscribed" not in i18n
 assert "Unbegrenzte Aufnahmen während des Abos" not in i18n
