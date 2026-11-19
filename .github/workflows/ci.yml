@@ -96,5 +96,16 @@ jobs:
             curl -fsS --max-time 8 http://127.0.0.1:9124/capacity | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("data") or d; print({k:v.get(k) for k in ("runningJobs","maxConcurrentMeetings","maxConcurrent","availableSlots")})' || true
             echo 'public_health_subset='
             curl -fsS --max-time 8 http://127.0.0.1:8109/health | python3 -c 'import sys,json;d=json.load(sys.stdin);print({k:d.get(k) for k in ("max_concurrent_meetings","premium_reserved_slots","free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs","database_backend")})'
+            echo 'service_after_rollback='
+            systemctl is-active beonmeet-controller || true
+            echo 'launch_error_diagnostics='
+            journalctl -u beonmeet-controller --since '2026-11-19 07:49:55 UTC' --until '2026-11-19 07:51:15 UTC' --no-pager -o cat | python3 -c '
+            import sys
+            raw=sys.stdin.read().splitlines()
+            keys=("Traceback", "Error:", "Exception:", "ModuleNotFoundError", "ImportError", "PermissionError", "FileNotFoundError", "SyntaxError", "NameError", "No module", "App startup", "application startup", "Failed to import", "main.py", "admin_panel.py", "billing_policy.py", "db_compat.py", "state_store.py")
+            lines=[s for s in raw if any(k in s for k in keys)]
+            for line in lines[-38:]:
+                print(line[:450])
+            '
             echo PREFLIGHT_END
 
