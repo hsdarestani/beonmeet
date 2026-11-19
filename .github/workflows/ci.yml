@@ -133,4 +133,8 @@ jobs:
             ps -eo comm,%cpu,%mem,rss --sort=-rss | head -18
             echo RECORDER_RELEVANT_COMPOSE_RESOURCES
             grep -nE 'beonmeet-(worker|chrome)-single|MAX_CONCURRENT_MEETINGS|CHROME_WINDOW_SIZE|mem_limit|cpus:|shm_size|pids_limit' /opt/beonmeet/worker/docker-compose.yml | head -60 || true
+            echo PLAYWRIGHT_INSTALLED_IN_RECORDER
+            docker exec beonmeet-worker-single node -e 'for (const mod of ["playwright","playwright-core","puppeteer","puppeteer-core"]) {try {console.log(mod+"="+require.resolve(mod));} catch(e) {}}'
+            echo CHROME_CDP_VERSION
+            docker exec beonmeet-worker-single node -e 'fetch("http://beonmeet-chrome-single:9223/json/version").then(r=>r.json()).then(x=>console.log({Browser:x.Browser,ProtocolVersion:x["Protocol-Version"]})).catch(e=>console.log("cdp_error="+e.message))'
             echo AUDIT_COMPLETE
