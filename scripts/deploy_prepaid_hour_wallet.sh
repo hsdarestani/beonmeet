@@ -24,7 +24,7 @@ for port in (9124,9126):
     assert int((d.get('data') or d).get('runningJobs') or 0)==0,'active recorder'
 print('WALLET_RELEASE_IDLE_PRECHECK_PASS')
 PY
-SOURCE=2659cb31ac0d812e86a87b9e60c87c87f3f69963
+SOURCE=3ae6bb2892840130b09e32909e29696e5c15b799
 PREVIOUS=b3220a0dd7c1f4ca72321f70544b38c22a0b099b
 git fetch --quiet origin refs/heads/feat/prepaid-recording-hour-wallet-20261119
 git merge-base --is-ancestor "$SOURCE" FETCH_HEAD || { echo REVIEWED_SOURCE_NOT_FETCHED;exit 1; }
