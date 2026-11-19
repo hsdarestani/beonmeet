@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from db_compat import connect_db, is_postgres
 from state_store import DurableStateStore
 from billing_policy import PLANS, PUBLIC_PLANS, PUBLIC_PLAN_CODES, plan_quota_seconds, remaining_seconds
+from credit_wallet import create_wallet_schema, add_entry, balance as wallet_balance, has_wallet_history
 
 router = APIRouter()
 DB_PATH = Path(os.environ.get("BEONMEET_DB_PATH", "/data/beonmeet.db"))
@@ -337,6 +338,9 @@ def init_db() -> None:
         with _db() as db:
             db.executescript(schema)
         _migrate_sqlite_to_postgres_once()
+        with _db() as db:
+            create_wallet_schema(db)
+        migrate_public_subscriptions_to_wallet()
         return
 
     with _db() as db:
@@ -395,6 +399,9 @@ def init_db() -> None:
             );
             """
         )
+    with _db() as db:
+        create_wallet_schema(db)
+    migrate_public_subscriptions_to_wallet()
 
 
 def utcnow() -> datetime:
@@ -451,6 +458,13 @@ def record_recording(telegram_id: str, meet_url: str, filename: str, size_bytes:
             "UPDATE users SET total_recordings = total_recordings + 1, last_seen=? WHERE telegram_id=?",
             (now, str(telegram_id)),
         )
+        # Never debit free trials or grandfathered unlimited legacy terms.
+        # Every completed paid recording has an idempotent filename reference.
+        # An in-progress meeting may exceed available time: signed debt carries
+        # into the next top-up instead of silently gifting additional hours.
+        if duration_seconds and has_wallet_history(db,str(telegram_id)) and not _active_legacy_subscription(telegram_id):
+            add_entry(db,str(telegram_id),-max(0,int(duration_seconds)),
+                f"recording:{telegram_id}:{filename or ''}","recording")
 
 
 def find_recording_for_artifact(
@@ -501,6 +515,94 @@ def _parse_dt(value: str | None) -> datetime | None:
         return None
 
 
+def migrate_public_subscriptions_to_wallet() -> None:
+    """One-time conversion of still-owned public subscription allowances.
+
+    Current 30-day periods: keep only unspent recorded seconds.
+    Previously prepaid future periods: credit their full advertised hours.
+    Past expired periods are not revived. Historical rows stay for audit.
+    Unique ledger references prevent double conversion after restarts.
+    """
+    now=utcnow()
+    with _db() as db:
+        rows=db.execute(
+            """SELECT id, telegram_id, plan_code, starts_at, ends_at
+               FROM subscriptions WHERE status='active'
+                 AND plan_code IN ('basic','pro','business')"""
+        ).fetchall()
+        converted=0
+        for row in rows:
+            start=_parse_dt(row["starts_at"])
+            end=_parse_dt(row["ends_at"])
+            if not start or not end:
+                continue
+            if start.tzinfo is None: start=start.replace(tzinfo=timezone.utc)
+            if end.tzinfo is None: end=end.replace(tzinfo=timezone.utc)
+            if end <= now:
+                continue
+            quota=plan_quota_seconds(str(row["plan_code"]))
+            if not quota:
+                continue
+            used=0
+            if start <= now:
+                usage=db.execute(
+                    """SELECT COALESCE(SUM(duration_seconds),0) AS total
+                       FROM recordings WHERE telegram_id=? AND created_at>=? AND created_at<?""",
+                    (str(row["telegram_id"]),start.isoformat(),end.isoformat()),
+                ).fetchone()
+                used=int(usage["total"] or 0)
+            leftover=max(0,int(quota)-used)
+            if leftover:
+                changed=add_entry(db,str(row["telegram_id"]),leftover,
+                    f"migration:subscription:{row['id']}","migration")
+                converted+=int(bool(changed))
+        if converted:
+            print(f"wallet migration credited {converted} previous paid period(s)",flush=True)
+
+
+def recording_credit_info(telegram_id: str) -> dict:
+    with _db() as db:
+        return wallet_balance(db,str(telegram_id))
+
+
+def _active_legacy_subscription(telegram_id: str) -> dict | None:
+    info=subscription_info(str(telegram_id))
+    if info.get("premium") and str(info.get("plan") or "") in {"monthly","quarterly","halfyear"}:
+        return info
+    return None
+
+
+def credit_purchase(telegram_id: str, code: str, receipt: str) -> dict:
+    """Activate verified Zibal payment as immediate, non-expiring hours.
+
+    Existing legacy subscription receipts must not be credited again after
+    migration from the previous subscription implementation.
+    """
+    if code not in PUBLIC_PLAN_CODES or not receipt:
+        raise ValueError("Invalid recording-hour credit purchase")
+    seconds=plan_quota_seconds(code)
+    if not seconds:
+        raise ValueError("Invalid hours")
+    with _db() as db:
+        old=db.execute(
+            "SELECT id FROM subscriptions WHERE telegram_id=? AND note=? LIMIT 1",
+            (str(telegram_id),f"Zibal receipt {receipt}"),
+        ).fetchone()
+        if not old:
+            add_entry(db,str(telegram_id),int(seconds),f"zibal:{receipt}","purchase")
+        result=wallet_balance(db,str(telegram_id))
+    return result
+
+
+def admin_credit_hours(telegram_id: str, code: str, note: str = "") -> dict:
+    if code not in PUBLIC_PLAN_CODES:
+        raise ValueError("Unknown recording-hour quantity")
+    with _db() as db:
+        add_entry(db,str(telegram_id),plan_quota_seconds(code),
+                  "admin:"+secrets.token_urlsafe(18),"admin")
+        return wallet_balance(db,str(telegram_id))
+
+
 def free_recording_entitlement(telegram_id: str) -> dict:
     """Return the current lifetime free-recording allowance for one Telegram user."""
     with _db() as db:
@@ -511,7 +613,7 @@ def free_recording_entitlement(telegram_id: str) -> dict:
 
     used = int(row["total_recordings"] or 0) if row else 0
     until = _parse_dt(row["premium_until"]) if row else None
-    premium = bool(until and until > utcnow())
+    premium = is_premium(telegram_id)
     remaining = max(0, FREE_RECORDING_LIMIT - used)
     return {
         "premium": premium,
@@ -523,10 +625,11 @@ def free_recording_entitlement(telegram_id: str) -> dict:
 
 
 def is_premium(telegram_id: str) -> bool:
+    # A paid account is determined by available recording seconds, not dates.
+    if _active_legacy_subscription(telegram_id):
+        return True
     with _db() as db:
-        row = db.execute("SELECT premium_until FROM users WHERE telegram_id=?", (str(telegram_id),)).fetchone()
-    until = _parse_dt(row["premium_until"]) if row else None
-    return bool(until and until > utcnow())
+        return wallet_balance(db,str(telegram_id))["remaining_seconds"] > 0
 
 
 def was_premium_at(telegram_id: str, when_iso: str) -> bool:
@@ -551,7 +654,13 @@ def was_premium_at(telegram_id: str, when_iso: str) -> bool:
             ends = ends.replace(tzinfo=timezone.utc)
         if starts <= when < ends:
             return True
-    return False
+    with _db() as db:
+        credited=db.execute(
+            """SELECT 1 FROM credit_entries WHERE telegram_id=? AND
+               seconds_delta>0 AND created_at<=? LIMIT 1""",
+            (str(telegram_id), when.isoformat()),
+        ).fetchone()
+    return bool(credited)
 
 
 def subscription_info(telegram_id: str) -> dict:
@@ -593,33 +702,21 @@ def subscription_info(telegram_id: str) -> dict:
 
 
 def paid_recording_entitlement(telegram_id: str) -> dict:
-    """Paid recording usage is counted only in the current subscription period.
-
-    None for remaining_seconds means an existing legacy unlimited plan; the new
-    public plans always have finite quotas. This function does not infer usage
-    from an older paid period or give away hours on an early renewal.
-    """
-    info = subscription_info(telegram_id)
-    if not info["premium"]:
-        return {"premium": False, "allowed": False, "plan": None, "used_seconds": 0, "remaining_seconds": 0, "quota_seconds": 0}
-    plan = info["plan"]
-    quota = plan_quota_seconds(plan)
-    if quota is None:
-        return {"premium": True, "allowed": True, "plan": plan, "used_seconds": 0, "remaining_seconds": None, "quota_seconds": None}
-    period_end = info.get("period_end") or info["until"]
-    period_start = info.get("period_start") or (period_end - timedelta(days=30))
-    with _db() as db:
-        row = db.execute(
-            """SELECT COALESCE(SUM(duration_seconds), 0) AS total
-               FROM recordings WHERE telegram_id=? AND created_at>=? AND created_at<?""",
-            (str(telegram_id), period_start.isoformat(), period_end.isoformat()),
-        ).fetchone()
-    used = max(0, int(row["total"] or 0)) if row else 0
-    remaining = remaining_seconds(plan, used)
+    """Non-expiring total credit balance, preserving legacy unlimited periods."""
+    legacy=_active_legacy_subscription(telegram_id)
+    wallet=recording_credit_info(telegram_id)
+    if legacy:
+        return {"premium":True,"allowed":True,"plan":legacy.get("plan"),
+            "used_seconds":wallet["used_seconds"],"quota_seconds":None,
+            "remaining_seconds":None,"wallet_remaining_seconds":wallet["remaining_seconds"]}
+    remaining=wallet["remaining_seconds"]
     return {
-        "premium": True, "allowed": remaining is None or remaining > 0,
-        "plan": plan, "used_seconds": used, "remaining_seconds": remaining,
-        "quota_seconds": quota,
+        "premium":remaining>0,
+        "allowed":remaining>0,
+        "plan":None,
+        "used_seconds":wallet["used_seconds"],
+        "remaining_seconds":remaining,
+        "quota_seconds":wallet["credited_seconds"],
     }
 
 
@@ -682,6 +779,9 @@ def activate_subscription(telegram_id: str, plan_code: str, note: str = "") -> d
 def deactivate_subscription(telegram_id: str) -> None:
     now = utcnow().isoformat()
     with _db() as db:
+        net=wallet_balance(db,str(telegram_id))["signed_balance_seconds"]
+        if net>0:
+            add_entry(db,str(telegram_id),-net,"admin:revoke:"+secrets.token_urlsafe(16),"admin")
         db.execute(
             "UPDATE users SET premium_until=NULL, premium_plan=NULL WHERE telegram_id=?",
             (str(telegram_id),),
@@ -693,43 +793,42 @@ def deactivate_subscription(telegram_id: str) -> None:
 
 
 def paid_sales_capacity(plan_code: str, telegram_id: str = "") -> dict:
-    """Conservative soft capacity gate for new paid 30-day subscriptions.
+    """Limit outstanding unspent prepaid hours on shared VPS.
 
-    Count the advertised hours of active paid users, including conservative
-    15-hour reservations for older unlimited subscriptions. No new servers are
-    created. This is not a substitute for real peak-concurrency load testing.
+    No subscription-cycle reservations. Repeat topups add instantly, and
+    the existing 12-user/60-unspent-hour pilot safeguards stay in place.
     """
-    requested = plan_quota_seconds(plan_code)
-    if requested == 0 or plan_code not in PUBLIC_PLAN_CODES:
-        return {"allowed": False, "reason": "unknown plan"}
-    now = utcnow().isoformat()
+    requested=plan_quota_seconds(plan_code)
+    if not requested or plan_code not in PUBLIC_PLAN_CODES:
+        return {"allowed":False,"reason":"unknown hours bundle"}
     with _db() as db:
-        active = db.execute(
-            """SELECT telegram_id, premium_plan FROM users
-               WHERE premium_until IS NOT NULL AND premium_until > ?""",
-            (now,),
+        rows=db.execute(
+            """SELECT telegram_id, SUM(seconds_delta) AS net
+               FROM credit_entries GROUP BY telegram_id
+               HAVING SUM(seconds_delta)>0"""
         ).fetchall()
-    members = {str(u["telegram_id"]) for u in active}
-    sold = 0
-    for item in active:
-        allocated = plan_quota_seconds(str(item["premium_plan"] or ""))
-        sold += allocated if allocated is not None else 15 * 3600
-    # Renewals by already active members do not consume an additional concurrent
-    # subscription seat; nevertheless count the new quota if it is higher.
-    already_active = str(telegram_id) in members
-    projected_users = len(members) + (0 if already_active else 1)
-    projected_sold = sold + requested
+        legacy_candidates=db.execute(
+            "SELECT telegram_id FROM users WHERE premium_until IS NOT NULL",
+        ).fetchall()
+    members={str(r["telegram_id"]) for r in rows}
+    sold=sum(max(0,int(r["net"] or 0)) for r in rows)
+    for row in legacy_candidates:
+        sid=str(row["telegram_id"])
+        if sid not in members and _active_legacy_subscription(sid):
+            members.add(sid)
+            sold+=15*3600  # grandfathered unlimited subscriber safety reserve
+    projected_users=len(members)+(0 if str(telegram_id) in members else 1)
+    projected_sold=sold+requested
     return {
         "allowed": (
-            PAID_SALES_MAX_ACTIVE_USERS > 0
-            and PAID_SALES_MAX_SOLD_HOURS > 0
-            and projected_users <= PAID_SALES_MAX_ACTIVE_USERS
-            and projected_sold <= PAID_SALES_MAX_SOLD_HOURS * 3600
+            PAID_SALES_MAX_ACTIVE_USERS>0 and PAID_SALES_MAX_SOLD_HOURS>0
+            and projected_users<=PAID_SALES_MAX_ACTIVE_USERS
+            and projected_sold<=PAID_SALES_MAX_SOLD_HOURS*3600
         ),
-        "active_users": len(members), "sold_hours": round(sold / 3600, 2),
-        "limit_users": PAID_SALES_MAX_ACTIVE_USERS,
-        "limit_sold_hours": PAID_SALES_MAX_SOLD_HOURS,
-        "requested_hours": round(requested / 3600, 2),
+        "active_users":len(members),"sold_hours":round(sold/3600,2),
+        "limit_users":PAID_SALES_MAX_ACTIVE_USERS,
+        "limit_sold_hours":PAID_SALES_MAX_SOLD_HOURS,
+        "requested_hours":round(requested/3600,2),
     }
 
 
@@ -754,7 +853,7 @@ def create_payment_intent(telegram_id: str, plan_code: str) -> dict:
         "telegram_id": str(telegram_id),
         "plan": plan_code,
         "amount_toman": int(plan["price"]),
-        "label": f"اشتراک BeOnMeet، {plan['label']}",
+        "label": f"شارژ {int(plan['quota_minutes']) // 60} ساعت ضبط BeOnMeet",
         "expires_at": expires,
     }
 
@@ -842,8 +941,8 @@ def _layout(title: str, body: str, active: str = "dashboard") -> str:
         ("users", "/admin/users", "کاربران", "◉"),
         ("recordings", "/admin/recordings", "ضبط ها", "◍"),
         ("auto", "/admin/auto-meetings", "همه جلسات", "◎"),
-        ("subscriptions", "/admin/subscriptions", "اشتراک ها", "◆"),
-        ("plans", "/admin/plans", "پلن ویژه", "✦"),
+        ("subscriptions", "/admin/subscriptions", "اشتراک‌های قبلی", "◆"),
+        ("plans", "/admin/plans", "قیمت شارژ ساعت", "✦"),
         ("system", "/admin/system", "سیستم", "◫"),
     ]
     nav_html = "".join(
@@ -1131,10 +1230,19 @@ a:focus-visible,.btn:focus-visible,input:focus-visible,select:focus-visible{{out
 def _stats():
     with _db() as db:
         users = db.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-        premium = db.execute(
-            "SELECT COUNT(*) c FROM users WHERE premium_until IS NOT NULL AND premium_until > ?",
-            (utcnow().isoformat(),),
-        ).fetchone()["c"]
+        wallets = db.execute(
+            """SELECT telegram_id FROM credit_entries GROUP BY telegram_id
+               HAVING SUM(seconds_delta)>0"""
+        ).fetchall()
+        members={str(row["telegram_id"]) for row in wallets}
+        legacy=db.execute(
+            """SELECT DISTINCT telegram_id FROM subscriptions
+               WHERE status='active' AND plan_code IN ('monthly','quarterly','halfyear')
+                 AND starts_at<=? AND ends_at>?""",
+            (utcnow().isoformat(),utcnow().isoformat()),
+        ).fetchall()
+        members.update(str(row["telegram_id"]) for row in legacy)
+        premium=len(members)
         recordings = db.execute("SELECT COUNT(*) c FROM recordings").fetchone()["c"]
         requests = db.execute("SELECT COUNT(*) c FROM meeting_requests").fetchone()["c"]
         recent = db.execute("SELECT * FROM users ORDER BY last_seen DESC LIMIT 8").fetchall()
@@ -1188,31 +1296,31 @@ async def dashboard(request: Request):
     <div class="top"><div><h1>سلام، مدیر 👋</h1><div class="sub">وضعیت BeOnMeet در یک نگاه</div></div><span class="pill">● سیستم آنلاین</span></div>
     <div class="grid">
       <div class="card metric"><div class="label">کل کاربران</div><div class="num cyan">{users}</div><div class="hint">کاربر ثبت شده</div></div>
-      <div class="card metric"><div class="label">پلن ویژه فعال</div><div class="num purple">{premium}</div><div class="hint">مشترک فعال</div></div>
+      <div class="card metric"><div class="label">کاربران دارای اعتبار</div><div class="num purple">{premium}</div><div class="hint">موجودی ضبط یا دسترسی قدیمی</div></div>
       <div class="card metric"><div class="label">درخواست ضبط</div><div class="num">{requests}</div><div class="hint">از ابتدای فعالیت</div></div>
       <div class="card metric"><div class="label">ضبط تکمیل شده</div><div class="num good">{recordings}</div><div class="hint">فایل تحویل شده</div></div>
     </div>
     <div class="two section">
       <div class="card"><div class="section-head"><h2>درخواست های ۷ روز اخیر</h2><span class="pill">Activity</span></div><div class="chart">{bars}</div></div>
-      <div class="card"><div class="section-head"><h2>قیمت پلن ویژه</h2><a class="pill" href="/admin/plans" style="text-decoration:none">مدیریت پلن</a></div>
+      <div class="card"><div class="section-head"><h2>قیمت شارژ ساعت ضبط</h2><a class="pill" href="/admin/plans" style="text-decoration:none">تنظیمات قیمت</a></div>
         <div style="display:grid;gap:10px;margin-top:12px">
-          <div><span class="muted">Basic · ۲ ساعت</span><b style="float:left">{_money(PLANS["basic"]["price"])} تومان</b></div>
-          <div><span class="muted">Pro · ۶ ساعت</span><b style="float:left">{_money(PLANS["pro"]["price"])} تومان</b></div>
-          <div><span class="muted">Business · ۱۵ ساعت</span><b style="float:left">{_money(PLANS["business"]["price"])} تومان</b></div>
+          <div><span class="muted">خرید ۲ ساعت</span><b style="float:left">{_money(PLANS["basic"]["price"])} تومان</b></div>
+          <div><span class="muted">خرید ۶ ساعت</span><b style="float:left">{_money(PLANS["pro"]["price"])} تومان</b></div>
+          <div><span class="muted">خرید ۱۵ ساعت</span><b style="float:left">{_money(PLANS["business"]["price"])} تومان</b></div>
         </div>
       </div>
     </div>
     <div class="card section"><div class="section-head"><h2>کاربران اخیر</h2><a class="pill" href="/admin/users" style="text-decoration:none">همه کاربران</a></div>
-      <table><thead><tr><th>کاربر</th><th>پلن</th><th>درخواست</th><th>ضبط</th><th>آخرین فعالیت</th><th>مدیریت</th></tr></thead><tbody>{rows}</tbody></table>
+      <table><thead><tr><th>کاربر</th><th>اعتبار ضبط</th><th>درخواست</th><th>ضبط</th><th>آخرین فعالیت</th><th>مدیریت</th></tr></thead><tbody>{rows}</tbody></table>
     </div>"""
     return _layout("داشبورد", body, "dashboard")
 
 
 def _user_row(r) -> str:
-    active = bool(r["premium_until"] and (_parse_dt(r["premium_until"]) or utcnow()-timedelta(days=1)) > utcnow())
+    active = is_premium(str(r["telegram_id"]))
     name = (f'{r["first_name"]} {r["last_name"]}').strip() or "بدون نام"
     uname = f'@{r["username"]}' if r["username"] else r["telegram_id"]
-    plan = '<span class="badge premium">ویژه</span>' if active else '<span class="badge free">رایگان</span>'
+    plan = '<span class="badge premium">اعتبار دارد</span>' if active else '<span class="badge free">بدون اعتبار</span>'
     initial = _esc((name[:1] or "U").upper())
     return f"""<tr>
       <td><div class="user"><div class="avatar">{initial}</div><div><b>{_esc(name)}</b><div class="muted">{_esc(uname)}</div></div></div></td>
@@ -1235,7 +1343,7 @@ async def users_page(request: Request, q: str = ""):
     table="".join(_user_row(r) for r in rows) or '<tr><td colspan="6" class="empty">چیزی پیدا نشد</td></tr>'
     body=f"""<div class="top"><div><h1>کاربران</h1><div class="sub">{len(rows)} نتیجه</div></div>
     <form><input class="search" name="q" value="{_esc(q)}" placeholder="نام، یوزرنیم یا Telegram ID"><button class="btn primary">جستجو</button></form></div>
-    <div class="card"><table><thead><tr><th>کاربر</th><th>پلن</th><th>درخواست</th><th>ضبط</th><th>آخرین فعالیت</th><th>مدیریت</th></tr></thead><tbody>{table}</tbody></table></div>"""
+    <div class="card"><table><thead><tr><th>کاربر</th><th>اعتبار ضبط</th><th>درخواست</th><th>ضبط</th><th>آخرین فعالیت</th><th>مدیریت</th></tr></thead><tbody>{table}</tbody></table></div>"""
     return _layout("کاربران", body, "users")
 
 
@@ -1248,6 +1356,7 @@ async def user_page(request: Request, telegram_id: str):
         recs=db.execute("SELECT * FROM recordings WHERE telegram_id=? ORDER BY id DESC LIMIT 10", (telegram_id,)).fetchall()
     if not u: raise HTTPException(404, "کاربر پیدا نشد")
     active=is_premium(telegram_id)
+    wallet=recording_credit_info(telegram_id)
     controller_state = _controller_state()
     auto_enabled = bool(controller_state.get("auto_join_all", {}).get(str(telegram_id)))
     google_info = await asyncio.to_thread(_google_account_info, str(telegram_id))
@@ -1255,7 +1364,7 @@ async def user_page(request: Request, telegram_id: str):
     sub_rows="".join(f'<tr><td>{_esc(PLANS.get(s["plan_code"], {"label": s["plan_code"]})["label"])}</td><td>{_money(s["price_toman"])}</td><td>{_fa_date(s["starts_at"])}</td><td>{_fa_date(s["ends_at"])}</td><td>{_esc(s["status"])}</td></tr>' for s in subs) or '<tr><td colspan="5" class="empty">اشتراکی ندارد</td></tr>'
     rec_rows="".join(f'<tr><td>{_fa_date(r["created_at"])}</td><td>{_esc(r["meet_url"])}</td><td>{round(r["size_bytes"]/1024/1024,1)} MB</td><td>{round(r["duration_seconds"]/60,1)} دقیقه</td></tr>' for r in recs) or '<tr><td colspan="4" class="empty">ضبطی ندارد</td></tr>'
     body=f"""<div class="top"><div><h1>{_esc(name)}</h1><div class="sub">{_esc("@"+u["username"] if u["username"] else telegram_id)}</div></div>
-      {'<span class="badge premium">پلن ویژه فعال تا '+_fa_date(u["premium_until"])+'</span>' if active else '<span class="badge free">پلن رایگان</span>'}</div>
+      {'<span class="badge premium">اعتبار ساعت ضبط فعال</span>' if active else '<span class="badge free">بدون اعتبار ضبط</span>'}</div>
     <div class="grid">
       <div class="card metric"><div class="label">درخواست ها</div><div class="num">{u["total_requests"]}</div></div>
       <div class="card metric"><div class="label">ضبط ها</div><div class="num">{u["total_recordings"]}</div></div>
@@ -1270,15 +1379,15 @@ async def user_page(request: Request, telegram_id: str):
         <div><div class="muted">وضعیت اتصال</div><div style="margin-top:7px">{'<span class="badge premium">Calendar متصل</span>' if google_info.get("connected") else '<span class="badge free">نیاز به بررسی</span>'}<div class="muted" style="margin-top:6px">{_esc(google_info.get("error") or "مجوزهای لازم فعال است")}</div></div></div>
       </div>
     </div>
-    <div class="card section subscription-card"><div class="section-head"><h2>مدیریت اشتراک</h2><span class="pill">Premium controls</span></div>
+    <div class="card section subscription-card"><div class="section-head"><h2>مدیریت موجودی ساعت ضبط</h2><span class="pill">{wallet["remaining_seconds"]//3600} ساعت و {(wallet["remaining_seconds"]%3600)//60} دقیقه · بدون انقضا</span></div>
       <form class="inline" method="post" action="/admin/users/{_esc(telegram_id)}/activate">
-        <select name="plan_code"><option value="basic">Basic · ۲ ساعت · ۲۹۸٬۰۰۰</option><option value="pro">Pro · ۶ ساعت · ۴۹۸٬۰۰۰</option><option value="business">Business · ۱۵ ساعت · ۹۹۸٬۰۰۰</option></select>
+        <select name="plan_code"><option value="basic">شارژ ۲ ساعت</option><option value="pro">شارژ ۶ ساعت</option><option value="business">شارژ ۱۵ ساعت</option></select>
         <input name="note" placeholder="یادداشت اختیاری">
-        <button class="btn primary">فعال کردن / تمدید</button>
+        <button class="btn primary">افزودن اعتبار بدون انقضا</button>
       </form>
-      {'<form style="margin-top:10px" method="post" action="/admin/users/'+_esc(telegram_id)+'/deactivate"><button class="btn danger">غیرفعال کردن پلن ویژه</button></form>' if active else ''}
+      {'<form style="margin-top:10px" method="post" action="/admin/users/'+_esc(telegram_id)+'/deactivate"><button class="btn danger">لغو دسترسی و صفرکردن اعتبار</button></form>' if active else ''}
     </div>
-    <div class="two section"><div class="card"><div class="section-head"><h2>سابقه اشتراک</h2></div><table><thead><tr><th>پلن</th><th>مبلغ</th><th>شروع</th><th>پایان</th><th>وضعیت</th></tr></thead><tbody>{sub_rows}</tbody></table></div>
+    <div class="two section"><div class="card"><div class="section-head"><h2>سابقه اشتراک‌های قبلی (صرفاً آرشیو)</h2></div><table><thead><tr><th>پلن</th><th>مبلغ</th><th>شروع</th><th>پایان</th><th>وضعیت</th></tr></thead><tbody>{sub_rows}</tbody></table></div>
     <div class="card"><div class="section-head"><h2>ضبط های اخیر</h2></div><table><thead><tr><th>زمان</th><th>Meet</th><th>حجم</th><th>مدت</th></tr></thead><tbody>{rec_rows}</tbody></table></div></div>"""
     return _layout(name, body, "users")
 
@@ -1290,7 +1399,7 @@ async def activate_user(request: Request, telegram_id: str):
     form=parse_qs(raw)
     plan=(form.get("plan_code") or [""])[0]
     note=(form.get("note") or [""])[0]
-    activate_subscription(telegram_id, plan, note)
+    admin_credit_hours(telegram_id, plan, note)
     return RedirectResponse(f"/admin/users/{telegram_id}", status_code=303)
 
 
@@ -1435,7 +1544,7 @@ async def subscriptions_page(request: Request):
     with _db() as db:
         rows=db.execute("""SELECT s.*,u.username,u.first_name,u.last_name FROM subscriptions s LEFT JOIN users u ON u.telegram_id=s.telegram_id ORDER BY s.id DESC LIMIT 300""").fetchall()
     trs="".join(f'<tr><td>{_esc((str(r["first_name"] or "")+" "+str(r["last_name"] or "")).strip() or r["username"] or r["telegram_id"])}</td><td>{_esc(PLANS.get(r["plan_code"], {"label": r["plan_code"]})["label"])}</td><td>{_money(r["price_toman"])} تومان</td><td>{_fa_date(r["starts_at"])}</td><td>{_fa_date(r["ends_at"])}</td><td>{_esc(r["status"])}</td></tr>' for r in rows) or '<tr><td colspan="6" class="empty">هنوز اشتراکی ثبت نشده</td></tr>'
-    body=f'<div class="top"><div><h1>اشتراک ها</h1><div class="sub">سابقه فعال سازی و تمدید پلن ویژه</div></div></div><div class="card"><table><thead><tr><th>کاربر</th><th>پلن</th><th>مبلغ</th><th>شروع</th><th>پایان</th><th>وضعیت</th></tr></thead><tbody>{trs}</tbody></table></div>'
+    body=f'<div class="top"><div><h1>اشتراک‌های قدیمی</h1><div class="sub">آرشیو دوره‌های خریداری‌شده قبل از کیف پول ساعت ضبط</div></div></div><div class="card"><table><thead><tr><th>کاربر</th><th>پلن</th><th>مبلغ</th><th>شروع</th><th>پایان</th><th>وضعیت</th></tr></thead><tbody>{trs}</tbody></table></div>'
     return _layout("اشتراک ها", body, "subscriptions")
 
 
@@ -1446,11 +1555,11 @@ async def plans_page(request: Request):
         f'<div class="feature"><span class="dot {status}"></span><div><b>{_esc(name)}</b><div class="muted" style="margin-top:4px">{_esc(desc)}</div></div></div>'
         for name,desc,status in PREMIUM_FEATURES
     )
-    body=f"""<div class="top"><div><h1>پلن ویژه</h1><div class="sub">قیمت گذاری و نقشه قابلیت های پولی</div></div><span class="badge premium">Premium</span></div>
+    body=f"""<div class="top"><div><h1>خرید ساعت ضبط</h1><div class="sub">شارژ اعتباری یک‌باره، بدون انقضا و بدون اشتراک</div></div><span class="badge premium">Premium</span></div>
     <div class="plan-grid">
-      <div class="card plan"><span class="badge premium">Basic</span><div class="price">{_money(PLANS["basic"]["price"])}</div><div class="muted">تومان · ۳۰ روز · ۲ ساعت ضبط</div></div>
-      <div class="card plan"><span class="badge premium">Pro</span><div class="price">{_money(PLANS["pro"]["price"])}</div><div class="muted">تومان · ۳۰ روز · ۶ ساعت ضبط</div></div>
-      <div class="card plan"><span class="badge premium">Business</span><div class="price">{_money(PLANS["business"]["price"])}</div><div class="muted">تومان · ۳۰ روز · ۱۵ ساعت ضبط</div></div>
+      <div class="card plan"><span class="badge premium">۲ ساعت</span><div class="price">{_money(PLANS["basic"]["price"])}</div><div class="muted">تومان · شارژ ۲ ساعت بدون انقضا</div></div>
+      <div class="card plan"><span class="badge premium">۶ ساعت</span><div class="price">{_money(PLANS["pro"]["price"])}</div><div class="muted">تومان · شارژ ۶ ساعت بدون انقضا</div></div>
+      <div class="card plan"><span class="badge premium">۱۵ ساعت</span><div class="price">{_money(PLANS["business"]["price"])}</div><div class="muted">تومان · شارژ ۱۵ ساعت بدون انقضا</div></div>
     </div>
     <div class="two section"><div class="card"><div class="section-head"><h2>قابلیت های ویژه</h2><span class="pill">قابل توسعه</span></div>{feature_html}</div>
     <div class="card"><div class="section-head"><h2>پلن رایگان</h2></div>
@@ -1459,7 +1568,7 @@ async def plans_page(request: Request):
       <div class="feature"><span class="dot"></span><div><b>ارسال در تلگرام</b><div class="muted">مستقیم برای درخواست دهنده</div></div></div>
       <div class="alert" style="margin-top:15px">پرداخت آنلاین زیبال از مسیر HamoonCloud برای خرید کاربرها در حال استفاده است. فعال سازی دستی هم همچنان از صفحه کاربر در دسترسه.</div>
     </div></div>"""
-    return _layout("پلن ویژه", body, "plans")
+    return _layout("خرید ساعت ضبط", body, "plans")
 
 
 

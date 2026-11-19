@@ -40,6 +40,8 @@ from i18n import (
 from admin_panel import (
     PLANS,
     activate_subscription,
+    credit_purchase,
+    recording_credit_info,
     create_payment_intent,
     find_recording_for_artifact,
     free_recording_entitlement,
@@ -321,7 +323,7 @@ async def setup_telegram_profile() -> None:
             })
             public_commands = [
                 {"command": "start", "description": profile["commands"]["start"]},
-                {"command": "plans", "description": profile["commands"]["plans"]},
+                {"command": "credits", "description": profile["commands"]["credits"]},
                 {"command": "now", "description": profile["commands"]["now"]},
                 {"command": "language", "description": profile["commands"]["language"]},
             ]
@@ -341,7 +343,7 @@ async def setup_telegram_profile() -> None:
         })
         default_commands = [
             {"command": "start", "description": default_profile["commands"]["start"]},
-            {"command": "plans", "description": default_profile["commands"]["plans"]},
+            {"command": "credits", "description": default_profile["commands"]["credits"]},
             {"command": "now", "description": default_profile["commands"]["now"]},
             {"command": "language", "description": default_profile["commands"]["language"]},
         ]
@@ -358,7 +360,7 @@ async def setup_telegram_profile() -> None:
                 profile = i18n_profile(lang)
                 admin_commands = [
                     {"command": "start", "description": profile["commands"]["start"]},
-                    {"command": "plans", "description": profile["commands"]["plans"]},
+                    {"command": "credits", "description": profile["commands"]["credits"]},
                     {"command": "now", "description": profile["commands"]["now"]},
                     {"command": "language", "description": profile["commands"]["language"]},
                     {"command": "admin", "description": profile["commands"]["admin"]},
@@ -756,7 +758,10 @@ async def _paid_recording_allowed(
     """
     quota = await asyncio.to_thread(paid_recording_entitlement, str(chat_id))
     if not quota.get("premium"):
-        return True
+        if notify:
+            await tg_text(chat_id, t(chat_id, "wallet_empty"), with_menu=True)
+            await send_subscription_offer(chat_id)
+        return False
     remaining = quota.get("remaining_seconds")
     if remaining is None:
         return True  # protect grandfathered unlimited legacy subscriptions
@@ -776,8 +781,7 @@ async def _paid_recording_allowed(
     if notify:
         used = int(quota.get("used_seconds") or 0)
         limit = int(quota.get("quota_seconds") or 0)
-        await tg_text(chat_id, t(chat_id, "paid_quota_reached",
-                                used=round(used / 60), limit=round(limit / 60)))
+        await tg_text(chat_id, t(chat_id, "wallet_empty"), with_menu=True)
         await send_subscription_offer(chat_id)
     return False
 
@@ -1423,36 +1427,19 @@ async def telegram_loop() -> None:
                         await tg_text(chat_id, t(chat_id, "admin_only"))
                     continue
 
-                if text.startswith("/plans") or text.startswith("/premium"):
+                if text.startswith(("/credits", "/balance", "/plans", "/premium")):
+                    wallet = await asyncio.to_thread(recording_credit_info, str(chat_id))
+                    remaining = max(0, int(wallet.get("remaining_seconds") or 0))
+                    total_minutes=(remaining + 59) // 60
+                    message = t(chat_id, "wallet_balance", hours=total_minutes // 60,
+                                minutes=total_minutes % 60)
                     info = await asyncio.to_thread(subscription_info, str(chat_id))
-                    if info.get("premium"):
-                        until = info.get("period_end") or info.get("until")
-                        until_text = until.astimezone().strftime("%Y-%m-%d") if until else ""
-                        balance = await asyncio.to_thread(paid_recording_entitlement, str(chat_id))
-                        remain = balance.get("remaining_seconds")
-                        remaining_label = (
-                            t(chat_id, "quota_legacy") if remain is None
-                            else t(chat_id, "quota_remaining", minutes=int(remain // 60),
-                                   used=int(balance.get("used_seconds") or 0) // 60)
-                        )
-                        upcoming = await asyncio.to_thread(next_subscription_period, str(chat_id))
-                        upcoming_text = ""
-                        if upcoming and upcoming.get("starts") and upcoming.get("until"):
-                            upcoming_text = "\n\n" + t(
-                                chat_id, "renewal_scheduled",
-                                plan=plan_description(str(upcoming.get("plan") or "")),
-                                starts=upcoming["starts"].astimezone().strftime("%Y-%m-%d"),
-                                until=upcoming["until"].astimezone().strftime("%Y-%m-%d"),
-                            )
-                        await tg_text(
-                            chat_id,
-                            t(chat_id, "premium_active", until=until_text)
-                            + "\n\n" + plan_description(str(info.get("plan") or ""))
-                            + "\n" + remaining_label + upcoming_text,
-                            with_menu=True,
-                        )
-                    else:
-                        await send_subscription_offer(chat_id)
+                    if info.get("premium") and str(info.get("plan") or "") in ("monthly","quarterly","halfyear"):
+                        end = info.get("period_end") or info.get("until")
+                        until = end.astimezone().strftime("%Y-%m-%d") if end else ""
+                        message += "\n\n" + t(chat_id, "quota_legacy") + " " + until
+                    await tg_text(chat_id, message, with_menu=True)
+                    await send_subscription_offer(chat_id)
                     continue
 
                 if text.startswith("/auto"):
@@ -2090,7 +2077,7 @@ async def billing_payment_intent(intent: str) -> dict[str, Any]:
         "status": row.get("status"),
         "plan": row.get("plan_code"),
         "amount_toman": int(row.get("amount_toman") or 0),
-        "label": f"اشتراک BeOnMeet، {plan['label']}",
+        "label": f"شارژ {int(plan['quota_minutes']) // 60} ساعت ضبط BeOnMeet",
     }
 
 
@@ -2125,44 +2112,43 @@ async def billing_payment_return(payment: str = "", receipt: str = "", intent: s
     already_paid = row.get("status") == "paid"
     paid_row = await asyncio.to_thread(mark_payment_paid, intent, receipt)
     telegram_id = str((paid_row or row).get("telegram_id") or "")
-    before = await asyncio.to_thread(subscription_info, telegram_id)
-    # A second purchase is a FUTURE 30-day term, not a top-up of this term.
-    # Retried callbacks are deduplicated by the verified Zibal receipt.
-    until = await asyncio.to_thread(activate_subscription, telegram_id, expected_plan, f"Zibal receipt {receipt}")
-    scheduled = bool(before.get("premium") and before.get("until") and before["until"] > datetime.now(timezone.utc))
-    label = str(PLANS[expected_plan].get("label") or expected_plan)
+    purchased_seconds = int(PUBLIC_PLANS[expected_plan]["quota_minutes"]) * 60
+    # An independently verified Zibal receipt is credited once. Callback retries
+    # do not top up twice. Previously credited subscription receipts are
+    # recognized and preserved by credit_purchase.
+    wallet = await asyncio.to_thread(credit_purchase, telegram_id, expected_plan, receipt)
+    remaining = max(0, int(wallet["remaining_seconds"]))
     if not already_paid:
-        if expected_plan not in PUBLIC_PLAN_CODES:
-            confirmation = t(telegram_id, "payment_confirmed_legacy", plan=label, until=until.astimezone().strftime("%Y-%m-%d"))
-        elif scheduled:
-            confirmation = t(
-                telegram_id, "payment_scheduled", plan=label,
-                starts=before["until"].astimezone().strftime("%Y-%m-%d"),
-                until=until.astimezone().strftime("%Y-%m-%d"),
-                hours=int(PUBLIC_PLANS[expected_plan]["quota_minutes"] // 60),
-            )
-        else:
-            confirmation = t(
-                telegram_id, "payment_confirmed", plan=label,
-                until=until.astimezone().strftime("%Y-%m-%d"),
-                hours=int(PUBLIC_PLANS[expected_plan]["quota_minutes"] // 60),
-            )
         try:
-            await tg_text(telegram_id, confirmation)
-        except Exception as exc:
-            print("payment confirmation Telegram delivery failed:", type(exc).__name__, flush=True)
-        if ADMINUSER and ADMINUSER != telegram_id:
             await tg_text(
-                ADMINUSER,
-                f"💳 خرید پلن ویژه\nکاربر: {telegram_id}\nپلن: {expected_plan}\nمبلغ: {expected_amount:,} تومان\nرسید: {receipt}"
+                telegram_id,
+                t(
+                    telegram_id, "wallet_payment_confirmed",
+                    hours=purchased_seconds // 3600,
+                    balance_hours=((remaining + 59) // 60) // 60,
+                    balance_minutes=((remaining + 59) // 60) % 60,
+                ),
+                with_menu=True,
             )
-
+        except Exception as exc:
+            print("credit purchase Telegram delivery failed:", type(exc).__name__, flush=True)
+        if ADMINUSER and ADMINUSER != telegram_id:
+            try:
+                await tg_text(
+                    ADMINUSER,
+                    f"💳 شارژ ساعت ضبط\nکاربر: {telegram_id}\n"
+                    f"ساعت: {purchased_seconds // 3600}\n"
+                    f"مبلغ: {expected_amount:,} تومان\nرسید: {receipt}",
+                )
+            except Exception as exc:
+                print("admin credit purchase notification failed:", type(exc).__name__, flush=True)
     return (
-        "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;"
-        "background:#0b0e17;color:white;display:grid;place-items:center;min-height:100vh;margin:0'>"
-        "<div style='text-align:center'><h2>پرداخت موفق بود ✅</h2><p>"
-        + ("دوره بعدی خریداری شد؛ ساعت‌های دوره فعلی افزایش پیدا نکرد." if scheduled else "اشتراک فعلی فعال شد.")
-        + " می‌تونی صفحه رو ببندی و به تلگرام برگردی.</p></div></body></html>"
+        "<html lang='fa' dir='rtl'><meta charset='utf-8'>"
+        "<body style='font-family:tahoma;background:#0b0e17;color:#fff;"
+        "display:grid;place-items:center;min-height:100vh'>"
+        "<div style='text-align:center'><h2>شارژ ساعت ضبط موفق بود ✅</h2>"
+        "<p>اعتبار خریداری‌شده به موجودی قبلی اضافه شد و تاریخ انقضا ندارد."
+        " موجودی را در تلگرام از بخش شارژ ساعت ببین.</p></div></body></html>"
     )
 
 
@@ -2746,7 +2732,7 @@ def public_shell(title: str, body: str) -> str:
 <title>{title}</title><meta name="description" content="Send a Google Meet link for scheduled or immediate recording and Telegram delivery.">
 <style>{PUBLIC_SITE_CSS}</style></head>
 <body><div class="wrap"><nav class="nav"><a class="brand" href="/"><span class="mark">B</span>BeOnMeet</a>
-<div class="links"><a href="/fa">فارسی</a><a href="/#how">How it works</a><a href="/#plans">Plans</a><a href="/#data">Google data</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div></nav></div>
+<div class="links"><a href="/fa">فارسی</a><a href="/#how">How it works</a><a href="/#credits">Buy hours</a><a href="/#data">Google data</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div></nav></div>
 {body}
 <footer><div class="wrap foot"><span>© 2026 BeOnMeet</span><span><a href="/privacy">Privacy Policy</a><a href="/terms">Terms of Service</a></span></div></footer>
 </body></html>"""
@@ -2764,10 +2750,10 @@ async def home() -> str:
         '<a class="button" href="mailto:meetrecorderbot@gmail.com?subject=BeOnMeet%20access">Request access</a>'
     )
     price_cards = "".join(
-        '<div class="card"><b>' + PUBLIC_PLANS[code]["label"] + '</b>'
-        + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>toman / 30 days</small></div>'
+        '<div class="card"><b>' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' hours credit</b>'
+        + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>toman · one-time purchase</small></div>'
         + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' hours recording</div>'
-        + '<p>This is a TOTAL allowance shared across meetings, not per meeting. Unused minutes expire after 30 days; another purchase schedules a future period, not an immediate top-up.</p>'
+        + '<p>Purchased recording hours are added to your balance immediately, never expire, and can be used across all meetings.</p>'
         + '</div>'
         for code in PUBLIC_PLAN_CODES
     )
@@ -2777,18 +2763,18 @@ async def home() -> str:
 <span class="eyebrow">Google Meet recording in Telegram</span>
 <h1>Send your meeting link. Get the recording in Telegram.</h1>
 <p>Send the Google Meet link to our Telegram bot. For scheduled meetings, invite the recorder to the meeting event; for an ongoing meeting use Join now. The host may need to admit the recorder before recording begins.</p>
-<div class="cta">__BOT_CTA__<a class="button secondary" href="#plans">Compare plans</a></div>
+<div class="cta">__BOT_CTA__<a class="button secondary" href="#credits">Buy hours</a></div>
 </div></section>
-<section id="plans" class="section"><div class="wrap">
-<h2>Simple plans, predictable recording hours</h2>
-<p>Each purchase gives a total allowance of 2, 6 or 15 recorded hours over a 30-day period starting at activation. Hours can be spread across meetings. Unused hours do not roll over, and there is no automatic renewal or automatic overage charge. If you run out early, another plan purchase starts only after the current paid period; contact support for immediate extra hours.</p>
+<section id="credits" class="section"><div class="wrap">
+<h2>Buy recording hours, not subscriptions</h2>
+<p>Choose 2, 6 or 15 hours of recording credit. Each purchase instantly adds hours to your existing balance, even if you already have credit. Hours never expire, there are no monthly subscriptions, and no automatic renewal. Completed recordings consume the corresponding time. If a recording runs beyond your balance, the excess is deducted from your next purchase.</p>
 <div class="grid prices">__PRICE_CARDS__</div>
-<div class="cta">__BOT_CTA__<a class="button secondary" href="/terms">Plan terms</a></div>
+<div class="cta">__BOT_CTA__<a class="button secondary" href="/terms">Credit terms</a></div>
 </div></section>
 <section id="how"><div class="wrap grid">
 <div class="card"><b>1. Send the link</b><p>Send a Google Meet link directly in the bot. For a future meeting, invite the recorder email to the calendar event.</p></div>
 <div class="card"><b>2. Admit the recorder</b><p>The recorder attempts to join the requested meeting. The host may need to admit it.</p></div>
-<div class="card"><b>3. Receive the result</b><p>After recording, the bot sends the files to your Telegram chat, subject to available capacity and plan.</p></div>
+<div class="card"><b>3. Receive the result</b><p>After recording, the bot sends the files to your Telegram chat, subject to available capacity and your available credit.</p></div>
 </div></section>
 <section class="section" id="data"><div class="wrap">
 <h2>Data access and privacy</h2>
@@ -2801,11 +2787,11 @@ async def home() -> str:
 </div></section>
 <section class="section"><div class="wrap">
 <h2>Recordings delivered where you already work</h2>
-<p>Meeting recordings and eligible Premium outputs such as separate audio and transcripts are delivered through Telegram. Temporary delivery files are retained only as needed to complete delivery and, depending on plan, may remain available for up to 72 hours before expiry.</p>
+<p>Meeting recordings and available outputs such as separate audio and transcripts are delivered through Telegram. Temporary delivery files are retained only as needed to complete delivery and may remain available for up to 72 hours. Purchased recording hours never expire.</p>
 </div></section>
 </main>"""
     return public_shell(
-        "BeOnMeet | Google Meet recording plans",
+        "BeOnMeet | Prepaid Google Meet recording hours",
         body.replace("__BOT_CTA__", bot_cta).replace("__PRICE_CARDS__", price_cards),
     )
 
@@ -2821,10 +2807,10 @@ async def home_fa() -> str:
         '<a class="button" href="mailto:meetrecorderbot@gmail.com?subject=BeOnMeet%20access">درخواست دسترسی</a>'
     )
     plan_cards = "".join(
-        '<div class="card" style="text-align:right"><b>' + PUBLIC_PLANS[code]["label"] + '</b>'
-        + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>تومان / ۳۰ روز</small></div>'
+        '<div class="card" style="text-align:right"><b>شارژ ' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' ساعت ضبط</b>'
+        + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>تومان · خرید یک‌باره</small></div>'
         + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' ساعت ضبط جلسه</div>'
-        + '<p>این سهمیه، مجموع ضبط تمام جلسه‌ها در ۳۰ روز است، نه سهمیه هر جلسه. ساعت باقی‌مانده منتقل نمی‌شود؛ خرید مجدد، دوره بعدی را فعال می‌کند نه شارژ فوری.</p>'
+        + '<p>هر خرید فوراً به موجودی ساعت ضبط اضافه می‌شود؛ ساعت‌ها تاریخ انقضا ندارند.</p>'
         + '</div>'
         for code in PUBLIC_PLAN_CODES
     )
@@ -2834,11 +2820,11 @@ async def home_fa() -> str:
 <span class="eyebrow">ضبط و دریافت جلسات Google Meet در تلگرام</span>
 <h1>جلسه‌ات را از دست نده. BeOnMeet ضبطش می‌کند.</h1>
 <p>لینک Google Meet را داخل ربات بفرست. برای جلسه آینده، ایمیل رکوردر را به رویداد تقویم دعوت کن؛ برای جلسه‌ای که شروع شده «ورود فوری» را بزن. پس از تأیید میزبان، ضبط انجام می‌شود و فایل در تلگرام ارسال می‌شود.</p>
-<div class="cta">__BOT_CTA__<a class="button secondary" href="#plans">مشاهده قیمت‌ها</a></div>
+<div class="cta">__BOT_CTA__<a class="button secondary" href="#credits">خرید ساعت</a></div>
 </div></section>
-<section id="plans" class="section"><div class="wrap">
-<h2>پلن‌های شفاف و ساعتی</h2>
-<p>هر پلن مجموعاً ۲، ۶ یا ۱۵ ساعت ضبط در ۳۰ روز از شروع دوره دارد؛ می‌توانی این ساعت‌ها را بین چند جلسه تقسیم کنی. ساعت باقی‌مانده در پایان دوره می‌سوزد. تمدید خودکار و برداشت خودکار بابت مازاد نداریم. اگر ساعت‌ها زودتر تمام شد، خرید دوباره سهمیه همان دوره را افزایش نمی‌دهد و برای ۳۰ روز بعد رزرو می‌شود؛ برای ساعت اضافه فوری باید با پشتیبانی هماهنگ کنی.</p>
+<section id="credits" class="section"><div class="wrap">
+<h2>فقط خرید ساعت ضبط؛ بدون اشتراک</h2>
+<p>فقط ساعت ضبط می‌خری: ۲، ۶ یا ۱۵ ساعت. هر خرید بلافاصله به موجودی قبلی‌ات اضافه می‌شود، تاریخ انقضا ندارد و برای تمام جلسه‌ها قابل استفاده است. به‌اندازه مدت ضبط موفق از اعتبار کم می‌شود؛ اگر جلسه از موجودی بیشتر طول بکشد، مازاد از شارژ بعدی کسر می‌شود. تمدید خودکار یا هزینه اضافه خودکار نداریم.</p>
 <div class="grid prices">__PRICE_CARDS__</div>
 <div class="cta">__BOT_CTA__</div>
 </div></section>
@@ -2914,9 +2900,9 @@ async def terms_of_service() -> str:
 <p>Google Meet, Google Calendar and Telegram are third party services. BeOnMeet is not affiliated with or endorsed by Google or Telegram. Their availability and policies can affect BeOnMeet functionality.</p>
 <h2>Availability</h2>
 <p>We work to provide reliable joining of meetings explicitly requested by the user and delivery of the resulting files, but admission controls, network conditions, third party outages, capacity limits or meeting configuration can prevent or delay recording. A host may need to admit the recorder.</p>
-<h2>Plans and temporary files</h2>
-<p>New Basic, Pro and Business subscriptions last 30 days from activation and include respectively a TOTAL of 2, 6 and 15 recorded hours, shared across all meetings in the period, not per meeting. Usage is measured by the duration of completed recordings. Unused hours expire at the end of the 30-day period and do not roll over. When the recording allowance is exhausted, new recording requests are blocked until the next subscription period or a support-assisted upgrade. A recording already in progress may finish and exceed the remaining allowance. No additional hourly charge is made automatically. Buying the same or another subscription during an active paid period does NOT top up its current allowance; it queues a new 30-day period after the last purchased paid period. These subscriptions are not automatically renewed.</p>
-<p>Some older customers retain their original plan terms until their existing entitlement expires. Temporary delivery and download files expire according to the applicable plan and service configuration.</p>
+<h2>Recording-hour credit and temporary files</h2>
+<p>BeOnMeet sells prepaid recording hours, not monthly subscriptions. One-time purchases of 2, 6 or 15 hours immediately increase the same non-expiring credit balance. Completed recordings deduct their actual duration. When the balance is exhausted, new recordings require another top-up. An already-started recording may finish and use more than the remaining hours; the excess is deducted from later purchases. There are no automatic renewals, top-ups or overage charges.</p>
+<p>Remaining allowance from still-active or prepaid future plans is converted into the non-expiring wallet. Used and already-expired time is not recredited. Legacy unlimited subscribers keep previously agreed rights until the original end date. Temporary recording/download files have expiry periods separate from hour credits.</p>
 <h2>Privacy</h2>
 <p>Our handling of personal information and Google user data is described in the <a href="/privacy">Privacy Policy</a>.</p>
 <h2>Suspension</h2>

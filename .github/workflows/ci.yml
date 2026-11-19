@@ -21,6 +21,7 @@ jobs:
           python3 tests/all_meetings_hidden_test.py
           python3 tests/billing_tier_test.py
           python3 tests/billing_usage_behavior_test.py
+          python3 tests/prepaid_hour_wallet_behavior_test.py
           python3 tests/hamooncloud_payment_patch_test.py
           python3 -m py_compile patches/fix_hamooncloud_beonmeet_plans.py
           bash -n scripts/deploy_hamooncloud_payment_plan_fix.sh
@@ -36,6 +37,8 @@ jobs:
           bash -n scripts/activate_five_on_shared_vps.sh
           bash -n scripts/rollback_five_on_shared_vps.sh
           bash -n scripts/deploy_hide_auto_clarify_billing.sh
+          bash -n scripts/deploy_prepaid_hour_wallet.sh
+
 
 
 

@@ -1,15 +1,16 @@
-"""Authoritative BeOnMeet plan catalog and side-effect-free quota math.
+"""Authoritative prepaid recording-hour purchase amounts and legacy plan catalog.
 
-Legacy duration plans remain recognizable for existing subscribers and pending
-payment intents. Only PUBLIC_PLAN_CODES may be offered to new customers.
+Old basic/pro/business codes remain unchanged for HamoonCloud payment compatibility,
+but the user buys permanent additive credits rather than monthly subscriptions.
+Legacy subscriptions remain recognized solely for grandfathered customers.
 """
 from __future__ import annotations
 
 PUBLIC_PLAN_CODES = ("basic", "pro", "business")
 PUBLIC_PLANS = {
-    "basic": {"label": "Basic", "months": 1, "price": 298_000, "quota_minutes": 120},
-    "pro": {"label": "Pro", "months": 1, "price": 498_000, "quota_minutes": 360},
-    "business": {"label": "Business", "months": 1, "price": 998_000, "quota_minutes": 900},
+    "basic": {"label": "۲ ساعت ضبط", "months": 1, "price": 298_000, "quota_minutes": 120},
+    "pro": {"label": "۶ ساعت ضبط", "months": 1, "price": 498_000, "quota_minutes": 360},
+    "business": {"label": "۱۵ ساعت ضبط", "months": 1, "price": 998_000, "quota_minutes": 900},
 }
 LEGACY_PLANS = {
     "monthly": {"label": "یک ماهه (قدیمی)", "months": 1, "price": 198_000, "quota_minutes": None},
@@ -41,4 +42,4 @@ def plan_description(code: str) -> str:
     if hours is None:
         return f"{plan['label']} (اشتراک قبلی)"
     display_hours = int(hours) if float(hours).is_integer() else hours
-    return f"{plan['label']} · {display_hours} ساعت ضبط در ۳۰ روز"
+    return f"{display_hours} ساعت اعتبار ضبط بدون انقضا"

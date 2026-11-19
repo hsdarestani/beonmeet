@@ -31,8 +31,8 @@ for needle in required_main:
     assert needle in MAIN, f"missing free-plan controller invariant: {needle}"
 
 assert I18N.count('"free_limit_reached"') == 3
-assert "one trial recording" in I18N
-assert "eine Probeaufnahme" in I18N
-assert "یک جلسه آزمایشی" in I18N
+assert "one free trial recording" in I18N
+assert "Probeaufnahme" in I18N
+assert "ضبط آزمایشی رایگان" in I18N
 
 print("FREE_PLAN_LIMIT_TEST_PASS")
