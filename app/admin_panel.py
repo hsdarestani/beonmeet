@@ -458,6 +458,13 @@ def record_recording(telegram_id: str, meet_url: str, filename: str, size_bytes:
             "UPDATE users SET total_recordings = total_recordings + 1, last_seen=? WHERE telegram_id=?",
             (now, str(telegram_id)),
         )
+        # Never debit free trials or grandfathered unlimited legacy terms.
+        # Every completed paid recording has an idempotent filename reference.
+        # An in-progress meeting may exceed available time: signed debt carries
+        # into the next top-up instead of silently gifting additional hours.
+        if duration_seconds and has_wallet_history(db,str(telegram_id)) and not _active_legacy_subscription(telegram_id):
+            add_entry(db,str(telegram_id),-max(0,int(duration_seconds)),
+                f"recording:{telegram_id}:{filename or ''}","recording")
 
 
 def find_recording_for_artifact(
@@ -606,7 +613,7 @@ def free_recording_entitlement(telegram_id: str) -> dict:
 
     used = int(row["total_recordings"] or 0) if row else 0
     until = _parse_dt(row["premium_until"]) if row else None
-    premium = bool(until and until > utcnow())
+    premium = is_premium(telegram_id)
     remaining = max(0, FREE_RECORDING_LIMIT - used)
     return {
         "premium": premium,
@@ -618,10 +625,11 @@ def free_recording_entitlement(telegram_id: str) -> dict:
 
 
 def is_premium(telegram_id: str) -> bool:
+    # A paid account is determined by available recording seconds, not dates.
+    if _active_legacy_subscription(telegram_id):
+        return True
     with _db() as db:
-        row = db.execute("SELECT premium_until FROM users WHERE telegram_id=?", (str(telegram_id),)).fetchone()
-    until = _parse_dt(row["premium_until"]) if row else None
-    return bool(until and until > utcnow())
+        return wallet_balance(db,str(telegram_id))["remaining_seconds"] > 0
 
 
 def was_premium_at(telegram_id: str, when_iso: str) -> bool:
@@ -646,7 +654,13 @@ def was_premium_at(telegram_id: str, when_iso: str) -> bool:
             ends = ends.replace(tzinfo=timezone.utc)
         if starts <= when < ends:
             return True
-    return False
+    with _db() as db:
+        credited=db.execute(
+            """SELECT 1 FROM credit_entries WHERE telegram_id=? AND
+               seconds_delta>0 AND created_at<=? LIMIT 1""",
+            (str(telegram_id), when.isoformat()),
+        ).fetchone()
+    return bool(credited)
 
 
 def subscription_info(telegram_id: str) -> dict:
@@ -688,33 +702,21 @@ def subscription_info(telegram_id: str) -> dict:
 
 
 def paid_recording_entitlement(telegram_id: str) -> dict:
-    """Paid recording usage is counted only in the current subscription period.
-
-    None for remaining_seconds means an existing legacy unlimited plan; the new
-    public plans always have finite quotas. This function does not infer usage
-    from an older paid period or give away hours on an early renewal.
-    """
-    info = subscription_info(telegram_id)
-    if not info["premium"]:
-        return {"premium": False, "allowed": False, "plan": None, "used_seconds": 0, "remaining_seconds": 0, "quota_seconds": 0}
-    plan = info["plan"]
-    quota = plan_quota_seconds(plan)
-    if quota is None:
-        return {"premium": True, "allowed": True, "plan": plan, "used_seconds": 0, "remaining_seconds": None, "quota_seconds": None}
-    period_end = info.get("period_end") or info["until"]
-    period_start = info.get("period_start") or (period_end - timedelta(days=30))
-    with _db() as db:
-        row = db.execute(
-            """SELECT COALESCE(SUM(duration_seconds), 0) AS total
-               FROM recordings WHERE telegram_id=? AND created_at>=? AND created_at<?""",
-            (str(telegram_id), period_start.isoformat(), period_end.isoformat()),
-        ).fetchone()
-    used = max(0, int(row["total"] or 0)) if row else 0
-    remaining = remaining_seconds(plan, used)
+    """Non-expiring total credit balance, preserving legacy unlimited periods."""
+    legacy=_active_legacy_subscription(telegram_id)
+    wallet=recording_credit_info(telegram_id)
+    if legacy:
+        return {"premium":True,"allowed":True,"plan":legacy.get("plan"),
+            "used_seconds":wallet["used_seconds"],"quota_seconds":None,
+            "remaining_seconds":None,"wallet_remaining_seconds":wallet["remaining_seconds"]}
+    remaining=wallet["remaining_seconds"]
     return {
-        "premium": True, "allowed": remaining is None or remaining > 0,
-        "plan": plan, "used_seconds": used, "remaining_seconds": remaining,
-        "quota_seconds": quota,
+        "premium":remaining>0,
+        "allowed":remaining>0,
+        "plan":None,
+        "used_seconds":wallet["used_seconds"],
+        "remaining_seconds":remaining,
+        "quota_seconds":wallet["credited_seconds"],
     }
 
 
@@ -788,43 +790,42 @@ def deactivate_subscription(telegram_id: str) -> None:
 
 
 def paid_sales_capacity(plan_code: str, telegram_id: str = "") -> dict:
-    """Conservative soft capacity gate for new paid 30-day subscriptions.
+    """Limit outstanding unspent prepaid hours on shared VPS.
 
-    Count the advertised hours of active paid users, including conservative
-    15-hour reservations for older unlimited subscriptions. No new servers are
-    created. This is not a substitute for real peak-concurrency load testing.
+    No subscription-cycle reservations. Repeat topups add instantly, and
+    the existing 12-user/60-unspent-hour pilot safeguards stay in place.
     """
-    requested = plan_quota_seconds(plan_code)
-    if requested == 0 or plan_code not in PUBLIC_PLAN_CODES:
-        return {"allowed": False, "reason": "unknown plan"}
-    now = utcnow().isoformat()
+    requested=plan_quota_seconds(plan_code)
+    if not requested or plan_code not in PUBLIC_PLAN_CODES:
+        return {"allowed":False,"reason":"unknown hours bundle"}
     with _db() as db:
-        active = db.execute(
-            """SELECT telegram_id, premium_plan FROM users
-               WHERE premium_until IS NOT NULL AND premium_until > ?""",
-            (now,),
+        rows=db.execute(
+            """SELECT telegram_id, SUM(seconds_delta) AS net
+               FROM credit_entries GROUP BY telegram_id
+               HAVING SUM(seconds_delta)>0"""
         ).fetchall()
-    members = {str(u["telegram_id"]) for u in active}
-    sold = 0
-    for item in active:
-        allocated = plan_quota_seconds(str(item["premium_plan"] or ""))
-        sold += allocated if allocated is not None else 15 * 3600
-    # Renewals by already active members do not consume an additional concurrent
-    # subscription seat; nevertheless count the new quota if it is higher.
-    already_active = str(telegram_id) in members
-    projected_users = len(members) + (0 if already_active else 1)
-    projected_sold = sold + requested
+        legacy_candidates=db.execute(
+            "SELECT telegram_id FROM users WHERE premium_until IS NOT NULL",
+        ).fetchall()
+    members={str(r["telegram_id"]) for r in rows}
+    sold=sum(max(0,int(r["net"] or 0)) for r in rows)
+    for row in legacy_candidates:
+        sid=str(row["telegram_id"])
+        if sid not in members and _active_legacy_subscription(sid):
+            members.add(sid)
+            sold+=15*3600  # grandfathered unlimited subscriber safety reserve
+    projected_users=len(members)+(0 if str(telegram_id) in members else 1)
+    projected_sold=sold+requested
     return {
         "allowed": (
-            PAID_SALES_MAX_ACTIVE_USERS > 0
-            and PAID_SALES_MAX_SOLD_HOURS > 0
-            and projected_users <= PAID_SALES_MAX_ACTIVE_USERS
-            and projected_sold <= PAID_SALES_MAX_SOLD_HOURS * 3600
+            PAID_SALES_MAX_ACTIVE_USERS>0 and PAID_SALES_MAX_SOLD_HOURS>0
+            and projected_users<=PAID_SALES_MAX_ACTIVE_USERS
+            and projected_sold<=PAID_SALES_MAX_SOLD_HOURS*3600
         ),
-        "active_users": len(members), "sold_hours": round(sold / 3600, 2),
-        "limit_users": PAID_SALES_MAX_ACTIVE_USERS,
-        "limit_sold_hours": PAID_SALES_MAX_SOLD_HOURS,
-        "requested_hours": round(requested / 3600, 2),
+        "active_users":len(members),"sold_hours":round(sold/3600,2),
+        "limit_users":PAID_SALES_MAX_ACTIVE_USERS,
+        "limit_sold_hours":PAID_SALES_MAX_SOLD_HOURS,
+        "requested_hours":round(requested/3600,2),
     }
 
 
@@ -849,7 +850,7 @@ def create_payment_intent(telegram_id: str, plan_code: str) -> dict:
         "telegram_id": str(telegram_id),
         "plan": plan_code,
         "amount_toman": int(plan["price"]),
-        "label": f"اشتراک BeOnMeet، {plan['label']}",
+        "label": f"شارژ {int(plan['quota_minutes']) // 60} ساعت ضبط BeOnMeet",
         "expires_at": expires,
     }
 
