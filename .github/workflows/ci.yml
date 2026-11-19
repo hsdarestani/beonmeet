@@ -27,6 +27,8 @@ jobs:
           python3 tests/admin_google_clay_test.py
           python3 tests/cloud_init_render_test.py
           python3 tests/low_resource_capture_patch_test.py
+          python3 -m py_compile patches/patch_low_resource_compiled_recorder.py
+          bash -n scripts/activate_five_on_shared_vps.sh
 
 
 
