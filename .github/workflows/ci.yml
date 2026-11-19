@@ -54,6 +54,23 @@ jobs:
             git -C /opt/beonmeet rev-parse HEAD
             printf 'git_dirty='
             git -C /opt/beonmeet status --porcelain | wc -l
+            echo 'git_dirty_names='
+            git -C /opt/beonmeet status --short | sed -E 's/^(.{3}).*/\1/' | sort | uniq -c
+            echo 'changed_critical_files='
+            git -C /opt/beonmeet status --porcelain -- app/main.py app/admin_panel.py app/i18n.py app/billing_policy.py
+            echo 'active_payment_counts='
+            python3 - <<'PY'
+            import sqlite3
+            from datetime import datetime,timezone
+            from pathlib import Path
+            p=Path('/opt/beonmeet/data/beonmeet.db')
+            if p.exists():
+                db=sqlite3.connect(f'file:{p}?mode=ro',uri=True)
+                now=datetime.now(timezone.utc).isoformat()
+                print('active_paid=',db.execute('SELECT count(*) FROM users WHERE premium_until>?',(now,)).fetchone()[0])
+                print('pending_payments=',db.execute("SELECT count(*) FROM payment_intents WHERE status='pending' AND expires_at>?",(now,)).fetchone()[0])
+                print('total_recordings=',db.execute('SELECT count(*) FROM recordings').fetchone()[0])
+            PY
             echo 'safe_env_flags='
             python3 - <<'PY'
             from pathlib import Path
