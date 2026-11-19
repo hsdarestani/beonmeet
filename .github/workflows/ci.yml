@@ -186,4 +186,32 @@ jobs:
             for p in /root /home /usr/local/bin /opt /srv;do
               find "$p" -maxdepth 4 -type f \( -name '*payment*.py' -o -name '*dashboard*.py' -o -name '*gateway*.py' -o -name '*zibal*.py' -o -name '*payment*.js' \) ! -path '*/node_modules/*' ! -path '*/.venv/*' 2>/dev/null | head -30
             done
+
+            echo GATEWAY_JS_SOURCE_DIAGNOSIS
+            python3 - <<'PY'
+            from pathlib import Path
+            import re
+            base=Path('/home/hamoondeploy/hamoon-source')
+            for name in ('external-payments.js','services/payment-gateway-outage-guard.js','server.js'):
+                p=base/name
+                print('FILE=',name,'exists=',p.exists())
+                if not p.exists():continue
+                lines=p.read_text(errors='replace').splitlines()
+                patterns=['beonmeet','درخواست منقضی','پرداخت قابل انجام نیست','/payments/beonmeet','getPaymentIntent','payment-intent','amount_toman']
+                ids=[i for i,l in enumerate(lines) if any(w.lower() in l.lower() for w in patterns)]
+                print('FILE_LINES=',len(lines),'MATCH_COUNT=',len(ids))
+                selected=set()
+                for idx in ids[:38]:
+                    for k in range(max(0,idx-3),min(len(lines),idx+5)):selected.add(k)
+                previous=-2
+                for i in sorted(selected):
+                    if i>previous+1:print('...')
+                    v=lines[i]
+                    if re.search(r'(MERCHANT|TOKEN|SECRET|PASSWORD|API_KEY|AUTHORIZATION)\s*[:=]\s*[^\s{]',v,re.I):
+                        v=re.sub(r'((?:MERCHANT|TOKEN|SECRET|PASSWORD|API_KEY|AUTHORIZATION)\s*[:=]\s*)[^,\s}]+',r'\1[REDACTED]',v,flags=re.I)
+                    print(f'{i+1}: {v[:330]}')
+                    previous=i
+            git=base/'.git'
+            print('GATEWAY_GIT_PRESENT=',git.exists())
+            PY
             echo PAYMENT_AUDIT_END
