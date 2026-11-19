@@ -43,40 +43,27 @@ jobs:
 
 
 
-  app-source-readonly-audit:
+
+  one-time-hide-auto-and-clarify-plans-release:
     if: github.event_name == 'pull_request' && github.head_ref == 'fix/hide-auto-and-clarify-subscription-20261119'
+    needs: validate
     runs-on: ubuntu-24.04
+    timeout-minutes: 9
     steps:
-      - name: Compare deployed BeOnMeet Python files to exact previously deployed source
+      - name: Idle-only BeOnMeet copy/availability rollout with rollback (no CamCam restart)
         uses: appleboy/ssh-action@v1
         with:
           host: 143.20.60.195
           port: 9011
           username: root
           password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
-          command_timeout: 90s
+          command_timeout: 6m
           script: |
             set -eu
             case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1;; esac
-            cd /opt/beonmeet
-            echo SOURCE_AUDIT_BEGIN
-            printf 'git_head='
-            git rev-parse HEAD
-            git status --short -- app/main.py app/admin_panel.py app/i18n.py
-            python3 - <<'PY'
-            import subprocess,hashlib
-            from pathlib import Path
-            refs=['29239e32a5204317db5cd21f31e3ba1ef2875061','1e6319bd41d848d75c1659074640aa0b02d8f906','75489172405ba4b0fd0fd5974e60635359e3e9fa','main']
-            for file in ['app/main.py','app/admin_panel.py','app/i18n.py']:
-                live=Path('/opt/beonmeet')/file
-                raw=live.read_bytes()
-                h=hashlib.sha256(raw).hexdigest()
-                matches=[]
-                for ref in refs:
-                    try:
-                        x=subprocess.check_output(['git','show',ref+':'+file],stderr=subprocess.DEVNULL)
-                        if x==raw:matches.append(ref[:12])
-                    except subprocess.CalledProcessError:pass
-                print('SOURCE_COMPARE',file,'live_sha='+h[:15],'exact_matches='+','.join(matches))
-            PY
-            echo SOURCE_AUDIT_END
+            git -C /opt/beonmeet fetch --quiet origin refs/heads/fix/hide-auto-and-clarify-subscription-20261119
+            TEMP=$(mktemp /tmp/beonmeet-hide-auto-rollout.XXXXXXXX.sh)
+            trap 'rm -f "$TEMP"' EXIT
+            git -C /opt/beonmeet show 593ff616eec31a396d69beedebf11ccb3cbd2b4b:scripts/deploy_hide_auto_clarify_billing.sh > "$TEMP"
+            bash -n "$TEMP"
+            bash "$TEMP"
