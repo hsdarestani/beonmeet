@@ -38,7 +38,7 @@ for needle in (
 ):
     assert needle in admin, needle
 for needle in (
-    "for plan_code in PUBLIC_PLAN_CODES:",
+    "for code, text_key in (",
     "async def _paid_recording_allowed(",
     "premium and not await _paid_recording_allowed(chat_id, event_id=event_id)",
     "premium and not await _paid_recording_allowed(chat_id, event_id=event_id, notify=False)",
