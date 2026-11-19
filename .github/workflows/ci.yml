@@ -149,5 +149,9 @@ jobs:
                 print(name, 'ports=', d['HostConfig'].get('PortBindings'),'user=',d['Config'].get('User'),
                   'readonly_root=',d['HostConfig'].get('ReadonlyRootfs'),'mounts=',[(x.get('Source'),x.get('Destination')) for x in d.get('Mounts',[])])
             PY
+            echo COMPILED_CAPTURE_SNIPPET
+            docker exec beonmeet-worker-single sh -lc "sed -n '713,770p' /usr/src/app/dist/bots/GoogleMeetBot.js" || true
+            echo COMPILED_CODEC_SNIPPET
+            docker exec beonmeet-worker-single sh -lc "head -42 /usr/src/app/dist/lib/recording.js" || true
             echo AUDIT_COMPLETE
 
