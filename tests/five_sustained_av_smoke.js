@@ -116,7 +116,10 @@ async function main() {
   });
   clearInterval(progress);
   const results=await Promise.all(pages.map(p=>p.evaluate(()=>window.__qa.stop())));
-  const stats=results.map((v,i)=>({...v,bytes:fs.statSync(paths[i]).size, receivedChunks:received[i].chunks}));
+  console.log('QA_RECORDER_INTERNAL_META '+JSON.stringify(results));
+  const stats=results.map((v,i)=>({...v,
+    bytes:fs.existsSync(paths[i])?fs.statSync(paths[i]).size:0,
+    receivedChunks:received[i].chunks}));
   console.log('QA_AV_RESULTS '+JSON.stringify(stats));
   const fail=stats.filter(v=>v.errors||v.frames<SECONDS*4||
     v.durationSeconds<SECONDS-5||v.bytes<SECONDS*1200||v.receivedChunks<SECONDS/5||
