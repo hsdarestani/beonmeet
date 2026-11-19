@@ -40,6 +40,8 @@ from i18n import (
 from admin_panel import (
     PLANS,
     activate_subscription,
+    credit_purchase,
+    recording_credit_info,
     create_payment_intent,
     find_recording_for_artifact,
     free_recording_entitlement,
@@ -321,7 +323,7 @@ async def setup_telegram_profile() -> None:
             })
             public_commands = [
                 {"command": "start", "description": profile["commands"]["start"]},
-                {"command": "plans", "description": profile["commands"]["plans"]},
+                {"command": "credits", "description": profile["commands"]["credits"]},
                 {"command": "now", "description": profile["commands"]["now"]},
                 {"command": "language", "description": profile["commands"]["language"]},
             ]
@@ -341,7 +343,7 @@ async def setup_telegram_profile() -> None:
         })
         default_commands = [
             {"command": "start", "description": default_profile["commands"]["start"]},
-            {"command": "plans", "description": default_profile["commands"]["plans"]},
+            {"command": "credits", "description": default_profile["commands"]["credits"]},
             {"command": "now", "description": default_profile["commands"]["now"]},
             {"command": "language", "description": default_profile["commands"]["language"]},
         ]
@@ -358,7 +360,7 @@ async def setup_telegram_profile() -> None:
                 profile = i18n_profile(lang)
                 admin_commands = [
                     {"command": "start", "description": profile["commands"]["start"]},
-                    {"command": "plans", "description": profile["commands"]["plans"]},
+                    {"command": "credits", "description": profile["commands"]["credits"]},
                     {"command": "now", "description": profile["commands"]["now"]},
                     {"command": "language", "description": profile["commands"]["language"]},
                     {"command": "admin", "description": profile["commands"]["admin"]},
@@ -756,7 +758,10 @@ async def _paid_recording_allowed(
     """
     quota = await asyncio.to_thread(paid_recording_entitlement, str(chat_id))
     if not quota.get("premium"):
-        return True
+        if notify:
+            await tg_text(chat_id, t(chat_id, "wallet_empty"), with_menu=True)
+            await send_subscription_offer(chat_id)
+        return False
     remaining = quota.get("remaining_seconds")
     if remaining is None:
         return True  # protect grandfathered unlimited legacy subscriptions
@@ -776,8 +781,7 @@ async def _paid_recording_allowed(
     if notify:
         used = int(quota.get("used_seconds") or 0)
         limit = int(quota.get("quota_seconds") or 0)
-        await tg_text(chat_id, t(chat_id, "paid_quota_reached",
-                                used=round(used / 60), limit=round(limit / 60)))
+        await tg_text(chat_id, t(chat_id, "wallet_empty"), with_menu=True)
         await send_subscription_offer(chat_id)
     return False
 
@@ -2090,7 +2094,7 @@ async def billing_payment_intent(intent: str) -> dict[str, Any]:
         "status": row.get("status"),
         "plan": row.get("plan_code"),
         "amount_toman": int(row.get("amount_toman") or 0),
-        "label": f"اشتراک BeOnMeet، {plan['label']}",
+        "label": f"شارژ {int(plan['quota_minutes']) // 60} ساعت ضبط BeOnMeet",
     }
 
 
