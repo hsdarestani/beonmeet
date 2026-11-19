@@ -173,7 +173,7 @@ jobs:
             assert mem>2600000,'Memory below safe synthetic test threshold'
             PY
             echo FIVE_SYNTHETIC_TEST_START
-            docker run -d --name "$TEST_CONTAINER" --network beonmeet-single --memory=2350m --memory-swap=2600m --cpus=1.4 --pids-limit=270 --shm-size=384m -e CHROME_WINDOW_SIZE=640,360 --tmpfs /tmp/chrome-profile:rw,size=512m beonmeet-chrome-cdp:latest >/dev/null
+            docker run -d --name "$TEST_CONTAINER" --network beonmeet-single --memory=2350m --memory-swap=2600m --cpus=1.4 --pids-limit=270 --shm-size=384m -e CHROME_WINDOW_SIZE=640,360 --tmpfs /tmp/chrome-profile:rw,size=512m,mode=0777 beonmeet-chrome-cdp:latest >/dev/null
             READY=0
             for i in $(seq 1 25);do
               if docker exec beonmeet-worker-single node -e 'fetch("http://beonmeet-five-synthetic-smoke:9223/json/version",{signal:AbortSignal.timeout(1300)}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))' >/dev/null 2>&1;then READY=1;break;fi
