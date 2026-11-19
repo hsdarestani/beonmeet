@@ -62,7 +62,7 @@ app = FastAPI(title="BeOnMeet Controller")
 app.include_router(admin_router)
 app.include_router(autoscaler_router)
 
-DATA_DIR = Path("/data")
+DATA_DIR = Path(os.environ.get("BEONMEET_DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "state.json"
 TOKEN_FILE = DATA_DIR / "google-token.json"
