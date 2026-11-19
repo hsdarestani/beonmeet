@@ -108,7 +108,7 @@ jobs:
                 print(line[:450])
             '
             echo 'launch_live_validation='
-            python3 - <<'PY'
+            /opt/beonmeet/.venv/bin/python - <<'PY'
             from pathlib import Path
             import os,re,sys,json,urllib.request
             d={}
