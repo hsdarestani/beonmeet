@@ -157,4 +157,17 @@ jobs:
             echo GATEWAY_DNS_AND_HEADERS
             getent ahostsv4 pay.hamooncloud.ir | awk 'NR==1 {print "gateway_ip="$1}'
             curl -sSI --max-time 8 https://pay.hamooncloud.ir/payments/beonmeet/start | grep -Ei '^(server|via|x-powered-by|content-type|HTTP/|location):?' | head -8 || true
+
+            echo PAYMENT_HOST_SERVICE_DISCOVERY
+            ls /etc/nginx/sites-enabled 2>/dev/null | head -30
+            grep -RHnE 'server_name.*pay\.hamooncloud\.ir|proxy_pass|root ' /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null | grep -A 4 -B 4 -E 'pay\.hamooncloud|proxy_pass|/opt/|/srv/' | head -75 || true
+            echo PAYMENT_RUNNING_SERVICES
+            systemctl list-units --type=service --state=running --no-pager --no-legend | grep -Ei 'pay|hamoon|zibal|stripe|billing|gateway' | head -22 || true
+            echo PAYMENT_HOST_PROCESSES
+            ps -eo pid,comm,args --no-headers | grep -Ei '[p]ayments|[h]amoon|[z]ibal' | sed -E 's/(TOKEN|SECRET|PASSWORD|API_KEY|MERCHANT|AUTH|KEY)=[^ ]+/\1=[REDACTED]/g' | cut -c1-180 | head -18 || true
+            echo PAYMENT_ROOT_PATHS
+            find /opt /srv /var/www -maxdepth 3 -type d \( -iname '*payment*' -o -iname '*hamoon*' -o -iname '*billing*' -o -iname '*zibal*' \) 2>/dev/null | head -35
+            echo PAYMENT_ERROR_SOURCE_FILE_MATCHES
+            find /opt /srv /var/www -maxdepth 6 -type f \( -name '*.py' -o -name '*.js' -o -name '*.ts' \) ! -path '*/node_modules/*' ! -path '*/.venv/*' ! -path '*/.git/*' -print0 2>/dev/null |
+              xargs -0 -r grep -Fl 'درخواست منقضی یا نامعتبره' 2>/dev/null | head -15 || true
             echo PAYMENT_AUDIT_END
