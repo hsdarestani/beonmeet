@@ -137,103 +137,17 @@ jobs:
             docker exec beonmeet-worker-single node -e 'for (const mod of ["playwright","playwright-core","puppeteer","puppeteer-core"]) {try {console.log(mod+"="+require.resolve(mod));} catch(e) {}}'
             echo CHROME_CDP_VERSION
             docker exec beonmeet-worker-single node -e 'fetch("http://beonmeet-chrome-single:9223/json/version").then(r=>r.json()).then(x=>console.log({Browser:x.Browser,ProtocolVersion:x["Protocol-Version"]})).catch(e=>console.log("cdp_error="+e.message))'
+
+            echo COMPILED_WORKER_ENTRYPOINT_AND_CAPTURE
+            docker exec beonmeet-worker-single sh -lc 'find /usr/src/app/dist -maxdepth 3 -type f -name "*GoogleMeetBot*.js" -o -name "*recording*.js" | head -12' || true
+            docker exec beonmeet-worker-single sh -lc "grep -R -n -m 2 -E 'new MediaRecorder|captureStream|getDisplayMedia|videoBitsPerSecond|selectedMimeType' /usr/src/app/dist/bots/GoogleMeetBot.js | head -18" || true
+            echo LIVE_PORT_BINDINGS
+            python3 - <<'PY'
+            import json,subprocess
+            for name in ('beonmeet-worker-single','beonmeet-chrome-single'):
+                d=json.loads(subprocess.check_output(['docker','inspect',name],text=True))[0]
+                print(name, 'ports=', d['HostConfig'].get('PortBindings'),'user=',d['Config'].get('User'),
+                  'readonly_root=',d['HostConfig'].get('ReadonlyRootfs'),'mounts=',[(x.get('Source'),x.get('Destination')) for x in d.get('Mounts',[])])
+            PY
             echo AUDIT_COMPLETE
 
-  five-isolated-video-encode-smoke:
-    if: github.event_name == 'pull_request' && github.head_ref == 'feat/five-concurrent-recorder-capacity-20261119'
-    needs: validate
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Synthetic five-tab recording test in ephemeral Chrome (not actual Meet)
-        uses: appleboy/ssh-action@v1
-        with:
-          host: 143.20.60.195
-          port: 9011
-          username: root
-          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
-          command_timeout: 3m
-          script: |
-            set -eu
-            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
-            exec 9>/var/lock/pars-vds-bot-deploy.lock
-            flock -w 30 9
-            TEST_CONTAINER=beonmeet-five-synthetic-smoke
-            docker ps -a --format '{{.Names}}' | grep -Fxq "$TEST_CONTAINER" && { echo 'Test already exists';exit 1; } || true
-            cleanup() { docker rm -f "$TEST_CONTAINER" >/dev/null 2>&1 || true; }
-            trap cleanup EXIT
-            python3 - <<'PY'
-            import json,urllib.request
-            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=5) as r:d=json.load(r)
-            for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'):
-                assert int(d.get(k) or 0)==0,'Live work: '+k
-            with urllib.request.urlopen('http://127.0.0.1:9124/capacity',timeout=5) as r:d=json.load(r)
-            assert int((d.get('data') or d).get('runningJobs') or 0)==0,'Existing recorder is busy'
-            mem=int(next(line.split()[1] for line in open('/proc/meminfo') if line.startswith('MemAvailable:')))
-            assert mem>2600000,'Memory below safe synthetic test threshold'
-            PY
-            echo FIVE_SYNTHETIC_TEST_START
-            docker run -d --name "$TEST_CONTAINER" --network beonmeet-single --memory=2350m --memory-swap=2600m --cpus=1.4 --pids-limit=270 --shm-size=384m -e CHROME_WINDOW_SIZE=640,360 --tmpfs /tmp/chrome-profile:rw,size=512m,mode=0777 beonmeet-chrome-cdp:latest >/dev/null
-            READY=0
-            for i in $(seq 1 25);do
-              if docker exec beonmeet-worker-single node -e 'fetch("http://beonmeet-five-synthetic-smoke:9223/json/version",{signal:AbortSignal.timeout(1300)}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))' >/dev/null 2>&1;then READY=1;break;fi
-              sleep 1
-            done
-            test "$READY" = 1 || { echo CHROME_TEST_BOOT_FAILED; docker ps -a --filter "name=$TEST_CONTAINER" --format '{{.Names}} {{.Status}}'; docker logs "$TEST_CONTAINER" --tail 25 2>&1 | grep -v -E 'token|secret' || true; exit 1; }
-            docker exec -i beonmeet-worker-single node - <<'NODE' &
-            const {chromium} = require('playwright');
-            (async () => {
-              const browser=await chromium.connectOverCDP('http://beonmeet-five-synthetic-smoke:9223',{timeout:15000});
-              const context=browser.contexts()[0] || await browser.newContext();
-              const pages=[];
-              try {
-                console.log('CDP_CONNECTED');
-                for (let i=0; i<5; i++) {
-                  console.log('OPEN_PAGE_'+i);
-                  const page=await Promise.race([
-                    context.newPage(),
-                    new Promise((_,reject)=>setTimeout(()=>reject(Error('page '+i+' timed out')),10000))
-                  ]);
-                  pages.push(page);
-                  console.log('PAGE_OPENED_'+i);
-                }
-                const results=await Promise.all(pages.map((p,i)=>p.evaluate(async (idx)=>{
-                  const can=document.createElement('canvas');
-                  can.width=640;can.height=360;document.body.appendChild(can);
-                  const draw=can.getContext('2d');
-                  const stream=can.captureStream(8);
-                  const mime=['video/webm;codecs=vp8','video/webm'].find(s=>MediaRecorder.isTypeSupported(s));
-                  if(!mime)throw Error('MediaRecorder codec unavailable');
-                  let total=0;
-                  const recorder=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:320000});
-                  recorder.ondataavailable=e=>total+=e.data.size;
-                  let f=0;
-                  const interval=setInterval(()=>{
-                    draw.fillStyle='#112233';draw.fillRect(0,0,640,360);
-                    draw.fillStyle='#9f2';draw.fillRect((f++*7)%570,60,65,65);
-                    draw.fillStyle='white';draw.font='22px sans-serif';draw.fillText('Synthetic BeOnMeet tab '+idx,40,45);
-                  },125);
-                  recorder.start(1000);
-                  await new Promise(resolve=>setTimeout(resolve,12000));
-                  recorder.stop();
-                  await new Promise(resolve=>recorder.onstop=resolve);
-                  clearInterval(interval);
-                  stream.getTracks().forEach(t=>t.stop());
-                  return {idx,bytes:total,frames:f,mime};
-                },i)));
-                console.log('SYNTHETIC_FIVE_RESULTS='+JSON.stringify(results));
-                if(results.length!==5 || results.some(x=>x.bytes<3000 || x.frames<6))process.exitCode=2;
-              } finally {
-                await Promise.all(pages.map(p=>p.close().catch(()=>{})));
-                await Promise.race([browser.close().catch(()=>{}),new Promise(resolve=>setTimeout(resolve,5000))]);
-              }
-            })().catch(e=>{console.error('SYNTHETIC_FIVE_FAILURE='+e.message);process.exitCode=3});
-            NODE
-            PID=$!
-            sleep 3
-            for i in 1 2 3; do
-              docker stats --no-stream --format '{{.Name}} CPU={{.CPUPerc}} MEM={{.MemUsage}}' | grep -E 'beonmeet-five-synthetic-smoke|beonmeet-chrome-single|beonmeet-worker-single' || true
-              sleep 4
-            done
-            wait "$PID"
-            echo FIVE_SYNTHETIC_TEST_PASS
