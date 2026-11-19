@@ -107,6 +107,27 @@ jobs:
             for line in lines[-38:]:
                 print(line[:450])
             '
+            echo 'launch_live_validation='
+            python3 - <<'PY'
+            from pathlib import Path
+            import os,re,sys,json,urllib.request
+            d={}
+            for line in Path('/opt/beonmeet/.env').read_text().splitlines():
+                if '=' in line and not line.lstrip().startswith('#'):
+                    k,v=line.split('=',1);d[k.strip()]=v.strip().strip('"').strip("'")
+            for k in ('WHISPER_MODEL','WHISPER_CPU_THREADS','TRANSCRIPTION_CONCURRENCY','FREE_RECORDING_LIMIT','PAID_SALES_MAX_ACTIVE_USERS','PAID_SALES_MAX_SOLD_HOURS','SEND_ADMIN_RECORDING_COPIES','AUTOSCALE_ENABLED'):
+                print(k+'='+str(d.get(k,'<missing>')))
+            print('bot_public_link='+d.get('TELEGRAM_BOT_URL',''))
+            with urllib.request.urlopen('http://127.0.0.1:8109/fa',timeout=8) as r: page=r.read().decode()
+            print('landing_tiers='+str(all(x in page for x in ('298,000','498,000','998,000'))))
+            print('landing_has_telegram_cta='+str('https://t.me/' in page))
+            sys.path.insert(0,'/opt/beonmeet/app')
+            os.environ.update(d)
+            from admin_panel import paid_sales_capacity
+            for p in ('basic','pro','business'):
+                cap=paid_sales_capacity(p)
+                print('sales_'+p+'='+str(cap.get('allowed'))+';active_users='+str(cap.get('active_users'))+';sold_hours='+str(cap.get('sold_hours')))
+            PY
             echo PREFLIGHT_END
 
 
