@@ -54,6 +54,7 @@ state = {"requests": {}, "auto_join_all": {"42": True}, "auto_registered_events"
 scan = {}
 env = {
     "Any": Any, "asyncio": AsyncMock, "datetime": datetime, "timezone": timezone,
+    "AUTO_ALL_MEETINGS_ENABLED": True,  # historical scheduler behavior, now hidden by default
     "timedelta": timedelta, "uuid": uuid, "TOKEN_FILE": Token(),
     "state": state, "calendar_scan_status": scan, "list_calendar_events": events,
     "calendar_connected": lambda cid: True, "is_premium": lambda cid: True,
