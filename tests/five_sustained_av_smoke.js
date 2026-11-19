@@ -1,0 +1,123 @@
+/* Five concurrent AV MediaRecorder streams, on an EPHEMERAL Chrome.
+   This is NOT a test of Google Meet join, consent, or Telegram delivery.
+   Requires playwright already installed in the BeOnMeet worker container.
+   No browser/user recording content is accessed. */
+'use strict';
+const fs = require('fs');
+const {chromium} = require('playwright');
+const SECONDS = Math.max(30, Math.min(600, Number(process.env.QA_SECONDS) || 180));
+const OUTDIR = '/tmp/beonmeet-five-sustained-20261119';
+const CDP_URL = 'http://beonmeet-five-qa-chrome:9223';
+const RATES = [220,330,440,550,660];
+fs.mkdirSync(OUTDIR, {recursive:false});
+const paths = RATES.map((_,i)=>OUTDIR+'/stream-'+(i+1)+'.webm');
+const received = RATES.map(()=>({bytes:0,chunks:0,writeErrors:0}));
+let browser, pages=[];
+const startedAt=Date.now();
+
+async function main() {
+  console.log('QA_AV_START seconds='+SECONDS+' output='+OUTDIR);
+  browser = await chromium.connectOverCDP(CDP_URL, {timeout:12000});
+  const ctx=browser.contexts()[0] || await browser.newContext();
+  for (let i=0; i<5; i++) {
+    const p=await ctx.newPage();
+    pages.push(p);
+    await p.exposeFunction('qaSendChunk',async (index, b64)=>{
+      if(index!==i) throw Error('Wrong recording stream ID');
+      const buf=Buffer.from(b64,'base64');
+      fs.appendFileSync(paths[index],buf);
+      received[index].bytes+=buf.length;
+      received[index].chunks++;
+    });
+    const res=await p.evaluate(async ({index, tone})=>{
+      let canvas=document.createElement('canvas');
+      canvas.width=640;canvas.height=360;document.body.appendChild(canvas);
+      const g=canvas.getContext('2d',{alpha:false});
+      const video=canvas.captureStream(8);
+      const audioContext=new AudioContext({sampleRate:48000});
+      const sine=audioContext.createOscillator();
+      sine.type='sine';sine.frequency.value=tone;
+      const gain=audioContext.createGain();gain.gain.value=0.06;
+      const out=audioContext.createMediaStreamDestination();
+      sine.connect(gain);gain.connect(out);sine.start();
+      await audioContext.resume();
+      const tracks=[...video.getVideoTracks(), ...out.stream.getAudioTracks()];
+      if(tracks.length!==2 || audioContext.state!=='running') throw Error('Audio or video not available');
+      const stream=new MediaStream(tracks);
+      const mime=['video/webm;codecs=vp8,opus','video/webm;codecs=vp8','video/webm'].find(s=>MediaRecorder.isTypeSupported(s));
+      if(!mime)throw Error('VP8 MediaRecorder codec missing');
+      const rec=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:320000,audioBitsPerSecond:64000});
+      let frames=0, errors=0, chunksSent=0;
+      let upload=Promise.resolve();
+      const t0=performance.now();
+      const draw=()=>{
+        g.fillStyle='hsl('+(index*64+frames%360)+',52%,24%)';
+        g.fillRect(0,0,640,360);
+        const x=(frames*5) % 555;
+        g.fillStyle='white';
+        g.fillRect(x,100,85,95);
+        g.fillStyle='hsl('+(index*64)+',90%,57%)';
+        g.font='bold 30px sans-serif';
+        g.fillText('QA STREAM '+(index+1),24,55);
+        g.font='18px sans-serif';
+        g.fillText('frame '+frames+' / tone '+tone+' Hz',24,325);
+        frames++;
+      };
+      draw();
+      const drawTimer=setInterval(draw,125);
+      rec.onerror=e=>{errors++;console.error('QA recorder error '+index,e.error && e.error.message)};
+      rec.ondataavailable=(e)=>{
+        if(e.data.size===0){errors++;return;}
+        upload=upload.then(async()=>{
+          const buf=new Uint8Array(await e.data.arrayBuffer());
+          let result='';
+          for(let offset=0;offset<buf.length;offset+=8192){
+            result += String.fromCharCode(...buf.slice(offset,offset+8192));
+          }
+          await window.qaSendChunk(index,btoa(result));
+          chunksSent++;
+        }).catch(e=>{errors++;console.error('QA upload error '+index,e.message)});
+      };
+      const stopped=new Promise(resolve=>{rec.onstop=resolve});
+      rec.start(2000);
+      window.__qa={frames:()=>frames,t0,stop:async()=>{
+        if(rec.state!=='inactive')rec.stop();
+        await Promise.race([stopped,new Promise((_,reject)=>setTimeout(()=>reject(Error('MediaRecorder stop timeout')),30000))]);
+        await upload;
+        clearInterval(drawTimer);
+        stream.getTracks().forEach(t=>t.stop());
+        sine.stop();await audioContext.close();
+        return {index,tone,frames,errors,chunksSent,
+          durationSeconds:Math.round((performance.now()-t0)/1000),
+          audioTracks:out.stream.getAudioTracks().length,
+          videoTracks:video.getVideoTracks().length,
+          codec:rec.mimeType};
+      }};
+      return {index,tone,codec:rec.mimeType,contextState:audioContext.state};
+    },{index:i,tone:RATES[i]});
+    console.log('QA_AV_PAGE_READY '+JSON.stringify(res));
+  }
+  console.log('QA_ALL_FIVE_RECORDERS_STARTED');
+  const progress = setInterval(async()=>{
+    try {
+      const vals=await Promise.all(pages.map(p=>p.evaluate(()=>({frames:window.__qa.frames()}))));
+      console.log('QA_PROGRESS '+JSON.stringify({elapsed:Math.round((Date.now()-startedAt)/1000),
+        frames:vals.map(x=>x.frames),bytes:received.map(x=>x.bytes)}));
+    }catch(e){ console.log('QA_PROGRESS_ERROR '+e.message); }
+  },30000);
+  await new Promise(resolve=>setTimeout(resolve,SECONDS*1000));
+  clearInterval(progress);
+  const results=await Promise.all(pages.map(p=>p.evaluate(()=>window.__qa.stop())));
+  const stats=results.map((v,i)=>({...v,bytes:fs.statSync(paths[i]).size, receivedChunks:received[i].chunks}));
+  console.log('QA_AV_RESULTS '+JSON.stringify(stats));
+  const fail=stats.filter(v=>v.errors||v.frames<SECONDS*4||
+    v.durationSeconds<SECONDS-5||v.bytes<SECONDS*1200||v.receivedChunks<SECONDS/5||
+    v.audioTracks!==1||v.videoTracks!==1);
+  if(fail.length) throw Error('Recording assertions failed for '+fail.map(x=>x.index).join(','));
+  console.log('QA_FIVE_AV_STREAMS_PASS');
+}
+main().catch(e=>{console.error('QA_FIVE_AV_STREAMS_FAILED '+(e && e.stack||e));process.exitCode=2})
+  .finally(async()=>{
+    for(const p of pages)await Promise.race([p.close().catch(()=>{}),new Promise(resolve=>setTimeout(resolve,2500))]);
+    if(browser)await Promise.race([browser.close().catch(()=>{}),new Promise(resolve=>setTimeout(resolve,2500))]);
+  });
