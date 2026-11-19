@@ -35,7 +35,7 @@ jobs:
 
 
   five-av-host-stress:
-    if: github.event_name == 'pull_request' && github.head_ref == 'qa/five-slot-sustained-load-20261119'
+    if: false # temporarily halted after shared host deployment lock contention
     needs: validate
     runs-on: ubuntu-24.04
     timeout-minutes: 9
@@ -200,3 +200,35 @@ jobs:
             done
             echo QA_CAMCAM_HEALTHY_AFTER_STRESS
             echo QA_FIVE_SUSTAINED_AV_STRESS_PASS
+
+  five-qa-lock-audit:
+    if: github.event_name == 'pull_request' && github.head_ref == 'qa/five-slot-sustained-load-20261119'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Read-only deployment lock, orphan process, and service health audit
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 1m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1;; esac
+            echo QA_LOCK_AUDIT_BEGIN
+            date -u +%F-%T
+            lslocks -o PID,COMMAND,PATH | grep -F pars-vds-bot-deploy.lock || true
+            fuser -v /var/lock/pars-vds-bot-deploy.lock 2>&1 | tail -15 || true
+            echo QA_RELEVANT_PROCESSES
+            ps -eo pid,ppid,stat,etimes,comm,args | grep -E '[d]ocker exec|[f]lock -w|[b]eonmeet-five|[n]ode -' | cut -c1-185 | tail -30
+            echo QA_TEST_CONTAINER
+            docker ps -a --filter name=beonmeet-five-qa-chrome --format '{{.Names}} {{.Status}}'
+            echo QA_PRODUCTION_WORKER
+            curl -fsS --max-time 8 http://127.0.0.1:8109/health | python3 -c 'import json,sys;d=json.load(sys.stdin);print({k:d.get(k) for k in ("ok","max_concurrent_meetings","free_queue","premium_queue","pending_delivery_jobs","active_delivery_jobs")})'
+            echo QA_CAMCAM_HEALTH
+            for s in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1;do
+              printf '%s=' "$s"
+              docker inspect -f '{{.State.Health.Status}}' "$s"
+            done
+            echo QA_LOCK_AUDIT_END
