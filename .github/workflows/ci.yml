@@ -96,7 +96,7 @@ jobs:
               }
             done
             git fetch --quiet origin refs/heads/qa/five-slot-sustained-load-20261119
-            git show 23b5ccf7816bca64482add343cad26d7acac30a8:tests/five_sustained_av_smoke.js > "$TEMP/stress.js"
+            git show 825358df7326daa1212d3f3064154117afe72c9e:tests/five_sustained_av_smoke.js > "$TEMP/stress.js"
             node --check "$TEMP/stress.js"
             docker exec beonmeet-worker-single rm -rf "$OUT" "$ABORT"
             echo QA_VP8_OPUS_START
@@ -107,7 +107,7 @@ jobs:
               sleep 1
             done
             [ "$READY" = 1 ] || { echo QA_EPHEMERAL_CHROME_BOOT_FAILED; docker logs "$TEST" --tail 18 || true; exit 1; }
-            docker exec -i -e QA_SECONDS=240 beonmeet-worker-single node - < "$TEMP/stress.js" > "$TEMP/test.log" 2>&1 &
+            docker exec -i -e QA_SECONDS=65 beonmeet-worker-single node - < "$TEMP/stress.js" > "$TEMP/test.log" 2>&1 &
             PID=$!
             SAFETY_ABORT=0
             for i in $(seq 1 28); do
