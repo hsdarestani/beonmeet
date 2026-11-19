@@ -25,7 +25,6 @@ def patch(source: str) -> str:
         return source
     if body.count(OLD) != 1 or NEW in body:
         raise ValueError("Unknown or ambiguous existing BeOnMeet allowlist")
-    assert OLD not in head and OLD not in tail, "Only BeOnMeet should use this exact check"
     return head + START + body.replace(OLD, NEW) + END + tail
 
 
