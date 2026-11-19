@@ -1430,8 +1430,9 @@ async def telegram_loop() -> None:
                 if text.startswith(("/credits", "/balance", "/plans", "/premium")):
                     wallet = await asyncio.to_thread(recording_credit_info, str(chat_id))
                     remaining = max(0, int(wallet.get("remaining_seconds") or 0))
-                    message = t(chat_id, "wallet_balance", hours=remaining // 3600,
-                                minutes=(remaining % 3600 + 59) // 60)
+                    total_minutes=(remaining + 59) // 60
+                    message = t(chat_id, "wallet_balance", hours=total_minutes // 60,
+                                minutes=total_minutes % 60)
                     info = await asyncio.to_thread(subscription_info, str(chat_id))
                     if info.get("premium") and str(info.get("plan") or "") in ("monthly","quarterly","halfyear"):
                         end = info.get("period_end") or info.get("until")
@@ -2124,8 +2125,8 @@ async def billing_payment_return(payment: str = "", receipt: str = "", intent: s
                 t(
                     telegram_id, "wallet_payment_confirmed",
                     hours=purchased_seconds // 3600,
-                    balance_hours=remaining // 3600,
-                    balance_minutes=(remaining % 3600 + 59) // 60,
+                    balance_hours=((remaining + 59) // 60) // 60,
+                    balance_minutes=((remaining + 59) // 60) % 60,
                 ),
                 with_menu=True,
             )
