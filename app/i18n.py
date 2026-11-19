@@ -326,7 +326,7 @@ def profile(language: str) -> dict[str, Any]:
 BUTTON_ACTIONS: dict[str, str] = {}
 for _lang, _labels in MENU_LABELS.items():
     BUTTON_ACTIONS[_labels["new"]] = "/new"
-    BUTTON_ACTIONS[_labels["premium"]] = "/plans"
+    BUTTON_ACTIONS[_labels["premium"]] = "/credits"
     BUTTON_ACTIONS[_labels["now"]] = "/now"
     BUTTON_ACTIONS[_labels["auto"]] = "/auto"
     BUTTON_ACTIONS[_labels["help"]] = "/start"
