@@ -47,26 +47,3 @@ jobs:
 
 
 
-  one-time-prepaid-wallet-release:
-    if: github.event_name == 'pull_request' && github.head_ref == 'feat/prepaid-recording-hour-wallet-20261119'
-    needs: validate
-    runs-on: ubuntu-24.04
-    timeout-minutes: 9
-    steps:
-      - name: Release prepaid hours wallet on current shared VPS if idle, preserve backups and CamCam
-        uses: appleboy/ssh-action@v1
-        with:
-          host: 143.20.60.195
-          port: 9011
-          username: root
-          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
-          command_timeout: 6m
-          script: |
-            set -eu
-            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1;; esac
-            git -C /opt/beonmeet fetch --quiet origin refs/heads/feat/prepaid-recording-hour-wallet-20261119
-            TEMP=$(mktemp /tmp/beonmeet-prepaid-wallet-release.XXXXXXXX.sh)
-            trap 'rm -f "$TEMP"' EXIT
-            git -C /opt/beonmeet show 4ccdd745b827c2035cbfd0464ab515abf128b4ed:scripts/deploy_prepaid_hour_wallet.sh > "$TEMP"
-            bash -n "$TEMP"
-            bash "$TEMP"
