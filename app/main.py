@@ -50,6 +50,7 @@ from admin_panel import (
     is_premium,
     make_admin_login_url,
     mark_payment_paid,
+    next_subscription_period,
     record_recording,
     record_request,
     router as admin_router,
@@ -300,7 +301,7 @@ async def send_subscription_offer(chat_id: int | str, message_key: str = "premiu
         "sendMessage",
         {
             "chat_id": str(chat_id),
-            "text": t(chat_id, message_key),
+            "text": t(chat_id, message_key) + (("\n\n" + t(chat_id, "plan_rules_short")) if message_key != "premium_offer" else ""),
             "reply_markup": json.dumps({"inline_keyboard": rows}, ensure_ascii=False),
         },
     )
@@ -1434,11 +1435,20 @@ async def telegram_loop() -> None:
                             else t(chat_id, "quota_remaining", minutes=int(remain // 60),
                                    used=int(balance.get("used_seconds") or 0) // 60)
                         )
+                        upcoming = await asyncio.to_thread(next_subscription_period, str(chat_id))
+                        upcoming_text = ""
+                        if upcoming and upcoming.get("starts") and upcoming.get("until"):
+                            upcoming_text = "\n\n" + t(
+                                chat_id, "renewal_scheduled",
+                                plan=plan_description(str(upcoming.get("plan") or "")),
+                                starts=upcoming["starts"].astimezone().strftime("%Y-%m-%d"),
+                                until=upcoming["until"].astimezone().strftime("%Y-%m-%d"),
+                            )
                         await tg_text(
                             chat_id,
                             t(chat_id, "premium_active", until=until_text)
                             + "\n\n" + plan_description(str(info.get("plan") or ""))
-                            + "\n" + remaining_label,
+                            + "\n" + remaining_label + upcoming_text,
                             with_menu=True,
                         )
                     else:
@@ -2115,25 +2125,45 @@ async def billing_payment_return(payment: str = "", receipt: str = "", intent: s
     already_paid = row.get("status") == "paid"
     paid_row = await asyncio.to_thread(mark_payment_paid, intent, receipt)
     telegram_id = str((paid_row or row).get("telegram_id") or "")
-    # Apply even if the payment was marked paid during a previous attempt.
-    # activate_subscription deduplicates on the verified receipt.
+    before = await asyncio.to_thread(subscription_info, telegram_id)
+    # A second purchase is a FUTURE 30-day term, not a top-up of this term.
+    # Retried callbacks are deduplicated by the verified Zibal receipt.
     until = await asyncio.to_thread(activate_subscription, telegram_id, expected_plan, f"Zibal receipt {receipt}")
+    scheduled = bool(before.get("premium") and before.get("until") and before["until"] > datetime.now(timezone.utc))
+    label = str(PLANS[expected_plan].get("label") or expected_plan)
     if not already_paid:
-        await tg_text(
-            telegram_id,
-            t(
-                telegram_id,
-                "payment_confirmed",
+        if expected_plan not in PUBLIC_PLAN_CODES:
+            confirmation = t(telegram_id, "payment_confirmed_legacy", plan=label, until=until.astimezone().strftime("%Y-%m-%d"))
+        elif scheduled:
+            confirmation = t(
+                telegram_id, "payment_scheduled", plan=label,
+                starts=before["until"].astimezone().strftime("%Y-%m-%d"),
                 until=until.astimezone().strftime("%Y-%m-%d"),
+                hours=int(PUBLIC_PLANS[expected_plan]["quota_minutes"] // 60),
             )
-        )
+        else:
+            confirmation = t(
+                telegram_id, "payment_confirmed", plan=label,
+                until=until.astimezone().strftime("%Y-%m-%d"),
+                hours=int(PUBLIC_PLANS[expected_plan]["quota_minutes"] // 60),
+            )
+        try:
+            await tg_text(telegram_id, confirmation)
+        except Exception as exc:
+            print("payment confirmation Telegram delivery failed:", type(exc).__name__, flush=True)
         if ADMINUSER and ADMINUSER != telegram_id:
             await tg_text(
                 ADMINUSER,
                 f"💳 خرید پلن ویژه\nکاربر: {telegram_id}\nپلن: {expected_plan}\nمبلغ: {expected_amount:,} تومان\nرسید: {receipt}"
             )
 
-    return "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;background:#0b0e17;color:white;display:grid;place-items:center;min-height:100vh;margin:0'><div style='text-align:center'><h2>پرداخت موفق بود ✅</h2><p>پلن ویژه فعال شد. می‌تونی این صفحه رو ببندی و برگردی تلگرام.</p></div></body></html>"
+    return (
+        "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;"
+        "background:#0b0e17;color:white;display:grid;place-items:center;min-height:100vh;margin:0'>"
+        "<div style='text-align:center'><h2>پرداخت موفق بود ✅</h2><p>"
+        + ("دوره بعدی خریداری شد؛ ساعت‌های دوره فعلی افزایش پیدا نکرد." if scheduled else "اشتراک فعلی فعال شد.")
+        + " می‌تونی صفحه رو ببندی و به تلگرام برگردی.</p></div></body></html>"
+    )
 
 
 def _remote_worker_alive(entry: dict[str, Any]) -> bool:
@@ -2737,7 +2767,7 @@ async def home() -> str:
         '<div class="card"><b>' + PUBLIC_PLANS[code]["label"] + '</b>'
         + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>toman / 30 days</small></div>'
         + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' hours recording</div>'
-        + '<p>Usage is measured across successfully recorded meetings in the subscription period. New recording requests are blocked when the allowance is used.</p>'
+        + '<p>This is a TOTAL allowance shared across meetings, not per meeting. Unused minutes expire after 30 days; another purchase schedules a future period, not an immediate top-up.</p>'
         + '</div>'
         for code in PUBLIC_PLAN_CODES
     )
@@ -2751,7 +2781,7 @@ async def home() -> str:
 </div></section>
 <section id="plans" class="section"><div class="wrap">
 <h2>Simple plans, predictable recording hours</h2>
-<p>All plans are valid for 30 days. There is no promise of unlimited recordings or guaranteed entry to every meeting. Payment and activation happen through the bot.</p>
+<p>Each purchase gives a total allowance of 2, 6 or 15 recorded hours over a 30-day period starting at activation. Hours can be spread across meetings. Unused hours do not roll over, and there is no automatic renewal or automatic overage charge. If you run out early, another plan purchase starts only after the current paid period; contact support for immediate extra hours.</p>
 <div class="grid prices">__PRICE_CARDS__</div>
 <div class="cta">__BOT_CTA__<a class="button secondary" href="/terms">Plan terms</a></div>
 </div></section>
@@ -2794,7 +2824,7 @@ async def home_fa() -> str:
         '<div class="card" style="text-align:right"><b>' + PUBLIC_PLANS[code]["label"] + '</b>'
         + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>تومان / ۳۰ روز</small></div>'
         + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' ساعت ضبط جلسه</div>'
-        + '<p>اعتبار مربوط به مجموع مدت ضبط در دوره اشتراک است. ضبط جدید بعد از پایان سهمیه پذیرفته نمی‌شود.</p>'
+        + '<p>این سهمیه، مجموع ضبط تمام جلسه‌ها در ۳۰ روز است، نه سهمیه هر جلسه. ساعت باقی‌مانده منتقل نمی‌شود؛ خرید مجدد، دوره بعدی را فعال می‌کند نه شارژ فوری.</p>'
         + '</div>'
         for code in PUBLIC_PLAN_CODES
     )
@@ -2808,7 +2838,7 @@ async def home_fa() -> str:
 </div></section>
 <section id="plans" class="section"><div class="wrap">
 <h2>پلن‌های شفاف و ساعتی</h2>
-<p>هر خرید ۳۰ روز اعتبار دارد و تمدید خودکار نیست. هزینه اضافی بابت ساعت مازاد به‌صورت خودکار دریافت نمی‌شود. تغییر پلن در میانه دوره نیاز به هماهنگی پشتیبانی دارد.</p>
+<p>هر پلن مجموعاً ۲، ۶ یا ۱۵ ساعت ضبط در ۳۰ روز از شروع دوره دارد؛ می‌توانی این ساعت‌ها را بین چند جلسه تقسیم کنی. ساعت باقی‌مانده در پایان دوره می‌سوزد. تمدید خودکار و برداشت خودکار بابت مازاد نداریم. اگر ساعت‌ها زودتر تمام شد، خرید دوباره سهمیه همان دوره را افزایش نمی‌دهد و برای ۳۰ روز بعد رزرو می‌شود؛ برای ساعت اضافه فوری باید با پشتیبانی هماهنگ کنی.</p>
 <div class="grid prices">__PRICE_CARDS__</div>
 <div class="cta">__BOT_CTA__</div>
 </div></section>
@@ -2877,15 +2907,15 @@ async def terms_of_service() -> str:
 <h1>BeOnMeet Terms of Service</h1>
 <p>These Terms govern use of BeOnMeet. By connecting an account or requesting a recording, you agree to these Terms.</p>
 <h2>Service</h2>
-<p>BeOnMeet is a meeting automation service that can detect eligible Google Meet events from a connected Google Calendar, dispatch a recorder, and deliver recording related outputs through Telegram. Features and capacity can vary by plan.</p>
+<p>BeOnMeet records eligible Google Meet meetings requested by sending the meeting link directly in Telegram, and delivers files through Telegram subject to capacity and meeting admission. Automatic recording of every meeting on a connected personal Calendar is temporarily disabled and is not included in current paid plans.</p>
 <h2>Your responsibilities</h2>
 <ul><li>You must have the right to connect the Google account you authorize.</li><li>You are responsible for complying with meeting, workplace and local laws, including any notice or consent required before recording participants.</li><li>You may not use BeOnMeet for unlawful surveillance, harassment, unauthorized access or other illegal activity.</li></ul>
 <h2>Google and Telegram</h2>
 <p>Google Meet, Google Calendar and Telegram are third party services. BeOnMeet is not affiliated with or endorsed by Google or Telegram. Their availability and policies can affect BeOnMeet functionality.</p>
 <h2>Availability</h2>
-<p>We work to provide reliable automatic joining and delivery, but admission controls, network conditions, third party outages, capacity limits or meeting configuration can prevent or delay recording. A host may need to admit the recorder.</p>
+<p>We work to provide reliable joining of meetings explicitly requested by the user and delivery of the resulting files, but admission controls, network conditions, third party outages, capacity limits or meeting configuration can prevent or delay recording. A host may need to admit the recorder.</p>
 <h2>Plans and temporary files</h2>
-<p>New Basic, Pro and Business subscriptions last 30 days and include respectively 2, 6 and 15 hours of recorded meetings. Usage is measured by the duration of completed recordings. When the recording allowance is exhausted, new recording requests are blocked until the next subscription period or a support-assisted upgrade. A recording that is already in progress is allowed to finish and may use more than the remaining allowance. No additional hourly charge is made automatically. A new purchase while an active subscription exists is scheduled after the existing paid period unless handled by support. These subscriptions are not automatically renewed.</p>
+<p>New Basic, Pro and Business subscriptions last 30 days from activation and include respectively a TOTAL of 2, 6 and 15 recorded hours, shared across all meetings in the period, not per meeting. Usage is measured by the duration of completed recordings. Unused hours expire at the end of the 30-day period and do not roll over. When the recording allowance is exhausted, new recording requests are blocked until the next subscription period or a support-assisted upgrade. A recording already in progress may finish and exceed the remaining allowance. No additional hourly charge is made automatically. Buying the same or another subscription during an active paid period does NOT top up its current allowance; it queues a new 30-day period after the last purchased paid period. These subscriptions are not automatically renewed.</p>
 <p>Some older customers retain their original plan terms until their existing entitlement expires. Temporary delivery and download files expire according to the applicable plan and service configuration.</p>
 <h2>Privacy</h2>
 <p>Our handling of personal information and Google user data is described in the <a href="/privacy">Privacy Policy</a>.</p>
