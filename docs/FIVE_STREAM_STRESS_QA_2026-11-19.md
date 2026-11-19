@@ -42,3 +42,12 @@ Every file was confirmed by `ffprobe` to contain **both audio and video streams*
 - Test source: `tests/five_sustained_av_smoke.js`; uses Playwright already installed in the BeOnMeet worker container and a short-lived separate Chrome container. Does not use production customer data.
 - Passing workflow: `44492683469`. An overlapping CI run failed after 30s waiting on the shared deploy lock; it was not a second host/recording failure.
 - Remove temporary remote SSH CI jobs after saving evidence; do not leave recurring load tests tied to pull request edits.
+
+## Post-test cleanup verification
+
+Read-only [run #44493596745](https://github.com/hsdarestani/beonmeet/actions/runs/44493596745), approximately 09:08 UTC:
+- Temporary synthetic Chrome container was absent.
+- No test process holding the shared deployment lock; no stray 5-stream QA process found.
+- Host memory returned to ~3,986 MB available.
+- BeOnMeet remained healthy with 5 configured slots, queues and delivery jobs empty.
+- All four monitored CamCam services remained healthy.
