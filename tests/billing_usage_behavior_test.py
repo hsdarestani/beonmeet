@@ -44,9 +44,12 @@ env = {
     "PLANS": policy.PLANS,
     "plan_quota_seconds": policy.plan_quota_seconds,
     "remaining_seconds": policy.remaining_seconds,
+    "PUBLIC_PLAN_CODES": policy.PUBLIC_PLAN_CODES,
+    "PAID_SALES_MAX_ACTIVE_USERS": 12,
+    "PAID_SALES_MAX_SOLD_HOURS": 60,
 }
 for name in ("_parse_dt", "subscription_info", "paid_recording_entitlement",
-             "record_recording", "activate_subscription"):
+             "record_recording", "activate_subscription", "paid_sales_capacity"):
     node = functions[name]
     isolated = ast.Module(body=[node], type_ignores=[])
     exec(compile(ast.fix_missing_locations(isolated), filename="app/admin_panel.py", mode="exec"), env)
@@ -87,4 +90,10 @@ assert same == renewal
 assert db.execute(
     "SELECT COUNT(*) FROM subscriptions WHERE telegram_id='42' AND note='Zibal receipt 9898'"
 ).fetchone()[0] == 1
+assert env["paid_sales_capacity"]("basic", "brandnew")["allowed"]
+env["PAID_SALES_MAX_ACTIVE_USERS"] = 2
+assert env["paid_sales_capacity"]("business", "brandnew")["allowed"] is False, "protect customer count"
+env["PAID_SALES_MAX_ACTIVE_USERS"] = 12
+env["PAID_SALES_MAX_SOLD_HOURS"] = 8
+assert env["paid_sales_capacity"]("business", "brandnew")["allowed"] is False, "protect allocated recording hours"
 print("BILLING_USAGE_BEHAVIOR_TEST_PASS")
