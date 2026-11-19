@@ -30,6 +30,11 @@ git -C /opt/beonmeet fetch --quiet origin refs/heads/fix/payment-intent-gateway-
 git -C /opt/beonmeet show 2658facfb884f77dee8fd6177bacaf101b4e79a6:patches/fix_hamooncloud_beonmeet_plans.py > "$WORK/patcher.py"
 python3 "$WORK/patcher.py" "$SOURCE" "$WORK/patched-external-payments.js"
 node --check "$WORK/patched-external-payments.js"
+if cmp -s "$SOURCE" "$WORK/patched-external-payments.js"; then
+  echo HAMOONCLOUD_PLAN_ALLOWLIST_ALREADY_APPLIED
+  SUCCESS=1
+  exit 0
+fi
 python3 - "$SOURCE" "$WORK/patched-external-payments.js" <<'PY'
 import sys,importlib.util
 from pathlib import Path
