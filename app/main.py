@@ -1794,7 +1794,7 @@ def transcribe_audio_local(audio_path: Path) -> tuple[str, str]:
             model_name,
             device="cpu",
             compute_type=os.environ.get("WHISPER_COMPUTE_TYPE", "int8"),
-            cpu_threads=max(6, min(14, (os.cpu_count() or 8) - 2)),
+            cpu_threads=max(1, min(int(os.environ.get("WHISPER_CPU_THREADS", "2")), os.cpu_count() or 2)),
             num_workers=1,
             download_root=str(DATA_DIR / "whisper-models"),
         )
@@ -1917,7 +1917,7 @@ def transcribe_audio_recovery_fast(audio_path: Path) -> tuple[str, str]:
             model_name,
             device="cpu",
             compute_type=os.environ.get("WHISPER_COMPUTE_TYPE", "int8"),
-            cpu_threads=max(6, min(14, (os.cpu_count() or 8) - 2)),
+            cpu_threads=max(1, min(int(os.environ.get("WHISPER_CPU_THREADS", "2")), os.cpu_count() or 2)),
             num_workers=1,
             download_root=str(DATA_DIR / "whisper-models"),
         )
@@ -3029,7 +3029,7 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
             "caption": t(chat_id, "recording_ready_caption"),
         }
     ]
-    if ADMINUSER and ADMINUSER != chat_id:
+    if ADMINUSER and ADMINUSER != chat_id and os.environ.get("SEND_ADMIN_RECORDING_COPIES", "false").lower() in {"1", "true", "yes"}:
         admin_caption = (
             "🎥 یک ضبط جدید آماده شد\n\n"
             f"👤 درخواست دهنده:\n{who}\n"
@@ -3148,7 +3148,7 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
 
                         # Admin copy is best effort and must never cause a duplicate
                         # user delivery or block transcript generation.
-                        if audio_already_delivered and ADMINUSER and ADMINUSER != chat_id:
+                        if audio_already_delivered and ADMINUSER and ADMINUSER != chat_id and os.environ.get("SEND_ADMIN_RECORDING_COPIES", "false").lower() in {"1", "true", "yes"}:
                             try:
                                 await send_audio_to_recipients(
                                     [{
@@ -3231,7 +3231,7 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                                         await save_state()
                                     transcript_already_delivered = True
 
-                                    if ADMINUSER and ADMINUSER != chat_id:
+                                    if ADMINUSER and ADMINUSER != chat_id and os.environ.get("SEND_ADMIN_RECORDING_COPIES", "false").lower() in {"1", "true", "yes"}:
                                         try:
                                             with transcript_path.open("rb") as fp:
                                                 await telegram(
@@ -3293,7 +3293,7 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
             state.setdefault("launched_events", {}).pop(completed_event_id, None)
             await save_state()
 
-        return {"ok": True, "admin_copy": bool(ADMINUSER), "premium": premium_active}
+        return {"ok": True, "admin_copy": bool(ADMINUSER and os.environ.get("SEND_ADMIN_RECORDING_COPIES", "false").lower() in {"1", "true", "yes"}), "premium": premium_active}
     except Exception as exc:
         # Do not tell the user that Telegram delivery failed when the recording
         # itself was already delivered successfully. Premium audio/transcript
