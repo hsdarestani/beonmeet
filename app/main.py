@@ -2792,7 +2792,7 @@ async def home() -> str:
 </div></section>
 <section class="section" id="data"><div class="wrap">
 <h2>Data access and privacy</h2>
-<p>Manual recording requires your meeting link. Previously connected Calendar permissions remain read-only; personal automatic recording of all meetings is temporarily unavailable.</p>
+<p>Recording requires you to send your meeting link. Any previously granted Calendar permissions remain read-only; you can revoke them through your Google Account settings.</p>
 <div class="data">
 <div class="notice"><strong>Meeting links</strong><br>Used only to find and record the meetings you explicitly request.</div>
 <div class="notice"><strong>Read-only Google access</strong><br>Existing authorizations do not let BeOnMeet modify your Calendar events. You can revoke access from your Google Account.</div>
@@ -2907,7 +2907,7 @@ async def terms_of_service() -> str:
 <h1>BeOnMeet Terms of Service</h1>
 <p>These Terms govern use of BeOnMeet. By connecting an account or requesting a recording, you agree to these Terms.</p>
 <h2>Service</h2>
-<p>BeOnMeet records eligible Google Meet meetings requested by sending the meeting link directly in Telegram, and delivers files through Telegram subject to capacity and meeting admission. Automatic recording of every meeting on a connected personal Calendar is temporarily disabled and is not included in current paid plans.</p>
+<p>BeOnMeet records eligible Google Meet meetings requested by sending the meeting link directly in Telegram, and delivers files through Telegram subject to available capacity and meeting admission.</p>
 <h2>Your responsibilities</h2>
 <ul><li>You must have the right to connect the Google account you authorize.</li><li>You are responsible for complying with meeting, workplace and local laws, including any notice or consent required before recording participants.</li><li>You may not use BeOnMeet for unlawful surveillance, harassment, unauthorized access or other illegal activity.</li></ul>
 <h2>Google and Telegram</h2>
