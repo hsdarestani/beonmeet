@@ -49,7 +49,7 @@ env = {
     "PAID_SALES_MAX_SOLD_HOURS": 60,
 }
 for name in ("_parse_dt", "subscription_info", "paid_recording_entitlement",
-             "record_recording", "activate_subscription", "paid_sales_capacity"):
+             "record_recording", "activate_subscription", "paid_sales_capacity", "next_subscription_period"):
     node = functions[name]
     isolated = ast.Module(body=[node], type_ignores=[])
     exec(compile(ast.fix_missing_locations(isolated), filename="app/admin_panel.py", mode="exec"), env)
@@ -85,6 +85,17 @@ assert env["paid_recording_entitlement"]("legacy")["allowed"] is True
 renewal = env["activate_subscription"]("42", "pro", "Zibal receipt 9898")
 assert renewal == datetime(2026, 12, 31, 11, 0, tzinfo=timezone.utc)
 assert env["subscription_info"]("42")["plan"] == "basic", "future renewal must not overwrite current entitlement"
+assert env["paid_recording_entitlement"]("42")["remaining_seconds"] == 0, "renewal must not be immediate refill"
+future = env["next_subscription_period"]("42")
+assert future and future["plan"] == "pro"
+assert future["starts"] == datetime(2026, 12, 1, 11, 0, tzinfo=timezone.utc)
+assert future["until"] == datetime(2026, 12, 31, 11, 0, tzinfo=timezone.utc)
+# Buying Basic again also appends a new 30-day term, rather than 120 extra
+# minutes in the current expired-allowance period.
+extra_basic = env["activate_subscription"]("42", "basic", "Zibal receipt 9899")
+assert extra_basic == datetime(2027, 1, 30, 11, 0, tzinfo=timezone.utc)
+assert env["paid_recording_entitlement"]("42")["remaining_seconds"] == 0
+assert env["next_subscription_period"]("42")["plan"] == "pro"
 same = env["activate_subscription"]("42", "pro", "Zibal receipt 9898")
 assert same == renewal
 assert db.execute(
