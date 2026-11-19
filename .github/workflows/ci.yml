@@ -217,6 +217,30 @@ jobs:
             git=base/'.git'
             print('GATEWAY_GIT_PRESENT=',git.exists())
             PY
+
+            echo ZIBAL_UPSTREAM_DIAGNOSIS
+            python3 - <<'PY'
+            from pathlib import Path
+            import re
+            p=Path('/home/hamoondeploy/hamoon-source/external-payments.js')
+            a=p.read_text(errors='replace').splitlines()
+            for i in list(range(0,min(58,len(a))))+list(range(75,min(145,len(a)))):
+                s=a[i]
+                if re.search(r'(?i)(password|secret|merchant|api[_-]?key)\s*[:=]\s*[\'"][^\'"]+[\'"]',s):
+                    s=re.sub(r'([:=]\s*[\'"])[^\'"]+([\'"])',r'\1[REDACTED]\2',s)
+                print(f'{i+1}: {s[:240]}')
+            PY
+            echo HAMOON_DASHBOARD_RECENT_ERRORS
+            journalctl -u hamoon-dashboard --since '2026-11-19 09:29:00 UTC' --no-pager -o cat | python3 -c '
+            import sys,re
+            lines=sys.stdin.read().splitlines()
+            matches=[x for x in lines if any(w in x for w in ("BEONMEET_PAYMENT_START","ZIBAL","zibal","gateway","PAYMENT_START","ECONN","ETIMEDOUT","not available"))]
+            for x in matches[-22:]:
+                x=re.sub(r"(?i)(merchant|token|api[_-]?key|password|secret)[\"\\x27 ]*[:=][\"\\x27 ]*[a-z0-9_-]{6,}",r"\1=[REDACTED]",x)
+                print(x[:420])
+            '
+            echo ZIBAL_REACHABILITY
+            curl -sS -o /dev/null -w 'zibal_root_http=%{http_code}\n' --max-time 8 https://gateway.zibal.ir/v1/request || true
             echo PAYMENT_AUDIT_END
 
   one-time-gateway-plan-fix:
