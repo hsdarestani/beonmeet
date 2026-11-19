@@ -2750,7 +2750,7 @@ async def home() -> str:
         '<a class="button" href="mailto:meetrecorderbot@gmail.com?subject=BeOnMeet%20access">Request access</a>'
     )
     price_cards = "".join(
-        '<div class="card"><b>' + PUBLIC_PLANS[code]["label"] + '</b>'
+        '<div class="card"><b>' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' hours credit</b>'
         + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>toman · one-time purchase</small></div>'
         + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' hours recording</div>'
         + '<p>Purchased recording hours are added to your balance immediately, never expire, and can be used across all meetings.</p>'
@@ -2807,7 +2807,7 @@ async def home_fa() -> str:
         '<a class="button" href="mailto:meetrecorderbot@gmail.com?subject=BeOnMeet%20access">درخواست دسترسی</a>'
     )
     plan_cards = "".join(
-        '<div class="card" style="text-align:right"><b>' + PUBLIC_PLANS[code]["label"] + '</b>'
+        '<div class="card" style="text-align:right"><b>شارژ ' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' ساعت ضبط</b>'
         + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>تومان · خرید یک‌باره</small></div>'
         + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' ساعت ضبط جلسه</div>'
         + '<p>هر خرید فوراً به موجودی ساعت ضبط اضافه می‌شود؛ ساعت‌ها تاریخ انقضا ندارند.</p>'
