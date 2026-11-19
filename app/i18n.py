@@ -108,8 +108,10 @@ MESSAGES: dict[str, dict[str, str]] = {
     },
         "manual_mode_notice": "📩 فعلاً فقط ضبط با ارسال لینک جلسه فعال است. برای جلسه آینده، ایمیل رکوردر را به دعوت تقویم اضافه کن؛ برای جلسه در حال اجرا از «ورود فوری» استفاده کن.",
         "auto_unavailable": "⏸ قابلیت ضبط خودکار «همه جلسات» فعلاً فعال نیست و در پلن‌های فروشی ارائه نمی‌شود. برای ضبط، لینک هر جلسه را مستقیم در ربات بفرست.",
-        "payment_scheduled": "✅ پرداخت پلن {plan} تأیید شد، اما چون هنوز اشتراک فعالی داری، این خرید **شارژ فوری ساعت‌ها نیست**.\nدوره جدید از {starts} شروع می‌شود و تا {until} ادامه دارد؛ مجموعاً {hours} ساعت ضبط در آن دوره خواهی داشت. سهمیه دوره فعلی تغییر نمی‌کند.",
+        "payment_scheduled": "✅ پرداخت پلن {plan} تأیید شد، اما چون هنوز اشتراک فعالی داری، این خرید شارژ فوری ساعت‌ها نیست.\nدوره جدید از {starts} شروع می‌شود و تا {until} ادامه دارد؛ مجموعاً {hours} ساعت ضبط در آن دوره خواهی داشت. سهمیه دوره فعلی تغییر نمی‌کند.",
         "renewal_scheduled": "📅 دوره بعدی که قبلاً خریداری کرده‌ای: {plan}\nشروع: {starts} | پایان: {until}\nاین خرید ساعت ضبط دوره فعلی را افزایش نمی‌دهد.",
+        "plan_rules_short": "ℹ️ هر پلن مجموعِ ۲/۶/۱۵ ساعت ضبط در ۳۰ روز است؛ ساعت‌های مانده منتقل نمی‌شود. خرید دوباره در دوره فعال، شارژ فوری نیست و برای دوره بعد رزرو می‌شود. برای ساعت اضافه فوری با پشتیبانی تماس بگیر.",
+        "payment_confirmed_legacy": "✅ پرداخت پلن قبلی {plan} تأیید شد. اعتبار تا {until} است؛ شرایط همان اشتراک قدیمی اعمال می‌شود.",
     "en": {
         "language_choose": "🌐 Choose the bot language. Meeting language is independent and detected automatically.",
         "language_changed": "✅ Bot language changed to English.",
@@ -176,6 +178,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "auto_unavailable": "⏸ The All Meetings automatic-calendar feature is temporarily unavailable and is not part of current paid plans. Send each meeting link directly to this bot.",
         "payment_scheduled": "✅ {plan} payment confirmed, but you already have an active subscription. This is NOT an immediate hours top-up.\nThe new period begins {starts} and ends {until}; it will provide {hours} total recorded hours. Your current period balance is unchanged.",
         "renewal_scheduled": "📅 Already purchased next period: {plan}\nStarts {starts} | Ends {until}\nThis does not increase your current period's minutes.",
+        "plan_rules_short": "ℹ️ Each plan has a total of 2/6/15 recorded hours over 30 days. Unused hours expire. A second purchase during an active term queues the next period; it is NOT an immediate top-up. Contact support for immediate additional hours.",
+        "payment_confirmed_legacy": "✅ Your legacy plan {plan} payment was confirmed. Active until {until}; its original plan terms apply.",
     "de": {
         "language_choose": "🌐 Wähle die Sprache des Bots. Die Sprache des Meetings ist davon unabhängig und wird automatisch erkannt.",
         "language_changed": "✅ Die Bot Sprache wurde auf Deutsch umgestellt.",
@@ -238,6 +242,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "video_part": "Teil {index} von {count}",
         "payment_confirmed": "✅ Zahlung für {plan} bestätigt. Dein 30-Tage-Zeitraum ist bis {until} aktiv und enthält {hours} Stunden Aufnahme insgesamt. Keine automatische Verlängerung, keine Übertragung.",
     },
+        "plan_rules_short": "ℹ️ Jeder Tarif enthält insgesamt 2/6/15 Aufnahmestunden in 30 Tagen. Reststunden verfallen. Ein zweiter Kauf während des laufenden Abos gilt für den nächsten Zeitraum, NICHT als sofortige Aufladung. Für zusätzliche Stunden Support kontaktieren.",
+        "payment_confirmed_legacy": "✅ Zahlung des bisherigen Tarifs {plan} bestätigt. Gültig bis {until}; die ursprünglichen Tarifbedingungen gelten.",
 }
 
 PROFILE_TEXT = {
