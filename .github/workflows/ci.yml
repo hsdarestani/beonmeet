@@ -28,3 +28,65 @@ jobs:
           python3 tests/cloud_init_render_test.py
 
 
+
+  one-vps-recorder-audit:
+    if: github.event_name == 'pull_request' && github.head_ref == 'feat/five-concurrent-recorder-capacity-20261119'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Read-only audit of recorder slots and host budget
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 3m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST;exit 1;; esac
+            cd /opt/beonmeet
+            echo AUDIT_BEGIN
+            date -u +%F-%T
+            echo HOST_SYSTEM
+            nproc
+            free -m | head -3
+            df -h / /dev/shm | tail -3
+            uptime
+            echo DOCKER_RUNNING_SERVICES
+            docker ps --format '{{.Names}} {{.Image}} {{.Status}}'
+            echo DOCKER_RESOURCE_USAGE
+            docker stats --no-stream --format '{{.Name}} CPU={{.CPUPerc}} MEM={{.MemUsage}}' | head -35
+            echo DOCKER_RECORDER_CONFIG_NONSECRET
+            python3 - <<'PY'
+            import json,subprocess
+            names=subprocess.check_output(['docker','ps','--format','{{.Names}}'],text=True).splitlines()
+            for name in names:
+                if not any(s in name.lower() for s in ('beonmeet','chrome','recorder','meeting-bot')):
+                    continue
+                info=json.loads(subprocess.check_output(['docker','inspect',name],text=True))[0]
+                env={}
+                allow={'MAX_CONCURRENT_MEETINGS','GOOGLE_CHROME_CDP_URL','CHROME_WINDOW_SIZE','MAX_RECORDING_DURATION_MINUTES','RECORDING_TMP_DIR','TRANSCRIPTION_CONCURRENCY','GOOGLE_CHROME_USER_DATA_DIR','NODE_ENV','SHM_SIZE'}
+                for line in info['Config'].get('Env',[]):
+                    if '=' in line:
+                        k,v=line.split('=',1)
+                        if k in allow:env[k]=v
+                host=info.get('HostConfig') or {}
+                print(json.dumps({'name':name,'image':info['Config'].get('Image'),'env':env,'memory_limit_bytes':host.get('Memory'),'cpus_nano':host.get('NanoCpus'),'shm_size_bytes':host.get('ShmSize'),'restart_policy':host.get('RestartPolicy',{}).get('Name')},ensure_ascii=False))
+            PY
+            echo DOCKER_RECORDER_CAPACITY
+            curl -fsS --max-time 6 http://127.0.0.1:9124/capacity | python3 -c 'import sys,json;d=json.load(sys.stdin); v=d.get("data") or d; print({k:v.get(k) for k in ("maxConcurrentMeetings","maxConcurrent","runningJobs","availableSlots","maxRunningJobs","queuedJobs","pendingJobs","totalSlots")})' || true
+            echo CONTROLLER_HEALTH
+            curl -fsS --max-time 6 http://127.0.0.1:8109/health | python3 -c 'import sys,json; d=json.load(sys.stdin); print({k:d.get(k) for k in ("max_concurrent_meetings","local_free_meeting_slots","local_premium_reserved_slots","healthy_free_workers","healthy_premium_workers","free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs","autoscaler_enabled")})'
+            echo NONSECRET_ENV
+            python3 - <<'PY'
+            from pathlib import Path
+            d={}
+            for line in Path('/opt/beonmeet/.env').read_text().splitlines():
+                if '=' not in line or line.lstrip().startswith('#'):continue
+                k,v=line.split('=',1);k=k.strip()
+                if k in {'FREE_MEETING_SLOTS','PREMIUM_MEETING_SLOTS','TRANSCRIPTION_CONCURRENCY','AUTOSCALE_ENABLED','WHISPER_CPU_THREADS','WHISPER_MODEL','PREMIUM_WORKER_SLOTS','MAX_CONCURRENT_MEETINGS','FREE_WORKER_URLS','PREMIUM_WORKER_URLS'}:
+                    if k.endswith('_URLS'):d[k]='configured' if v else 'unset'
+                    else:d[k]=v.strip()
+            print(d)
+            PY
+            echo AUDIT_COMPLETE
