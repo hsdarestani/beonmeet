@@ -2732,7 +2732,7 @@ def public_shell(title: str, body: str) -> str:
 <title>{title}</title><meta name="description" content="Send a Google Meet link for scheduled or immediate recording and Telegram delivery.">
 <style>{PUBLIC_SITE_CSS}</style></head>
 <body><div class="wrap"><nav class="nav"><a class="brand" href="/"><span class="mark">B</span>BeOnMeet</a>
-<div class="links"><a href="/fa">فارسی</a><a href="/#how">How it works</a><a href="/#plans">Plans</a><a href="/#data">Google data</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div></nav></div>
+<div class="links"><a href="/fa">فارسی</a><a href="/#how">How it works</a><a href="/#credits">Buy hours</a><a href="/#data">Google data</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div></nav></div>
 {body}
 <footer><div class="wrap foot"><span>© 2026 BeOnMeet</span><span><a href="/privacy">Privacy Policy</a><a href="/terms">Terms of Service</a></span></div></footer>
 </body></html>"""
