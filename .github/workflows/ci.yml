@@ -109,3 +109,48 @@ jobs:
             '
             echo PREFLIGHT_END
 
+
+  isolated-native-import-smoke:
+    if: github.event_name == 'pull_request' && github.head_ref == 'feat/ad-launch-tiered-billing-20261113'
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Import staged controller in existing Python environment without service restart
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 2m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1;; esac
+            cd /opt/beonmeet
+            SOURCE=1e6319bd41d848d75c1659074640aa0b02d8f906
+            git fetch --quiet origin refs/heads/feat/ad-launch-tiered-billing-20261113
+            STAGE=$(mktemp -d /opt/beonmeet/.smoke.XXXXXXXX)
+            export STAGE
+            trap 'rm -rf "$STAGE"' EXIT
+            for name in main.py admin_panel.py i18n.py billing_policy.py; do
+              git show "$SOURCE:app/$name" > "$STAGE/$name"
+            done
+            .venv/bin/python - <<'PY'
+            import os,sys
+            from pathlib import Path
+            env=Path('/opt/beonmeet/.env')
+            for line in env.read_text().splitlines():
+                if '=' in line and not line.lstrip().startswith('#'):
+                    k,v=line.split('=',1)
+                    os.environ[k.strip()]=v.strip().strip('"').strip("'")
+            st=Path(os.environ['STAGE'])
+            os.environ['BEONMEET_DATA_DIR']=str(st/'isolated-data')
+            os.environ['BEONMEET_DB_PATH']=str(st/'isolated.db')
+            os.environ['RECORDING_TMP_DIR']=str(st/'records')
+            sys.path[:0]=[str(st), '/opt/beonmeet/app']
+            import main
+            assert main.DATA_DIR == st/'isolated-data'
+            assert main.app.title == 'BeOnMeet Controller'
+            assert main.autoscaler_enabled() is False
+            print('NATIVE_SYSTEMD_ISOLATED_IMPORT_PASS')
+            PY
