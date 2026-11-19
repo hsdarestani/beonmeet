@@ -241,16 +241,16 @@ MESSAGES: dict[str, dict[str, str]] = {
         "large_audio_download": "🎧 Die vollständige Audiodatei des Meetings ist bereit.\n\n⬇️ Audiodatei herunterladen:\n{url}\n\nDieser Link ist {hours} Stunden gültig.",
         "video_part": "Teil {index} von {count}",
         "payment_confirmed": "✅ Zahlung für {plan} bestätigt. Dein 30-Tage-Zeitraum ist bis {until} aktiv und enthält {hours} Stunden Aufnahme insgesamt. Keine automatische Verlängerung, keine Übertragung.",
-    },
-        "plan_rules_short": "ℹ️ Jeder Tarif enthält insgesamt 2/6/15 Aufnahmestunden in 30 Tagen. Reststunden verfallen. Ein zweiter Kauf während des laufenden Abos gilt für den nächsten Zeitraum, NICHT als sofortige Aufladung. Für zusätzliche Stunden Support kontaktieren.",
-        "payment_confirmed_legacy": "✅ Zahlung des bisherigen Tarifs {plan} bestätigt. Gültig bis {until}; die ursprünglichen Tarifbedingungen gelten.",
-}
-
-PROFILE_TEXT = {
         "manual_mode_notice": "📩 Zur Aufnahme jeden Meeting-Link einzeln senden. Bei geplanten Meetings die Recorder-E-Mail zum Termin einladen; für laufende Meetings Sofort beitreten verwenden.",
         "auto_unavailable": "⏸ Die automatische Funktion Alle Meetings ist derzeit nicht verfügbar und nicht in den kostenpflichtigen Tarifen enthalten. Bitte Meeting-Links einzeln senden.",
         "payment_scheduled": "✅ Zahlung für {plan} bestätigt. Du hast noch ein aktives Abo: Das ist KEINE sofortige Stundenaufladung.\nDer neue Zeitraum läuft von {starts} bis {until}, dann stehen {hours} Stunden insgesamt zur Verfügung. Dein aktuelles Kontingent bleibt unverändert.",
         "renewal_scheduled": "📅 Bereits gekaufter Folgezeitraum: {plan}\nBeginn {starts} | Ende {until}\nKeine zusätzlichen Minuten für den aktuellen Zeitraum.",
+        "plan_rules_short": "ℹ️ Jeder Tarif enthält insgesamt 2/6/15 Aufnahmestunden in 30 Tagen. Reststunden verfallen. Ein zweiter Kauf während des laufenden Abos gilt für den nächsten Zeitraum, NICHT als sofortige Aufladung. Für zusätzliche Stunden Support kontaktieren.",
+        "payment_confirmed_legacy": "✅ Zahlung des bisherigen Tarifs {plan} bestätigt. Gültig bis {until}; die ursprünglichen Tarifbedingungen gelten.",
+    },
+}
+
+PROFILE_TEXT = {
     "fa": {
         "description": "لینک Google Meet رو بفرست. سر وقت وارد جلسه می‌شم، ضبط می‌کنم و فایل رو همینجا می‌فرستم. متن جلسه چندزبانه است.",
         "short": "ضبط Google Meet با ارسال لینک و متن چندزبانه",
