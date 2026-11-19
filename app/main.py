@@ -50,6 +50,7 @@ from admin_panel import (
     is_premium,
     make_admin_login_url,
     mark_payment_paid,
+    next_subscription_period,
     record_recording,
     record_request,
     router as admin_router,
@@ -104,6 +105,8 @@ FREE_DOWNLOAD_TTL_HOURS = max(
 PREMIUM_DOWNLOAD_TTL_HOURS = max(1, int(os.environ.get("PREMIUM_DOWNLOAD_TTL_HOURS", "72")))
 BOT_DISPLAY_NAME = os.environ.get("BOT_DISPLAY_NAME", "BeOnMeet Recorder")
 CALENDAR_POLL_SECONDS = int(os.environ.get("CALENDAR_POLL_SECONDS", "30"))
+# Closed until genuine end-to-end automatic-calendar QA has passed.
+AUTO_ALL_MEETINGS_ENABLED = os.environ.get("AUTO_ALL_MEETINGS_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
 PAYMENT_STATUS_URL = os.environ.get(
     "PAYMENT_STATUS_URL",
     "https://pay.hamooncloud.ir/payments/beonmeet/status",
@@ -168,6 +171,13 @@ def load_state() -> None:
     state.setdefault("recording_downloads", {})
     state.setdefault("premium_recoveries", {})
     state.setdefault("free_limit_notified", {})
+    if not AUTO_ALL_MEETINGS_ENABLED:
+        prior_auto = state.setdefault("auto_join_all", {})
+        if any(prior_auto.values()):
+            for key in prior_auto:
+                prior_auto[key] = False
+            STATE_STORE.save(state)
+            print("Previously enabled All Meetings settings were disabled; Google tokens preserved", flush=True)
     print(f"controller state loaded from {source}", flush=True)
 
 
@@ -225,8 +235,8 @@ def telegram_reply_keyboard(chat_id: int | str) -> dict[str, Any]:
     labels = i18n_menu(user_language(chat_id))
     rows = [
         [{"text": labels["new"]}, {"text": labels["premium"]}],
-        [{"text": labels["now"]}, {"text": labels["auto"]}],
-        [{"text": labels["help"]}, {"text": labels["language"]}],
+        [{"text": labels["now"]}, {"text": labels["help"]}],
+        [{"text": labels["language"]}],
     ]
     if ADMINUSER and str(chat_id) == ADMINUSER:
         rows.append([{"text": labels["admin"]}])
@@ -291,7 +301,7 @@ async def send_subscription_offer(chat_id: int | str, message_key: str = "premiu
         "sendMessage",
         {
             "chat_id": str(chat_id),
-            "text": t(chat_id, message_key),
+            "text": t(chat_id, message_key) + (("\n\n" + t(chat_id, "plan_rules_short")) if message_key != "premium_offer" else ""),
             "reply_markup": json.dumps({"inline_keyboard": rows}, ensure_ascii=False),
         },
     )
@@ -313,7 +323,6 @@ async def setup_telegram_profile() -> None:
                 {"command": "start", "description": profile["commands"]["start"]},
                 {"command": "plans", "description": profile["commands"]["plans"]},
                 {"command": "now", "description": profile["commands"]["now"]},
-                {"command": "auto", "description": profile["commands"]["auto"]},
                 {"command": "language", "description": profile["commands"]["language"]},
             ]
             await telegram("setMyCommands", {
@@ -334,7 +343,6 @@ async def setup_telegram_profile() -> None:
             {"command": "start", "description": default_profile["commands"]["start"]},
             {"command": "plans", "description": default_profile["commands"]["plans"]},
             {"command": "now", "description": default_profile["commands"]["now"]},
-            {"command": "auto", "description": default_profile["commands"]["auto"]},
             {"command": "language", "description": default_profile["commands"]["language"]},
         ]
         await telegram("setMyCommands", {
@@ -352,7 +360,6 @@ async def setup_telegram_profile() -> None:
                     {"command": "start", "description": profile["commands"]["start"]},
                     {"command": "plans", "description": profile["commands"]["plans"]},
                     {"command": "now", "description": profile["commands"]["now"]},
-                    {"command": "auto", "description": profile["commands"]["auto"]},
                     {"command": "language", "description": profile["commands"]["language"]},
                     {"command": "admin", "description": profile["commands"]["admin"]},
                 ]
@@ -432,7 +439,7 @@ def calendar_connected(chat_id: int | str | None = None) -> bool:
 
 
 def auto_join_enabled(chat_id: int | str) -> bool:
-    return bool(state.setdefault("auto_join_all", {}).get(str(chat_id)))
+    return AUTO_ALL_MEETINGS_ENABLED and bool(state.setdefault("auto_join_all", {}).get(str(chat_id)))
 
 
 def calendar_auth_url(chat_id: int | str) -> str:
@@ -1242,7 +1249,7 @@ async def calendar_loop() -> None:
 
             # Personal auto mode: once enabled, every Google Meet on that user's
             # connected calendar is discovered and launched without sending links.
-            auto_settings = dict(state.setdefault("auto_join_all", {}))
+            auto_settings = dict(state.setdefault("auto_join_all", {})) if AUTO_ALL_MEETINGS_ENABLED else {}
             for chat_id, enabled in auto_settings.items():
                 if not enabled:
                     calendar_scan_status[chat_id] = {"status": "disabled"}
@@ -1428,11 +1435,20 @@ async def telegram_loop() -> None:
                             else t(chat_id, "quota_remaining", minutes=int(remain // 60),
                                    used=int(balance.get("used_seconds") or 0) // 60)
                         )
+                        upcoming = await asyncio.to_thread(next_subscription_period, str(chat_id))
+                        upcoming_text = ""
+                        if upcoming and upcoming.get("starts") and upcoming.get("until"):
+                            upcoming_text = "\n\n" + t(
+                                chat_id, "renewal_scheduled",
+                                plan=plan_description(str(upcoming.get("plan") or "")),
+                                starts=upcoming["starts"].astimezone().strftime("%Y-%m-%d"),
+                                until=upcoming["until"].astimezone().strftime("%Y-%m-%d"),
+                            )
                         await tg_text(
                             chat_id,
                             t(chat_id, "premium_active", until=until_text)
                             + "\n\n" + plan_description(str(info.get("plan") or ""))
-                            + "\n" + remaining_label,
+                            + "\n" + remaining_label + upcoming_text,
                             with_menu=True,
                         )
                     else:
@@ -1442,6 +1458,13 @@ async def telegram_loop() -> None:
                 if text.startswith("/auto"):
                     parts = text.strip().lower().split(maxsplit=1)
                     explicit = parts[1] if len(parts) > 1 else ""
+
+                    if not AUTO_ALL_MEETINGS_ENABLED:
+                        if explicit in {"off", "0", "false", "disable"}:
+                            state.setdefault("auto_join_all", {})[str(chat_id)] = False
+                            await save_state()
+                        await tg_text(chat_id, t(chat_id, "auto_unavailable"), with_menu=True)
+                        continue
 
                     if explicit in {"status", "check"}:
                         await tg_text(chat_id, auto_calendar_status_message(chat_id), with_menu=True)
@@ -1479,7 +1502,9 @@ async def telegram_loop() -> None:
 
                 if text.startswith("/start"):
                     premium_active = await asyncio.to_thread(is_premium, str(chat_id))
-                    if not premium_active:
+                    if not AUTO_ALL_MEETINGS_ENABLED:
+                        auth_status = t(chat_id, "manual_mode_notice")
+                    elif not premium_active:
                         auth_status = t(chat_id, "auto_premium_status")
                     elif calendar_connected(chat_id):
                         auth_status = t(chat_id, "calendar_connected")
@@ -2100,25 +2125,45 @@ async def billing_payment_return(payment: str = "", receipt: str = "", intent: s
     already_paid = row.get("status") == "paid"
     paid_row = await asyncio.to_thread(mark_payment_paid, intent, receipt)
     telegram_id = str((paid_row or row).get("telegram_id") or "")
-    # Apply even if the payment was marked paid during a previous attempt.
-    # activate_subscription deduplicates on the verified receipt.
+    before = await asyncio.to_thread(subscription_info, telegram_id)
+    # A second purchase is a FUTURE 30-day term, not a top-up of this term.
+    # Retried callbacks are deduplicated by the verified Zibal receipt.
     until = await asyncio.to_thread(activate_subscription, telegram_id, expected_plan, f"Zibal receipt {receipt}")
+    scheduled = bool(before.get("premium") and before.get("until") and before["until"] > datetime.now(timezone.utc))
+    label = str(PLANS[expected_plan].get("label") or expected_plan)
     if not already_paid:
-        await tg_text(
-            telegram_id,
-            t(
-                telegram_id,
-                "payment_confirmed",
+        if expected_plan not in PUBLIC_PLAN_CODES:
+            confirmation = t(telegram_id, "payment_confirmed_legacy", plan=label, until=until.astimezone().strftime("%Y-%m-%d"))
+        elif scheduled:
+            confirmation = t(
+                telegram_id, "payment_scheduled", plan=label,
+                starts=before["until"].astimezone().strftime("%Y-%m-%d"),
                 until=until.astimezone().strftime("%Y-%m-%d"),
+                hours=int(PUBLIC_PLANS[expected_plan]["quota_minutes"] // 60),
             )
-        )
+        else:
+            confirmation = t(
+                telegram_id, "payment_confirmed", plan=label,
+                until=until.astimezone().strftime("%Y-%m-%d"),
+                hours=int(PUBLIC_PLANS[expected_plan]["quota_minutes"] // 60),
+            )
+        try:
+            await tg_text(telegram_id, confirmation)
+        except Exception as exc:
+            print("payment confirmation Telegram delivery failed:", type(exc).__name__, flush=True)
         if ADMINUSER and ADMINUSER != telegram_id:
             await tg_text(
                 ADMINUSER,
                 f"💳 خرید پلن ویژه\nکاربر: {telegram_id}\nپلن: {expected_plan}\nمبلغ: {expected_amount:,} تومان\nرسید: {receipt}"
             )
 
-    return "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;background:#0b0e17;color:white;display:grid;place-items:center;min-height:100vh;margin:0'><div style='text-align:center'><h2>پرداخت موفق بود ✅</h2><p>پلن ویژه فعال شد. می‌تونی این صفحه رو ببندی و برگردی تلگرام.</p></div></body></html>"
+    return (
+        "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;"
+        "background:#0b0e17;color:white;display:grid;place-items:center;min-height:100vh;margin:0'>"
+        "<div style='text-align:center'><h2>پرداخت موفق بود ✅</h2><p>"
+        + ("دوره بعدی خریداری شد؛ ساعت‌های دوره فعلی افزایش پیدا نکرد." if scheduled else "اشتراک فعلی فعال شد.")
+        + " می‌تونی صفحه رو ببندی و به تلگرام برگردی.</p></div></body></html>"
+    )
 
 
 def _remote_worker_alive(entry: dict[str, Any]) -> bool:
@@ -2698,7 +2743,7 @@ a{color:inherit}.wrap{width:min(1120px,calc(100% - 40px));margin:auto}.nav{displ
 def public_shell(title: str, body: str) -> str:
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title><meta name="description" content="BeOnMeet automatically joins scheduled Google Meet meetings, records them, and delivers the result to Telegram.">
+<title>{title}</title><meta name="description" content="Send a Google Meet link for scheduled or immediate recording and Telegram delivery.">
 <style>{PUBLIC_SITE_CSS}</style></head>
 <body><div class="wrap"><nav class="nav"><a class="brand" href="/"><span class="mark">B</span>BeOnMeet</a>
 <div class="links"><a href="/fa">فارسی</a><a href="/#how">How it works</a><a href="/#plans">Plans</a><a href="/#data">Google data</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div></nav></div>
@@ -2722,35 +2767,35 @@ async def home() -> str:
         '<div class="card"><b>' + PUBLIC_PLANS[code]["label"] + '</b>'
         + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>toman / 30 days</small></div>'
         + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' hours recording</div>'
-        + '<p>Usage is measured across successfully recorded meetings in the subscription period. New recording requests are blocked when the allowance is used.</p>'
+        + '<p>This is a TOTAL allowance shared across meetings, not per meeting. Unused minutes expire after 30 days; another purchase schedules a future period, not an immediate top-up.</p>'
         + '</div>'
         for code in PUBLIC_PLAN_CODES
     )
     body = """
 <main>
 <section class="hero"><div class="wrap">
-<span class="eyebrow">Automatic Google Meet recorder for Telegram</span>
-<h1>Your calendar knows the meeting. BeOnMeet handles the rest.</h1>
-<p>Connect Google Calendar once. BeOnMeet detects scheduled Google Meet events across your accessible calendars, joins at meeting time, records the session and delivers the result to your Telegram chat.</p>
+<span class="eyebrow">Google Meet recording in Telegram</span>
+<h1>Send your meeting link. Get the recording in Telegram.</h1>
+<p>Send the Google Meet link to our Telegram bot. For scheduled meetings, invite the recorder to the meeting event; for an ongoing meeting use Join now. The host may need to admit the recorder before recording begins.</p>
 <div class="cta">__BOT_CTA__<a class="button secondary" href="#plans">Compare plans</a></div>
 </div></section>
 <section id="plans" class="section"><div class="wrap">
 <h2>Simple plans, predictable recording hours</h2>
-<p>All plans are valid for 30 days. There is no promise of unlimited recordings or guaranteed entry to every meeting. Payment and activation happen through the bot.</p>
+<p>Each purchase gives a total allowance of 2, 6 or 15 recorded hours over a 30-day period starting at activation. Hours can be spread across meetings. Unused hours do not roll over, and there is no automatic renewal or automatic overage charge. If you run out early, another plan purchase starts only after the current paid period; contact support for immediate extra hours.</p>
 <div class="grid prices">__PRICE_CARDS__</div>
 <div class="cta">__BOT_CTA__<a class="button secondary" href="/terms">Plan terms</a></div>
 </div></section>
 <section id="how"><div class="wrap grid">
-<div class="card"><b>1. Connect once with Premium</b><p>Premium users authorize read only access to Google Calendar from the BeOnMeet Telegram bot.</p></div>
-<div class="card"><b>2. Meetings are detected</b><p>Google Meet events are found automatically whether you organize them or are invited to them. Cancelled and declined events are ignored.</p></div>
-<div class="card"><b>3. Receive the result</b><p>The recorder joins at the scheduled time and sends the recording back to the Telegram user who connected the calendar.</p></div>
+<div class="card"><b>1. Send the link</b><p>Send a Google Meet link directly in the bot. For a future meeting, invite the recorder email to the calendar event.</p></div>
+<div class="card"><b>2. Admit the recorder</b><p>The recorder attempts to join the requested meeting. The host may need to admit it.</p></div>
+<div class="card"><b>3. Receive the result</b><p>After recording, the bot sends the files to your Telegram chat, subject to available capacity and plan.</p></div>
 </div></section>
 <section class="section" id="data"><div class="wrap">
-<h2>Designed around minimum Google access</h2>
-<p>BeOnMeet requests read only Calendar permissions. It does not create, edit or delete your Google Calendar events.</p>
+<h2>Data access and privacy</h2>
+<p>Recording requires you to send your meeting link. Any previously granted Calendar permissions remain read-only; you can revoke them through your Google Account settings.</p>
 <div class="data">
-<div class="notice"><strong>Calendar list</strong><br>Used to discover the calendars available to your Google account so meetings are not limited to the primary calendar.</div>
-<div class="notice"><strong>Calendar events</strong><br>Used to identify Google Meet links, event timing and whether an event is cancelled or declined so the recorder can join at the correct time.</div>
+<div class="notice"><strong>Meeting links</strong><br>Used only to find and record the meetings you explicitly request.</div>
+<div class="notice"><strong>Read-only Google access</strong><br>Existing authorizations do not let BeOnMeet modify your Calendar events. You can revoke access from your Google Account.</div>
 </div>
 <div class="notice" style="margin-top:16px"><strong>No advertising use of Google user data.</strong><br>Google user data obtained through Google APIs is used only to provide BeOnMeet's user facing meeting automation. It is not sold and is not used for advertising or ad targeting. See the <a href="/privacy">Privacy Policy</a> for full details.</div>
 </div></section>
@@ -2779,7 +2824,7 @@ async def home_fa() -> str:
         '<div class="card" style="text-align:right"><b>' + PUBLIC_PLANS[code]["label"] + '</b>'
         + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>تومان / ۳۰ روز</small></div>'
         + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' ساعت ضبط جلسه</div>'
-        + '<p>اعتبار مربوط به مجموع مدت ضبط در دوره اشتراک است. ضبط جدید بعد از پایان سهمیه پذیرفته نمی‌شود.</p>'
+        + '<p>این سهمیه، مجموع ضبط تمام جلسه‌ها در ۳۰ روز است، نه سهمیه هر جلسه. ساعت باقی‌مانده منتقل نمی‌شود؛ خرید مجدد، دوره بعدی را فعال می‌کند نه شارژ فوری.</p>'
         + '</div>'
         for code in PUBLIC_PLAN_CODES
     )
@@ -2788,19 +2833,19 @@ async def home_fa() -> str:
 <section class="hero"><div class="wrap">
 <span class="eyebrow">ضبط و دریافت جلسات Google Meet در تلگرام</span>
 <h1>جلسه‌ات را از دست نده. BeOnMeet ضبطش می‌کند.</h1>
-<p>لینک Google Meet را به ربات بده یا تقویم Google را متصل کن. ربات در زمان جلسه برای ورود اقدام می‌کند و پس از پذیرفته‌شدن توسط میزبان، جلسه را ضبط و فایل را در تلگرام ارسال می‌کند.</p>
+<p>لینک Google Meet را داخل ربات بفرست. برای جلسه آینده، ایمیل رکوردر را به رویداد تقویم دعوت کن؛ برای جلسه‌ای که شروع شده «ورود فوری» را بزن. پس از تأیید میزبان، ضبط انجام می‌شود و فایل در تلگرام ارسال می‌شود.</p>
 <div class="cta">__BOT_CTA__<a class="button secondary" href="#plans">مشاهده قیمت‌ها</a></div>
 </div></section>
 <section id="plans" class="section"><div class="wrap">
 <h2>پلن‌های شفاف و ساعتی</h2>
-<p>هر خرید ۳۰ روز اعتبار دارد و تمدید خودکار نیست. هزینه اضافی بابت ساعت مازاد به‌صورت خودکار دریافت نمی‌شود. تغییر پلن در میانه دوره نیاز به هماهنگی پشتیبانی دارد.</p>
+<p>هر پلن مجموعاً ۲، ۶ یا ۱۵ ساعت ضبط در ۳۰ روز از شروع دوره دارد؛ می‌توانی این ساعت‌ها را بین چند جلسه تقسیم کنی. ساعت باقی‌مانده در پایان دوره می‌سوزد. تمدید خودکار و برداشت خودکار بابت مازاد نداریم. اگر ساعت‌ها زودتر تمام شد، خرید دوباره سهمیه همان دوره را افزایش نمی‌دهد و برای ۳۰ روز بعد رزرو می‌شود؛ برای ساعت اضافه فوری باید با پشتیبانی هماهنگ کنی.</p>
 <div class="grid prices">__PRICE_CARDS__</div>
 <div class="cta">__BOT_CTA__</div>
 </div></section>
 <section id="how" class="section"><div class="wrap">
 <h2>چطور کار می‌کند؟</h2>
 <div class="grid">
-<div class="card"><b>۱. لینک جلسه یا اتصال تقویم</b><p>لینک جلسه را بفرست. برای تشخیص خودکار جلسات، امکان اتصال Google Calendar هم وجود دارد.</p></div>
+<div class="card"><b>۱. ارسال لینک جلسه</b><p>لینک جلسه را در ربات بفرست. برای جلسه‌های آینده ایمیل رکوردر را به دعوت جلسه اضافه کن.</p></div>
 <div class="card"><b>۲. ورود ربات به جلسه</b><p>بسته به تنظیمات Google Meet ممکن است میزبان لازم باشد ربات را تأیید و وارد کند.</p></div>
 <div class="card"><b>۳. دریافت فایل</b><p>ویدیو به تلگرام ارسال می‌شود. فایل صوتی و متن خودکار در شرایط پشتیبانی‌شده ارائه می‌شوند و ممکن است خطا داشته باشند.</p></div>
 </div>
@@ -2808,7 +2853,7 @@ async def home_fa() -> str:
 </div></section>
 <section class="section"><div class="wrap">
 <h2>حریم خصوصی و شرایط استفاده</h2>
-<p>برای زمان‌بندی خودکار فقط دسترسی خواندن تقویم درخواست می‌شود. درباره داده‌ها، زمان نگهداری فایل‌ها و شرایط استفاده بیشتر بخوان.</p>
+<p>درباره داده‌های جلسه، دسترسی‌های قبلی Google، زمان نگهداری فایل‌ها و شرایط استفاده بیشتر بخوان.</p>
 <div class="cta"><a class="button secondary" href="/privacy">حریم خصوصی</a><a class="button secondary" href="/terms">شرایط استفاده</a></div>
 </div></section>
 </main>"""
@@ -2862,15 +2907,15 @@ async def terms_of_service() -> str:
 <h1>BeOnMeet Terms of Service</h1>
 <p>These Terms govern use of BeOnMeet. By connecting an account or requesting a recording, you agree to these Terms.</p>
 <h2>Service</h2>
-<p>BeOnMeet is a meeting automation service that can detect eligible Google Meet events from a connected Google Calendar, dispatch a recorder, and deliver recording related outputs through Telegram. Features and capacity can vary by plan.</p>
+<p>BeOnMeet records eligible Google Meet meetings requested by sending the meeting link directly in Telegram, and delivers files through Telegram subject to available capacity and meeting admission.</p>
 <h2>Your responsibilities</h2>
 <ul><li>You must have the right to connect the Google account you authorize.</li><li>You are responsible for complying with meeting, workplace and local laws, including any notice or consent required before recording participants.</li><li>You may not use BeOnMeet for unlawful surveillance, harassment, unauthorized access or other illegal activity.</li></ul>
 <h2>Google and Telegram</h2>
 <p>Google Meet, Google Calendar and Telegram are third party services. BeOnMeet is not affiliated with or endorsed by Google or Telegram. Their availability and policies can affect BeOnMeet functionality.</p>
 <h2>Availability</h2>
-<p>We work to provide reliable automatic joining and delivery, but admission controls, network conditions, third party outages, capacity limits or meeting configuration can prevent or delay recording. A host may need to admit the recorder.</p>
+<p>We work to provide reliable joining of meetings explicitly requested by the user and delivery of the resulting files, but admission controls, network conditions, third party outages, capacity limits or meeting configuration can prevent or delay recording. A host may need to admit the recorder.</p>
 <h2>Plans and temporary files</h2>
-<p>New Basic, Pro and Business subscriptions last 30 days and include respectively 2, 6 and 15 hours of recorded meetings. Usage is measured by the duration of completed recordings. When the recording allowance is exhausted, new recording requests are blocked until the next subscription period or a support-assisted upgrade. A recording that is already in progress is allowed to finish and may use more than the remaining allowance. No additional hourly charge is made automatically. A new purchase while an active subscription exists is scheduled after the existing paid period unless handled by support. These subscriptions are not automatically renewed.</p>
+<p>New Basic, Pro and Business subscriptions last 30 days from activation and include respectively a TOTAL of 2, 6 and 15 recorded hours, shared across all meetings in the period, not per meeting. Usage is measured by the duration of completed recordings. Unused hours expire at the end of the 30-day period and do not roll over. When the recording allowance is exhausted, new recording requests are blocked until the next subscription period or a support-assisted upgrade. A recording already in progress may finish and exceed the remaining allowance. No additional hourly charge is made automatically. Buying the same or another subscription during an active paid period does NOT top up its current allowance; it queues a new 30-day period after the last purchased paid period. These subscriptions are not automatically renewed.</p>
 <p>Some older customers retain their original plan terms until their existing entitlement expires. Temporary delivery and download files expire according to the applicable plan and service configuration.</p>
 <h2>Privacy</h2>
 <p>Our handling of personal information and Google user data is described in the <a href="/privacy">Privacy Policy</a>.</p>
@@ -2893,6 +2938,8 @@ async def auth_google(chat_id: str | None = None) -> RedirectResponse:
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid Telegram chat id")
 
+    if normalized_chat_id and not AUTO_ALL_MEETINGS_ENABLED:
+        raise HTTPException(status_code=404, detail="Personal automatic Calendar recording is temporarily unavailable")
     if normalized_chat_id and not await asyncio.to_thread(is_premium, normalized_chat_id):
         raise HTTPException(status_code=403, detail="Premium required for All meetings")
 
@@ -2923,6 +2970,8 @@ async def auth_google_callback(request: Request, state: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
     oauth_chat_id = str((oauth_entry or {}).get("chat_id") or "")
+    if oauth_chat_id and not AUTO_ALL_MEETINGS_ENABLED:
+        return "<html><body><h2>Automatic Calendar recording is temporarily unavailable</h2><p>Send the meeting link directly to BeOnMeet in Telegram.</p></body></html>"
     if oauth_chat_id and not await asyncio.to_thread(is_premium, oauth_chat_id):
         raise HTTPException(status_code=403, detail="Premium required for All meetings")
 

@@ -623,6 +623,28 @@ def paid_recording_entitlement(telegram_id: str) -> dict:
     }
 
 
+def next_subscription_period(telegram_id: str) -> dict | None:
+    """Earliest already-purchased future period, for transparent /plans output.
+
+    A renewal or second purchase is NEVER an immediate credit top-up.
+    """
+    now = utcnow().isoformat()
+    with _db() as db:
+        row = db.execute(
+            """SELECT plan_code, starts_at, ends_at FROM subscriptions
+               WHERE telegram_id=? AND status='active' AND starts_at>?
+               ORDER BY starts_at ASC LIMIT 1""",
+            (str(telegram_id), now),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "plan": str(row["plan_code"]),
+        "starts": _parse_dt(row["starts_at"]),
+        "until": _parse_dt(row["ends_at"]),
+    }
+
+
 def activate_subscription(telegram_id: str, plan_code: str, note: str = "") -> datetime:
     if plan_code not in PLANS:
         raise ValueError("invalid plan")
