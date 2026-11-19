@@ -27,3 +27,56 @@ jobs:
           python3 tests/admin_google_clay_test.py
           python3 tests/cloud_init_render_test.py
 
+
+  readonly-single-vps-preflight:
+    if: github.event_name == 'pull_request' && github.head_ref == 'feat/ad-launch-tiered-billing-20261113'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Read service layout and safe host capacity (no modifications)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 2m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST; exit 1;; esac
+            echo PREFLIGHT_START
+            date -u +%Y-%m-%dT%H:%M:%SZ
+            nproc
+            free -m | head -3
+            df -h / /dev/shm | tail -3
+            systemctl show beonmeet-controller -p ExecStart -p WorkingDirectory -p User -p ActiveState --no-pager
+            systemctl is-active rednotedownloader || true
+            printf 'git_head='
+            git -C /opt/beonmeet rev-parse HEAD
+            printf 'git_dirty='
+            git -C /opt/beonmeet status --porcelain | wc -l
+            echo 'safe_env_flags='
+            python3 - <<'PY'
+            from pathlib import Path
+            p=Path('/opt/beonmeet/.env')
+            allow={'AUTOSCALE_ENABLED','BEONMEET_STAGING_NO_POLL','FREE_MEETING_SLOTS','PREMIUM_MEETING_SLOTS','FREE_RECORDING_LIMIT','TRANSCRIPTION_CONCURRENCY','WHISPER_MODEL','RECOVERY_WHISPER_MODEL','TELEGRAM_BOT_URL','BEONMEET_DB_PATH','BEONMEET_DATA_DIR','RECORDING_TMP_DIR','FREE_MEETING_BOT_URL','PREMIUM_MEETING_BOT_URL'}
+            if p.exists():
+                for line in p.read_text().splitlines():
+                    if '=' not in line or line.lstrip().startswith('#'):continue
+                    key,value=line.split('=',1)
+                    key=key.strip()
+                    if key not in allow:continue
+                    if key.endswith('_BOT_URL') or key.endswith('_DIR') or key.endswith('_PATH'):
+                        print(key+'_configured='+str(bool(value.strip())))
+                    else:print(key+'='+value.strip())
+            PY
+            echo 'services='
+            systemctl --no-pager --plain list-units 'beonmeet*' --all | head -18 || true
+            echo 'controller_runtime='
+            ls -ld /opt/beonmeet/.venv /opt/beonmeet/app /opt/beonmeet/app/main.py /opt/beonmeet/app/billing_policy.py 2>&1 | head -8
+            echo 'database_files='
+            find /opt/beonmeet /var/lib/beonmeet -maxdepth 3 -type f \( -name '*.db' -o -name 'state.json' \) -printf '%p %s bytes\n' 2>/dev/null | head -14 || true
+            echo 'local_recorder_capacity='
+            curl -fsS --max-time 8 http://127.0.0.1:9124/capacity | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("data") or d; print({k:v.get(k) for k in ("runningJobs","maxConcurrentMeetings","maxConcurrent","availableSlots")})' || true
+            echo 'public_health_subset='
+            curl -fsS --max-time 8 http://127.0.0.1:8109/health | python3 -c 'import sys,json;d=json.load(sys.stdin);print({k:d.get(k) for k in ("max_concurrent_meetings","premium_reserved_slots","free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs","database_backend")})'
+            echo PREFLIGHT_END
