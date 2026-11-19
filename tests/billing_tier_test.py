@@ -27,6 +27,7 @@ main = (SRC / "main.py").read_text(encoding="utf-8")
 i18n = (SRC / "i18n.py").read_text(encoding="utf-8")
 ast.parse(admin)
 ast.parse(main)
+assert 'DATA_DIR = Path(os.environ.get("BEONMEET_DATA_DIR", "/data"))' in main, "systemd must respect configured data path"
 ast.parse(i18n)
 
 for needle in (
