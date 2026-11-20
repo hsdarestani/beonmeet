@@ -61,7 +61,7 @@ env={
     "plan_quota_seconds":policy.plan_quota_seconds,"PUBLIC_PLAN_CODES":policy.PUBLIC_PLAN_CODES,
     "PUBLIC_PLANS":policy.PUBLIC_PLANS,"PLANS":policy.PLANS,
     "PAID_SALES_MAX_ACTIVE_USERS":12,"PAID_SALES_MAX_SOLD_HOURS":60,
-    "FREE_RECORDING_LIMIT":1,
+    "FREE_TRIAL_MINUTES":60,
 }
 def extract(name):
     node=functions[name]
