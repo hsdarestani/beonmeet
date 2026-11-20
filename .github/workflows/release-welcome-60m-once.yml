@@ -1,0 +1,153 @@
+name: One-time guarded BeOnMeet 60-minute welcome credit release
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release-welcome-60m-once.yml
+permissions:
+  contents: read
+concurrency:
+  group: beonmeet-shared-controller
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate wallet, free minute admission and user-visible copy
+        run: |
+          python3 -m py_compile app/main.py app/admin_panel.py app/credit_wallet.py app/i18n.py
+          python3 tests/welcome_credit_behavior_test.py
+          python3 tests/prepaid_hour_wallet_behavior_test.py
+          python3 tests/billing_usage_behavior_test.py
+          python3 tests/free_plan_limit_test.py
+          python3 tests/i18n_test.py
+  deploy:
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Guarded idle-only BeOnMeet controller release; CamCam untouched
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 10m
+          script: |
+            bash -se <<'BASH'
+            set -euo pipefail
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST;exit 1;; esac
+            [ "$(id -u)" = 0 ] || { echo ROOT_REQUIRED;exit 1; }
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 60 9
+            cd /opt/beonmeet
+            test -s .env
+            test -s data/beonmeet.db
+            systemctl is-active --quiet beonmeet-controller
+            for service in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1;do
+              [ "$(docker inspect -f '{{.State.Health.Status}}' "$service")" = healthy ] || { echo CAMCAM_PRECHECK_FAILED;exit 1; }
+            done
+            .venv/bin/python - <<'PY'
+            import json,urllib.request
+            from pathlib import Path
+            values={}
+            for line in Path('.env').read_text().splitlines():
+                if '=' in line and not line.strip().startswith('#'):
+                    k,v=line.split('=',1);values[k.strip()]=v.strip().strip('"').strip("'")
+            assert values.get('FREE_TRIAL_MINUTES','60')=='60','FREE_TRIAL_MINUTES differs; manual review needed'
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=8) as r:
+                h=json.load(r)
+            assert h.get('ok') and int(h.get('max_concurrent_meetings') or 0)==5,'controller not healthy'
+            for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'):
+                assert int(h.get(k) or 0)==0,k+' not idle'
+            for p in (9124,9126):
+                with urllib.request.urlopen(f'http://127.0.0.1:{p}/capacity',timeout=8) as r:
+                    d=json.load(r)
+                assert int((d.get('data') or d).get('runningJobs') or 0)==0,'active recorder'
+            print('BEONMEET_WELCOME_IDLE_PREFLIGHT_PASS')
+            PY
+            BASE=ce649ac3618406a1b719219dbe86df814e22b6a1
+            SOURCE=f0bd3c2a53ad4f093c1066ea3af34f10f4c444a6
+            git fetch --quiet origin refs/heads/main
+            git merge-base --is-ancestor "$SOURCE" FETCH_HEAD || { echo SOURCE_NOT_MERGED;exit 1; }
+            for file in main.py admin_panel.py credit_wallet.py i18n.py;do
+              cmp -s "app/$file" <(git show "$BASE:app/$file") || { echo LIVE_SOURCE_CHANGED_$file;exit 1; }
+            done
+            BACKUP="/opt/beonmeet/.welcome-60m-backup-$(date -u +%Y%m%dT%H%M%SZ)"
+            STAGE=$(mktemp -d /opt/beonmeet/.stage-welcome-60m.XXXXXXXX)
+            mkdir -m 700 "$BACKUP"
+            for file in main.py admin_panel.py credit_wallet.py i18n.py;do
+              git show "$SOURCE:app/$file" > "$STAGE/$file"
+              chmod 644 "$STAGE/$file"
+            done
+            .venv/bin/python -m py_compile "$STAGE"/{main,admin_panel,credit_wallet,i18n}.py
+            tar -czf "$BACKUP/source-env.tar.gz" app/main.py app/admin_panel.py app/credit_wallet.py app/i18n.py .env
+            chmod 600 "$BACKUP/source-env.tar.gz"
+            if [ -s data/state.json ];then cp -p data/state.json "$BACKUP/state-before.json";fi
+            export BACKUP
+            .venv/bin/python - <<'PY'
+            import sqlite3,os
+            src=sqlite3.connect('file:/opt/beonmeet/data/beonmeet.db?mode=ro',uri=True)
+            dst=sqlite3.connect(os.environ['BACKUP']+'/db-before.sqlite')
+            src.backup(dst)
+            src.close();dst.close()
+            os.chmod(os.environ['BACKUP']+'/db-before.sqlite',0o600)
+            print('WELCOME_BACKUP_COMPLETE')
+            PY
+            .venv/bin/python - <<'PY'
+            import json,urllib.request
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=8) as r: h=json.load(r)
+            for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'):
+                assert int(h.get(k) or 0)==0,k+' became active'
+            for p in (9124,9126):
+                with urllib.request.urlopen(f'http://127.0.0.1:{p}/capacity',timeout=8) as r:d=json.load(r)
+                assert int((d.get('data') or d).get('runningJobs') or 0)==0,'recorder busy'
+            PY
+            CHANGED=0
+            SUCCESS=0
+            rollback() {
+              if [ "$CHANGED" = 1 ] && [ "$SUCCESS" = 0 ];then
+                echo WELCOME_CODE_ROLLBACK
+                tar -xzf "$BACKUP/source-env.tar.gz" -C /opt/beonmeet || true
+                systemctl restart beonmeet-controller || true
+              fi
+            }
+            trap 'rollback; rm -rf "$STAGE"' EXIT
+            CHANGED=1
+            for file in main.py admin_panel.py credit_wallet.py i18n.py;do
+              install -m 644 "$STAGE/$file" "app/$file"
+            done
+            systemctl restart beonmeet-controller
+            HEALTHY=0
+            for i in $(seq 1 30);do
+              if curl -fsS --max-time 3 http://127.0.0.1:8109/health >/dev/null 2>&1;then HEALTHY=1;break;fi
+              sleep 2
+            done
+            [ "$HEALTHY" = 1 ] || { echo CONTROLLER_START_FAILED;exit 1; }
+            .venv/bin/python - <<'PY'
+            import sys,json,urllib.request,sqlite3
+            sys.path.insert(0,'/opt/beonmeet/app')
+            from admin_panel import FREE_TRIAL_MINUTES
+            from i18n import MESSAGES
+            assert FREE_TRIAL_MINUTES==60
+            for lang in ('fa','en','de'):
+                assert MESSAGES[lang]['wallet_trial_included']
+            db=sqlite3.connect('file:/opt/beonmeet/data/beonmeet.db?mode=ro',uri=True)
+            assert db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='credit_entries'").fetchone()[0]==1
+            db.close()
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=8) as r:h=json.load(r)
+            assert h.get('ok') and int(h.get('max_concurrent_meetings') or 0)==5
+            print('WELCOME_60M_RUNTIME_AND_LEDGER_PASS')
+            PY
+            curl -fsS --max-time 12 https://beonmeet.smarbiz.sbs/health >/dev/null
+            nginx -t >/dev/null
+            systemctl is-active --quiet rednotedownloader
+            for service in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1;do
+              [ "$(docker inspect -f '{{.State.Health.Status}}' "$service")" = healthy ] || { echo CAMCAM_POSTCHECK_FAILED;exit 1; }
+            done
+            SUCCESS=1
+            echo BEONMEET_WELCOME_60M_PRODUCTION_DEPLOY_SUCCESS
+            echo "BACKUP_DIR=$BACKUP"
+            BASH

@@ -12,11 +12,11 @@ assert 'reference TEXT PRIMARY KEY' in wallet
 assert 'seconds_delta BIGINT NOT NULL' in wallet
 assert 'ON CONFLICT(reference) DO NOTHING' in wallet
 assert 'if duplicate:' in admin
-assert 'add_entry(db,str(telegram_id),-max(0,int(duration_seconds))' in admin
+assert 'add_entry(db,str(telegram_id),-amount,' in admin
 assert 'has_wallet_history(db,str(telegram_id))' in admin
 assert 'if note.startswith("Zibal receipt ")' in admin, "historical paid subscription callbacks still recognized"
 assert 'if not old:' in admin and 'add_entry(db,str(telegram_id),int(seconds),f"zibal:{receipt}","purchase")' in admin
-assert 'paid_sales_capacity' in admin and 'SUM(seconds_delta)>0' in admin
+assert 'paid_sales_capacity' in admin and 'paid_left > 0' in admin
 assert 'wallet = await asyncio.to_thread(credit_purchase, telegram_id, expected_plan, receipt)' in main
 assert 'await asyncio.to_thread(recording_credit_info, str(chat_id))' in main
 assert 'No automatic renewals' in main or 'no automatic renewal' in main.lower()

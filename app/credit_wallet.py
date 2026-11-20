@@ -24,7 +24,7 @@ def add_entry(db, telegram_id: str, seconds_delta: int, reference: str, kind: st
     delta=int(seconds_delta)
     if not delta or not reference or not str(telegram_id).strip():
         raise ValueError("Invalid wallet transaction")
-    if kind not in {"purchase", "migration", "recording", "admin", "refund"}:
+    if kind not in {"purchase", "migration", "recording", "admin", "refund", "trial"}:
         raise ValueError("Invalid wallet transaction kind")
     row=db.execute("SELECT telegram_id, seconds_delta, kind FROM credit_entries WHERE reference=?", (reference,)).fetchone()
     if row:
@@ -51,13 +51,21 @@ def balance(db, telegram_id: str) -> dict:
     row=db.execute(
         """SELECT COALESCE(SUM(CASE WHEN seconds_delta>0 THEN seconds_delta ELSE 0 END),0) AS credited,
                   COALESCE(SUM(CASE WHEN seconds_delta<0 THEN -seconds_delta ELSE 0 END),0) AS used,
-                  COALESCE(SUM(seconds_delta),0) AS net
+                  COALESCE(SUM(seconds_delta),0) AS net,
+                  COALESCE(SUM(CASE WHEN kind='trial' AND seconds_delta>0 THEN seconds_delta ELSE 0 END),0) AS welcome
            FROM credit_entries WHERE telegram_id=?""",
         (str(telegram_id),),
     ).fetchone()
     net=int(row["net"] or 0) if row else 0
+    used=int(row["used"] or 0) if row else 0
+    welcome=int(row["welcome"] or 0) if row else 0
+    total=max(0,net)
+    welcome_remaining=min(total,max(0,welcome-used))
     return {
-        "remaining_seconds": max(0, net),
+        "remaining_seconds": total,
+        "trial_granted_seconds": welcome,
+        "trial_remaining_seconds": welcome_remaining,
+        "paid_remaining_seconds": total-welcome_remaining,
         "signed_balance_seconds": net,
         "credited_seconds": int(row["credited"] or 0) if row else 0,
         "used_seconds": int(row["used"] or 0) if row else 0,
