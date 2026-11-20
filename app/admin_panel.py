@@ -584,7 +584,13 @@ def migrate_public_subscriptions_to_wallet() -> None:
 
 def recording_credit_info(telegram_id: str) -> dict:
     with _db() as db:
-        return wallet_balance(db,str(telegram_id))
+        result = wallet_balance(db,str(telegram_id))
+        grant = db.execute(
+            "SELECT COALESCE(SUM(seconds_delta),0) AS seconds FROM credit_entries WHERE telegram_id=? AND kind='trial'",
+            (str(telegram_id),),
+        ).fetchone()
+        result["trial_granted_seconds"] = int(grant["seconds"] or 0) if grant else 0
+        return result
 
 
 def _active_legacy_subscription(telegram_id: str) -> dict | None:
