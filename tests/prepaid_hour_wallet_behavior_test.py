@@ -61,7 +61,7 @@ env={
     "plan_quota_seconds":policy.plan_quota_seconds,"PUBLIC_PLAN_CODES":policy.PUBLIC_PLAN_CODES,
     "PUBLIC_PLANS":policy.PUBLIC_PLANS,"PLANS":policy.PLANS,
     "PAID_SALES_MAX_ACTIVE_USERS":12,"PAID_SALES_MAX_SOLD_HOURS":60,
-    "FREE_RECORDING_LIMIT":1,
+    "TRIAL_CREDIT_SECONDS":1800,
 }
 def extract(name):
     node=functions[name]
@@ -108,5 +108,5 @@ env["record_recording"]("44","https://meet.google.com/abc-defg-hij","legacy-unme
 assert env["recording_credit_info"]("44")["remaining_seconds"]==7200, "legacy rights until expiry"
 assert env["paid_recording_entitlement"]("44")["remaining_seconds"] is None
 assert wallet.balance(db,"unknown")["remaining_seconds"]==0
-assert not env["free_recording_entitlement"]("fresh")["remaining"]>0, "paid users' completed recordings exhausted trial"
+assert not env["free_recording_entitlement"]("fresh")["remaining_seconds"]>0, "paid users' completed recordings exhausted trial"
 print("PREPAID_HOUR_WALLET_BEHAVIOR_TEST_PASS")
