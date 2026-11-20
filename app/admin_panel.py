@@ -37,7 +37,8 @@ _GOOGLE_ACCOUNT_CACHE: dict[str, tuple[float, dict]] = {}
 INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
 ADMINUSER = os.environ.get("ADMINUSER", "").strip()
 DOMAIN = os.environ.get("DOMAIN", "beonmeet.smarbiz.sbs")
-FREE_RECORDING_LIMIT = max(0, int(os.environ.get("FREE_RECORDING_LIMIT", "1")))
+TRIAL_CREDIT_MINUTES = max(0, int(os.environ.get("TRIAL_CREDIT_MINUTES", "60")))
+TRIAL_CREDIT_SECONDS = TRIAL_CREDIT_MINUTES * 60
 # Single-VPS capacity caps: no extra servers, no per-user unlimited recording.
 PAID_SALES_MAX_ACTIVE_USERS = max(0, int(os.environ.get("PAID_SALES_MAX_ACTIVE_USERS", "12")))
 PAID_SALES_MAX_SOLD_HOURS = max(0, int(os.environ.get("PAID_SALES_MAX_SOLD_HOURS", "60")))
@@ -408,8 +409,14 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def touch_user(telegram_id: str, username: str = "", first_name: str = "", last_name: str = "") -> None:
+def touch_user(telegram_id: str, username: str = "", first_name: str = "", last_name: str = "") -> bool:
+    """Add introductory recording minutes to the same wallet exactly once.
+
+    Historical accounts that have already completed a recording consumed their
+    existing free trial and must not receive a second promotional grant.
+    """
     now = utcnow().isoformat()
+    user_id = str(telegram_id)
     with _db() as db:
         db.execute(
             """
@@ -421,7 +428,18 @@ def touch_user(telegram_id: str, username: str = "", first_name: str = "", last_
                 last_name=excluded.last_name,
                 last_seen=excluded.last_seen
             """,
-            (str(telegram_id), username or "", first_name or "", last_name or "", now, now),
+            (user_id, username or "", first_name or "", last_name or "", now, now),
+        )
+        if not TRIAL_CREDIT_SECONDS:
+            return False
+        user = db.execute(
+            "SELECT total_recordings FROM users WHERE telegram_id=?", (user_id,)
+        ).fetchone()
+        if not user or int(user["total_recordings"] or 0) > 0:
+            return False
+        return add_entry(
+            db, user_id, TRIAL_CREDIT_SECONDS,
+            f"trial:onboarding:{user_id}", "trial"
         )
 
 
@@ -458,8 +476,9 @@ def record_recording(telegram_id: str, meet_url: str, filename: str, size_bytes:
             "UPDATE users SET total_recordings = total_recordings + 1, last_seen=? WHERE telegram_id=?",
             (now, str(telegram_id)),
         )
-        # Never debit free trials or grandfathered unlimited legacy terms.
-        # Every completed paid recording has an idempotent filename reference.
+        # Deduct completed trial and paid recordings from the SAME time wallet.
+        # Grandfathered unlimited legacy terms remain unmetered.
+        # Every completed recording has an idempotent filename reference.
         # An in-progress meeting may exceed available time: signed debt carries
         # into the next top-up instead of silently gifting additional hours.
         if duration_seconds and has_wallet_history(db,str(telegram_id)) and not _active_legacy_subscription(telegram_id):
@@ -604,32 +623,34 @@ def admin_credit_hours(telegram_id: str, code: str, note: str = "") -> dict:
 
 
 def free_recording_entitlement(telegram_id: str) -> dict:
-    """Return the current lifetime free-recording allowance for one Telegram user."""
-    with _db() as db:
-        row = db.execute(
-            "SELECT total_recordings, premium_until FROM users WHERE telegram_id=?",
-            (str(telegram_id),),
-        ).fetchone()
+    """Show trial and purchased hours in one prepaid wallet.
 
-    used = int(row["total_recordings"] or 0) if row else 0
-    until = _parse_dt(row["premium_until"]) if row else None
+    Trial-only members still record on the free worker pool. They do not receive
+    paid priority, transcription, or separately reserved paid slots.
+    """
     premium = is_premium(telegram_id)
-    remaining = max(0, FREE_RECORDING_LIMIT - used)
+    wallet = recording_credit_info(telegram_id)
+    remaining = max(0, int(wallet["remaining_seconds"]))
     return {
         "premium": premium,
-        "used": used,
-        "limit": FREE_RECORDING_LIMIT,
-        "remaining": remaining,
+        "remaining_seconds": remaining,
         "allowed": premium or remaining > 0,
     }
 
 
 def is_premium(telegram_id: str) -> bool:
-    # A paid account is determined by available recording seconds, not dates.
     if _active_legacy_subscription(telegram_id):
         return True
     with _db() as db:
-        return wallet_balance(db,str(telegram_id))["remaining_seconds"] > 0
+        # An onboarding gift is spendable recording time, NOT a paid tier.
+        paid_origin = db.execute(
+            """SELECT 1 FROM credit_entries
+               WHERE telegram_id=? AND seconds_delta>0
+                 AND kind IN ('purchase','migration','admin','refund')
+               LIMIT 1""",
+            (str(telegram_id),),
+        ).fetchone()
+        return bool(paid_origin and wallet_balance(db, str(telegram_id))["remaining_seconds"] > 0)
 
 
 def was_premium_at(telegram_id: str, when_iso: str) -> bool:
@@ -657,7 +678,7 @@ def was_premium_at(telegram_id: str, when_iso: str) -> bool:
     with _db() as db:
         credited=db.execute(
             """SELECT 1 FROM credit_entries WHERE telegram_id=? AND
-               seconds_delta>0 AND created_at<=? LIMIT 1""",
+               seconds_delta>0 AND kind!='trial' AND created_at<=? LIMIT 1""",
             (str(telegram_id), when.isoformat()),
         ).fetchone()
     return bool(credited)
@@ -805,11 +826,14 @@ def paid_sales_capacity(plan_code: str, telegram_id: str = "") -> dict:
         rows=db.execute(
             """SELECT telegram_id, SUM(seconds_delta) AS net
                FROM credit_entries GROUP BY telegram_id
-               HAVING SUM(seconds_delta)>0"""
+               HAVING SUM(CASE WHEN seconds_delta>0 AND kind!='trial'
+                               THEN seconds_delta ELSE 0 END)>0
+                  AND SUM(seconds_delta)>0"""
         ).fetchall()
         legacy_candidates=db.execute(
             "SELECT telegram_id FROM users WHERE premium_until IS NOT NULL",
         ).fetchall()
+        candidate_wallet = wallet_balance(db, str(telegram_id))
     members={str(r["telegram_id"]) for r in rows}
     sold=sum(max(0,int(r["net"] or 0)) for r in rows)
     for row in legacy_candidates:
@@ -818,7 +842,10 @@ def paid_sales_capacity(plan_code: str, telegram_id: str = "") -> dict:
             members.add(sid)
             sold+=15*3600  # grandfathered unlimited subscriber safety reserve
     projected_users=len(members)+(0 if str(telegram_id) in members else 1)
-    projected_sold=sold+requested
+    # A gift-only user is excluded from sold capacity until their first purchase;
+    # reserve their remaining welcome balance as soon as they become paid.
+    intro_balance = (candidate_wallet["remaining_seconds"] if str(telegram_id) not in members else 0)
+    projected_sold=sold+requested+intro_balance
     return {
         "allowed": (
             PAID_SALES_MAX_ACTIVE_USERS>0 and PAID_SALES_MAX_SOLD_HOURS>0
