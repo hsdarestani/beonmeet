@@ -1,38 +1,38 @@
 #!/usr/bin/env python3
+"""Static guards for the unified onboarding trial and purchased-hour wallet."""
 from pathlib import Path
+import ast
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
 ADMIN = (ROOT / "app" / "admin_panel.py").read_text(encoding="utf-8")
 I18N = (ROOT / "app" / "i18n.py").read_text(encoding="utf-8")
+WALLET = (ROOT / "app" / "credit_wallet.py").read_text(encoding="utf-8")
 
-required_admin = [
-    'FREE_RECORDING_LIMIT = max(0, int(os.environ.get("FREE_RECORDING_LIMIT", "1")))',
-    'def free_recording_entitlement',
-    '"SELECT total_recordings, premium_until FROM users WHERE telegram_id=?"',
-    '"remaining": remaining',
-    '"allowed": premium or remaining > 0',
-]
-for needle in required_admin:
-    assert needle in ADMIN, f"missing free-plan DB invariant: {needle}"
+for source in (MAIN, ADMIN, I18N, WALLET):
+    ast.parse(source)
 
-required_main = [
-    'free_recording_entitlement,',
-    'def _pending_free_recordings',
-    'async def _free_recording_allowed',
-    'used + pending < limit',
-    'await send_subscription_offer(chat_id, "free_limit_reached")',
-    'if not premium and not await _free_recording_allowed(',
-    'if text.strip().lower() == "/now":',
-    'include_pending=False',
-    'state.setdefault("free_limit_notified", {})',
-]
-for needle in required_main:
-    assert needle in MAIN, f"missing free-plan controller invariant: {needle}"
+for needle in (
+    'TRIAL_CREDIT_MINUTES = max(0, int(os.environ.get("TRIAL_CREDIT_MINUTES", "60")))',
+    'def touch_user(',
+    'f"trial:onboarding:{user_id}", "trial"',
+    'def free_recording_entitlement(',
+    '"remaining_seconds": remaining',
+    "kind IN ('purchase','migration','admin','refund')",
+    "kind!='trial'",
+):
+    assert needle in ADMIN, f"missing unified credit invariant: {needle}"
 
-assert I18N.count('"free_limit_reached"') == 3
-assert "one free trial recording" in I18N
-assert "Probeaufnahme" in I18N
-assert "ضبط آزمایشی رایگان" in I18N
+for needle in (
+    'trial_credited = await asyncio.to_thread(',
+    'trial_credit_added',
+    'remaining_seconds > pending * 3600',
+    'if text.startswith(("/credits", "/balance", "/plans", "/premium")):',
+):
+    assert needle in MAIN, f"missing controller trial invariant: {needle}"
 
+assert '"trial"' in WALLET, "trial credit must use the wallet ledger"
+assert I18N.count('"trial_credit_added"') == 3
+assert I18N.count('"wallet_balance"') == 3
+assert 'one free trial recording' not in I18N
 print("FREE_PLAN_LIMIT_TEST_PASS")
