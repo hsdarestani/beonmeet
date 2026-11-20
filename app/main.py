@@ -29,6 +29,7 @@ from scaling_policy import order_queue
 from billing_policy import PUBLIC_PLAN_CODES, PUBLIC_PLANS, plan_description
 from i18n import (
     BUTTON_ACTIONS,
+    DEFAULT_LANGUAGE,
     LANGUAGE_BUTTONS,
     SUPPORTED_LANGUAGES,
     menu as i18n_menu,
@@ -218,7 +219,7 @@ async def telegram(method: str, data: dict[str, Any] | None = None, files: dict[
 def user_language(chat_id: int | str) -> str:
     return normalize_language(
         str(state.setdefault("user_languages", {}).get(str(chat_id)) or ""),
-        default="en",
+        default=DEFAULT_LANGUAGE,
     )
 
 
@@ -333,8 +334,8 @@ async def setup_telegram_profile() -> None:
                 "commands": json.dumps(public_commands, ensure_ascii=False),
             })
 
-        # English is the neutral default when Telegram does not provide a language.
-        default_profile = i18n_profile("en")
+        # Persian is the default Telegram profile for accounts without a language override.
+        default_profile = i18n_profile(DEFAULT_LANGUAGE)
         await telegram("setMyDescription", {
             "description": default_profile["description"],
         })
@@ -1388,14 +1389,11 @@ async def telegram_loop() -> None:
                     str(from_user.get("last_name") or chat.get("last_name") or ""),
                 )
 
-                # Choose an initial UI language from Telegram once, then persist the
-                # user's explicit choice independently from meeting/transcript language.
+                # New Telegram users start in Persian regardless of their Telegram app
+                # locale. Existing persisted selections are never overwritten.
                 user_languages = state.setdefault("user_languages", {})
                 if str(chat_id) not in user_languages:
-                    user_languages[str(chat_id)] = normalize_language(
-                        str(from_user.get("language_code") or ""),
-                        default="en",
-                    )
+                    user_languages[str(chat_id)] = DEFAULT_LANGUAGE
                     await save_state()
 
                 mapped_action = BUTTON_ACTIONS.get(text)
@@ -1404,7 +1402,7 @@ async def telegram_loop() -> None:
 
                 if text.startswith("/setlanguage"):
                     parts = text.split(maxsplit=1)
-                    requested = parts[1] if len(parts) > 1 else "en"
+                    requested = parts[1] if len(parts) > 1 else DEFAULT_LANGUAGE
                     await set_user_language(chat_id, requested)
                     await tg_text(chat_id, t(chat_id, "language_changed"), with_menu=True)
                     continue
