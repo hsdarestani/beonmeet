@@ -12,7 +12,7 @@ assert 'reference TEXT PRIMARY KEY' in wallet
 assert 'seconds_delta BIGINT NOT NULL' in wallet
 assert 'ON CONFLICT(reference) DO NOTHING' in wallet
 assert 'if duplicate:' in admin
-assert 'add_entry(db,str(telegram_id),-max(0,int(duration_seconds))' in admin
+assert 'add_entry(db,str(telegram_id),-debit_seconds' in admin
 assert 'has_wallet_history(db,str(telegram_id))' in admin
 assert 'if note.startswith("Zibal receipt ")' in admin, "historical paid subscription callbacks still recognized"
 assert 'if not old:' in admin and 'add_entry(db,str(telegram_id),int(seconds),f"zibal:{receipt}","purchase")' in admin
