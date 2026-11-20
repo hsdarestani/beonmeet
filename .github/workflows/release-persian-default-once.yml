@@ -1,0 +1,41 @@
+name: One-time BeOnMeet Persian default release
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release-persian-default-once.yml
+permissions:
+  contents: read
+concurrency:
+  group: beonmeet-shared-controller
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Persian onboarding and wallet regressions
+        run: |
+          python3 -m py_compile app/main.py app/i18n.py
+          python3 tests/i18n_test.py
+          python3 tests/persian_bot_default_test.py
+          python3 tests/welcome_credit_behavior_test.py
+          python3 tests/prepaid_hour_wallet_behavior_test.py
+          bash -n scripts/deploy_persian_default_once.sh
+  deploy:
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Deploy only BeOnMeet bot controller language updates
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 8m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            git fetch --quiet origin main
+            git show FETCH_HEAD:scripts/deploy_persian_default_once.sh | bash
