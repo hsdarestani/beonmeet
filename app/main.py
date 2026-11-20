@@ -45,6 +45,7 @@ from admin_panel import (
     create_payment_intent,
     find_recording_for_artifact,
     free_recording_entitlement,
+    FREE_TRIAL_MINUTES,
     paid_recording_entitlement,
     paid_sales_capacity,
     get_payment_intent,
@@ -726,10 +727,11 @@ async def _free_recording_allowed(
     if entitlement.get("premium"):
         return True
 
-    used = int(entitlement.get("used") or 0)
-    limit = int(entitlement.get("limit") or 0)
+    remaining = int(entitlement.get("remaining_seconds") or 0)
     pending = _pending_free_recordings(str(chat_id), exclude_event_id=event_id) if include_pending else 0
-    if used + pending < limit:
+    # Free trial users share the same minute balance displayed in /credits.
+    # An active free recording reserves the available trial session.
+    if remaining > 0 and pending == 0:
         return True
 
     if notify:
@@ -1433,6 +1435,9 @@ async def telegram_loop() -> None:
                     total_minutes=(remaining + 59) // 60
                     message = t(chat_id, "wallet_balance", hours=total_minutes // 60,
                                 minutes=total_minutes % 60)
+                    if wallet.get("trial_granted_seconds") and int(wallet.get("used_seconds") or 0) == 0:
+                        message += "\n\n" + t(chat_id, "trial_credit_in_wallet",
+                            minutes=int(wallet["trial_granted_seconds"]) // 60)
                     info = await asyncio.to_thread(subscription_info, str(chat_id))
                     if info.get("premium") and str(info.get("plan") or "") in ("monthly","quarterly","halfyear"):
                         end = info.get("period_end") or info.get("until")
@@ -1505,6 +1510,13 @@ async def telegram_loop() -> None:
                             "calendar_disconnected",
                             url=calendar_auth_url(chat_id),
                         )
+                    intro = await asyncio.to_thread(recording_credit_info, str(chat_id))
+                    trial_msg = (
+                        "\n\n" + t(chat_id, "trial_credit_in_wallet",
+                            minutes=int(intro["trial_granted_seconds"]) // 60)
+                        if intro.get("trial_granted_seconds") and int(intro.get("used_seconds") or 0) == 0
+                        else ""
+                    )
                     await tg_text(
                         chat_id,
                         t(
@@ -1512,7 +1524,7 @@ async def telegram_loop() -> None:
                             "start",
                             bot_email=BOT_EMAIL,
                             auth_status=auth_status,
-                        ),
+                        ) + trial_msg,
                         with_menu=True,
                     )
                     continue
