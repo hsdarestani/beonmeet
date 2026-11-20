@@ -108,5 +108,6 @@ env["record_recording"]("44","https://meet.google.com/abc-defg-hij","legacy-unme
 assert env["recording_credit_info"]("44")["remaining_seconds"]==7200, "legacy rights until expiry"
 assert env["paid_recording_entitlement"]("44")["remaining_seconds"] is None
 assert wallet.balance(db,"unknown")["remaining_seconds"]==0
-assert not env["free_recording_entitlement"]("fresh")["remaining"]>0, "paid users' completed recordings exhausted trial"
+assert env["free_recording_entitlement"]("fresh")["premium"], "purchased hours share one wallet"
+assert env["free_recording_entitlement"]("fresh")["remaining_seconds"]==18000
 print("PREPAID_HOUR_WALLET_BEHAVIOR_TEST_PASS")
