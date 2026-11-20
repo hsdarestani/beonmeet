@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 SUPPORTED_LANGUAGES = ("fa", "en", "de")
+DEFAULT_LANGUAGE = "fa"
 
 LANGUAGE_BUTTONS = {
     "fa": "🇮🇷 فارسی",
@@ -299,7 +300,7 @@ PROFILE_TEXT = {
 }
 
 
-def normalize_language(value: str | None, default: str = "en") -> str:
+def normalize_language(value: str | None, default: str = DEFAULT_LANGUAGE) -> str:
     value = (value or "").strip().lower().replace("_", "-")
     if value.startswith("fa") or value.startswith("per"):
         return "fa"
@@ -307,14 +308,14 @@ def normalize_language(value: str | None, default: str = "en") -> str:
         return "de"
     if value.startswith("en"):
         return "en"
-    return default if default in SUPPORTED_LANGUAGES else "en"
+    return default if default in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
 
 
 def tr(language: str, key: str, **kwargs: Any) -> str:
     lang = normalize_language(language)
-    template = MESSAGES.get(lang, MESSAGES["en"]).get(key)
+    template = MESSAGES.get(lang, MESSAGES[DEFAULT_LANGUAGE]).get(key)
     if template is None:
-        template = MESSAGES["en"].get(key, key)
+        template = MESSAGES[DEFAULT_LANGUAGE].get(key, key)
     return template.format(**kwargs)
 
 
