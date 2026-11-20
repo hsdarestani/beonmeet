@@ -24,7 +24,7 @@ def add_entry(db, telegram_id: str, seconds_delta: int, reference: str, kind: st
     delta=int(seconds_delta)
     if not delta or not reference or not str(telegram_id).strip():
         raise ValueError("Invalid wallet transaction")
-    if kind not in {"purchase", "migration", "recording", "admin", "refund"}:
+    if kind not in {"purchase", "migration", "recording", "admin", "refund", "trial"}:
         raise ValueError("Invalid wallet transaction kind")
     row=db.execute("SELECT telegram_id, seconds_delta, kind FROM credit_entries WHERE reference=?", (reference,)).fetchone()
     if row:
