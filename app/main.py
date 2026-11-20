@@ -39,6 +39,7 @@ from i18n import (
 
 from admin_panel import (
     PLANS,
+    TRIAL_CREDIT_MINUTES,
     activate_subscription,
     credit_purchase,
     recording_credit_info,
@@ -726,10 +727,11 @@ async def _free_recording_allowed(
     if entitlement.get("premium"):
         return True
 
-    used = int(entitlement.get("used") or 0)
-    limit = int(entitlement.get("limit") or 0)
+    remaining_seconds = max(0, int(entitlement.get("remaining_seconds") or 0))
     pending = _pending_free_recordings(str(chat_id), exclude_event_id=event_id) if include_pending else 0
-    if used + pending < limit:
+    # Trial time and purchased time share a wallet. A queued/active free
+    # recording conservatively reserves up to one hour until delivery.
+    if remaining_seconds > pending * 3600:
         return True
 
     if notify:
@@ -1376,7 +1378,7 @@ async def telegram_loop() -> None:
                 if not chat_id:
                     continue
 
-                await asyncio.to_thread(
+                trial_credited = await asyncio.to_thread(
                     touch_user,
                     str(chat_id),
                     str(from_user.get("username") or chat.get("username") or ""),
@@ -1433,6 +1435,8 @@ async def telegram_loop() -> None:
                     total_minutes=(remaining + 59) // 60
                     message = t(chat_id, "wallet_balance", hours=total_minutes // 60,
                                 minutes=total_minutes % 60)
+                    if trial_credited:
+                        message = t(chat_id, "trial_credit_added", minutes=TRIAL_CREDIT_MINUTES) + "\n\n" + message
                     info = await asyncio.to_thread(subscription_info, str(chat_id))
                     if info.get("premium") and str(info.get("plan") or "") in ("monthly","quarterly","halfyear"):
                         end = info.get("period_end") or info.get("until")
@@ -1505,16 +1509,21 @@ async def telegram_loop() -> None:
                             "calendar_disconnected",
                             url=calendar_auth_url(chat_id),
                         )
-                    await tg_text(
+                    welcome = t(
                         chat_id,
-                        t(
-                            chat_id,
-                            "start",
-                            bot_email=BOT_EMAIL,
-                            auth_status=auth_status,
-                        ),
-                        with_menu=True,
+                        "start",
+                        bot_email=BOT_EMAIL,
+                        auth_status=auth_status,
                     )
+                    wallet = await asyncio.to_thread(recording_credit_info, str(chat_id))
+                    remaining = max(0, int(wallet.get("remaining_seconds") or 0))
+                    minutes = (remaining + 59) // 60
+                    if trial_credited:
+                        welcome += "\n\n" + t(chat_id, "trial_credit_added", minutes=TRIAL_CREDIT_MINUTES)
+                    welcome += "\n\n" + t(
+                        chat_id, "wallet_balance", hours=minutes // 60, minutes=minutes % 60
+                    )
+                    await tg_text(chat_id, welcome, with_menu=True)
                     continue
 
                 if text.strip().lower() == "/now":
@@ -2824,6 +2833,7 @@ async def home_fa() -> str:
 </div></section>
 <section id="credits" class="section"><div class="wrap">
 <h2>فقط خرید ساعت ضبط؛ بدون اشتراک</h2>
+<p>کاربر جدید __FREE_TRIAL_MINUTES__ دقیقه اعتبار ضبط هدیه در همین کیف پول دریافت می‌کند؛ پس از مصرف، می‌توان ساعت بیشتری خرید.</p>
 <p>فقط ساعت ضبط می‌خری: ۲، ۶ یا ۱۵ ساعت. هر خرید بلافاصله به موجودی قبلی‌ات اضافه می‌شود، تاریخ انقضا ندارد و برای تمام جلسه‌ها قابل استفاده است. به‌اندازه مدت ضبط موفق از اعتبار کم می‌شود؛ اگر جلسه از موجودی بیشتر طول بکشد، مازاد از شارژ بعدی کسر می‌شود. تمدید خودکار یا هزینه اضافه خودکار نداریم.</p>
 <div class="grid prices">__PRICE_CARDS__</div>
 <div class="cta">__BOT_CTA__</div>
@@ -2845,7 +2855,7 @@ async def home_fa() -> str:
 </main>"""
     return public_shell(
         "BeOnMeet | ضبط جلسه گوگل میت در تلگرام",
-        body.replace("__BOT_CTA__", bot_cta).replace("__PRICE_CARDS__", plan_cards),
+        body.replace("__BOT_CTA__", bot_cta).replace("__PRICE_CARDS__", plan_cards).replace("__FREE_TRIAL_MINUTES__", str(TRIAL_CREDIT_MINUTES)),
     )
 
 
