@@ -26,6 +26,7 @@ jobs:
           python3 -m py_compile patches/fix_hamooncloud_beonmeet_plans.py
           bash -n scripts/deploy_hamooncloud_payment_plan_fix.sh
           python3 tests/free_plan_limit_test.py
+          python3 tests/trial_wallet_behavior_test.py
           python3 tests/public_oauth_pages_test.py
           python3 tests/recorder_end_guard_test.py
           python3 tests/admin_google_email_test.py
