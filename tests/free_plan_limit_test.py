@@ -13,7 +13,7 @@ for needle in (
     'def free_recording_entitlement',
     '"remaining_seconds": remaining',
     '"allowed": premium or remaining > 0',
-    '"kind IN (\'purchase\',\'migration\',\'admin\')"',
+    "kind IN ('purchase','migration','admin')",
 ):
     assert needle in admin, needle
 for needle in (
