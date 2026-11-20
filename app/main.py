@@ -726,10 +726,11 @@ async def _free_recording_allowed(
     if entitlement.get("premium"):
         return True
 
-    used = int(entitlement.get("used") or 0)
-    limit = int(entitlement.get("limit") or 0)
+    remaining = int(entitlement.get("remaining_seconds") or 0)
     pending = _pending_free_recordings(str(chat_id), exclude_event_id=event_id) if include_pending else 0
-    if used + pending < limit:
+    # Reserve one hour per in-flight free recording, same conservative
+    # concurrency approach used for paid sessions.
+    if remaining > pending * 3600:
         return True
 
     if notify:
@@ -1012,7 +1013,10 @@ async def queue_loop() -> None:
                         await tg_text(chat_id, t(chat_id, "queue_expired"))
                         continue
 
-                    if premium and not await _paid_recording_allowed(chat_id, event_id=event_id):
+                    if ((premium and not await _paid_recording_allowed(chat_id, event_id=event_id))
+                            or (not premium and not await _free_recording_allowed(
+                                chat_id, event_id=event_id, include_pending=False, notify=False
+                            ))):
                         state["join_queue"] = [
                             q for q in state.get("join_queue", [])
                             if str(q.get("event_id") or "") != event_id
@@ -1433,6 +1437,13 @@ async def telegram_loop() -> None:
                     total_minutes=(remaining + 59) // 60
                     message = t(chat_id, "wallet_balance", hours=total_minutes // 60,
                                 minutes=total_minutes % 60)
+                    trial_seconds = int(wallet.get("trial_remaining_seconds") or 0)
+                    if trial_seconds > 0:
+                        trial_minutes = (trial_seconds + 59) // 60
+                        message += "\n\n" + t(
+                            chat_id, "wallet_trial_included",
+                            hours=trial_minutes // 60, minutes=trial_minutes % 60,
+                        )
                     info = await asyncio.to_thread(subscription_info, str(chat_id))
                     if info.get("premium") and str(info.get("plan") or "") in ("monthly","quarterly","halfyear"):
                         end = info.get("period_end") or info.get("until")
@@ -2240,7 +2251,10 @@ async def remote_worker_claim(
                 continue
             req = item.get("req") or {}
             chat_id = str(req.get("chat_id") or "")
-            if premium and not await _paid_recording_allowed(chat_id, event_id=event_id, notify=False):
+            if ((premium and not await _paid_recording_allowed(chat_id, event_id=event_id, notify=False))
+                    or (not premium and not await _free_recording_allowed(
+                        chat_id, event_id=event_id, include_pending=False, notify=False
+                    ))):
                 continue
             chosen = item
             state["join_queue"] = [
