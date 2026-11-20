@@ -25,6 +25,18 @@ for lang in langs:
 assert MODULE.normalize_language("fa-IR") == "fa"
 assert MODULE.normalize_language("de-DE") == "de"
 assert MODULE.normalize_language("en-US") == "en"
+
+# New and unknown locales default to Persian without overriding an explicit choice.
+assert MODULE.DEFAULT_LANGUAGE == "fa"
+assert MODULE.normalize_language(None) == "fa"
+assert MODULE.normalize_language("") == "fa"
+assert MODULE.normalize_language("fr-FR") == "fa"
+assert MODULE.normalize_language("unknown", default="bogus") == "fa"
+assert MODULE.normalize_language("en-US") == "en"
+assert MODULE.normalize_language("de-DE") == "de"
+assert MODULE.menu(None) == MODULE.MENU_LABELS["fa"]
+assert MODULE.profile(None) == MODULE.PROFILE_TEXT["fa"]
+assert MODULE.tr(None, "language_changed") == MODULE.MESSAGES["fa"]["language_changed"]
 assert MODULE.BUTTON_ACTIONS["🇮🇷 فارسی"] == "/setlanguage fa"
 assert MODULE.BUTTON_ACTIONS["🇬🇧 English"] == "/setlanguage en"
 assert MODULE.BUTTON_ACTIONS["🇩🇪 Deutsch"] == "/setlanguage de"

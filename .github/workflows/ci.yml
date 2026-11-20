@@ -18,6 +18,8 @@ jobs:
           python3 tests/auto_calendar_behavior_test.py
           python3 tests/premium_delivery_test.py
           python3 tests/i18n_test.py
+          python3 tests/persian_bot_default_test.py
+          bash -n scripts/deploy_persian_default_once.sh
           python3 tests/all_meetings_hidden_test.py
           python3 tests/billing_tier_test.py
           python3 tests/billing_usage_behavior_test.py
