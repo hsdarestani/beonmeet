@@ -26,59 +26,56 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,datetime,subprocess,urllib.request
+            import subprocess,json,urllib.request,datetime,collections,os,re,hashlib
+            from pathlib import Path
             print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            js=r"""
-            (async()=>{
-              let browser,phase="cdp";
-              try{
-                const {chromium}=require("playwright-extra");
-                browser=await chromium.connectOverCDP(process.env.GOOGLE_CHROME_CDP_URL,{timeout:10000});
-                const all=browser.contexts().flatMap(c=>c.pages());
-                console.log("JOIN_BROWSER_TAB_COUNT",all.length);
-                let found=0;
-                for(const page of all){
-                  if(!page.url().includes("cru-ggpe-nwi"))continue;
-                  found++;
-                  phase="read_page";
-                  const details=await page.evaluate(()=>{
-                    const text=(document.body?.innerText||"").toLowerCase();
-                    const targets={
-                      ask_to_join:"ask to join",asking_to_join:"asking to join",
-                      waiting_to_be_let_in:"waiting to be let in",
-                      someone_let_you_in:"someone in the call",youll_join:"you'll join when",
-                      request_to_join:"request to join",waiting_for_host:"waiting for host",
-                      denied:"denied",cant_join:"can't join",cannot_join:"cannot join",
-                      host_to_admit:"admit",removed:"removed from this call",
-                      still_in_lobby:"waiting room",not_allowed:"not allowed",
-                      enter_name:"enter your name",you_are_asking:"you are asking",
-                      try_again:"try again",something_went_wrong:"something went wrong",
-                      rejoin:"rejoin",join_now:"join now",leave_call:"leave call",
-                      asking:"asking",host:"host"
-                    };
-                    const visible={};
-                    for(const [k,v] of Object.entries(targets))visible[k]=text.includes(v);
-                    const buttons=Array.from(document.querySelectorAll('button')).map(x=>(x.innerText||x.getAttribute('aria-label')||"").trim().toLowerCase());
-                    const b={
-                      ask_to_join:buttons.some(t=>t.includes("ask to join")),
-                      join_now:buttons.some(t=>t.includes("join now")),
-                      cancel_request:buttons.some(t=>t.includes("cancel request")),
-                      leave:buttons.some(t=>t.includes("leave call")),
-                      retry:buttons.some(t=>t.includes("retry"))
-                    };
-                    return {visible,buttons:b,button_count:buttons.length,body_char_count:text.length};
-                  });
-                  console.log("MATCHED_MEET_TAB_STATE",JSON.stringify(details));
-                }
-                console.log("MATCHED_MEET_TABS",found);
-                console.log("READONLY_CDP_LOBBY_AUDIT_DONE");
-              }catch(e){console.log("READONLY_CDP_LOBBY_AUDIT_ERROR",phase,e.name)}
-              process.exit(0);
-            })();
-            """
-            p=subprocess.run(["docker","exec","beonmeet-worker-five","node","-e",js],capture_output=True,text=True,timeout=26)
-            print("CHROME_DIAGNOSTIC_PROCESS_EXIT",p.returncode)
-            for line in p.stdout.splitlines():
-                if line.startswith(("JOIN_BROWSER_","MATCHED_MEET_","READONLY_CDP_LOBBY_")):print(line[:1000])
-            print("MEET_LOBBY_READONLY_AUDIT_COMPLETE")
+            state=json.loads(Path("data/state.json").read_text())
+            for v in (state.get("launched_events") or {}).values():
+                if not isinstance(v,dict) or "cru-ggpe-nwi" not in str(v.get("meet_url") or ""):continue
+                print("CURRENT_MEET_STATE",json.dumps({
+                   "status":v.get("status"),"launched":v.get("launched_at"),"waiting_since":v.get("waiting_since"),
+                   "recording_started":bool(v.get("recording_started_at"))}))
+            for n in ("beonmeet-worker-five","beonmeet-chrome-single"):
+                p=subprocess.run(["docker","inspect","--format","{{json .State}}",n],capture_output=True,text=True,timeout=6)
+                if p.returncode==0:
+                    obj=json.loads(p.stdout)
+                    print("CONTAINER_STATE",n,{k:obj.get(k) for k in ("Status","Running","OOMKilled","Restarting","StartedAt")})
+            p=subprocess.run(["docker","stats","--no-stream","--format","{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.PIDs}}","beonmeet-worker-five","beonmeet-chrome-single"],capture_output=True,text=True,timeout=12)
+            print("DOCKER_RESOURCE",p.stdout.strip().splitlines()[:2])
+            # Current Chrome tab count, login/lobby category only, no URLs or titles.
+            for container in ("beonmeet-worker-five","beonmeet-chrome-single"):
+                js=r"""
+                (async()=>{
+                  const c=process.env.GOOGLE_CHROME_CDP_URL||"http://127.0.0.1:9222";
+                  const u=c.replace(/\/$/,"")+"/json/list";
+                  const ac=new AbortController();const timer=setTimeout(()=>ac.abort(),5000);
+                  try{
+                    const r=await fetch(u,{signal:ac.signal});
+                    const a=await r.json();
+                    const types={meet:0,account:0,chrome:0,other:0};
+                    for(const t of a){const url=String(t.url||"");if(url.includes("meet.google.com"))types.meet++;else if(url.includes("accounts.google.com"))types.account++;else if(url.startsWith("chrome:"))types.chrome++;else types.other++;}
+                    console.log("CDP_LIST",JSON.stringify({status:r.status,total:a.length,types}));
+                  }catch(e){console.log("CDP_LIST_ERROR",e.name)}
+                  clearTimeout(timer);
+                })();
+                """
+                p=subprocess.run(["docker","exec",container,"node","-e",js],capture_output=True,text=True,timeout=10)
+                print("CDP_TABS",container,p.returncode,p.stdout.strip()[:300])
+            # Count distinct Chrome renderers and network processes (not command lines).
+            p=subprocess.run(["docker","exec","beonmeet-chrome-single","sh","-c","ps -e -o comm= | sort | uniq -c | tail -20"],capture_output=True,text=True,timeout=8)
+            print("CHROME_PROCESS_NAMES",p.stdout.strip().splitlines()[-12:])
+            logs=subprocess.run(["docker","logs","--since","2026-11-21T12:28:00Z","beonmeet-worker-five"],capture_output=True,text=True,timeout=15).stdout
+            events=[]
+            for line in logs.splitlines():
+                if not line.startswith("[2026-11-21T"):continue
+                msg=line.split("] ",4)[-1].split(" {",1)[0].strip()
+                # Only categorized events. Do not expose URLs/meeting names.
+                for k,needle in (
+                    ("start","Begin recording"),("joined","Meeting joined"),("waiting","waiting for the host"),
+                    ("ask_clicked","Success clicked using"),("retry","Retry count"),("timeout","TimeoutError"),
+                    ("failure","Meeting job permanently failed"),("closed","Meeting slot released"),
+                    ("end","Recording stopped"),("error","Error executing task"),("admit","admitted")):
+                    if needle.lower() in msg.lower():events.append([line[1:24],k]);break
+            print("WORKER_EVENTS_SINCE_SCREENSHOT",json.dumps(events[-50:]))
+            print("CDP_RECORDER_STATE_AUDIT_DONE")
             PY
