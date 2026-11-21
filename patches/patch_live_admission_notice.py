@@ -17,7 +17,7 @@ CLICK_PATCHED = '''buttonClicked = true;
                                 this._logger.info(`Success clicked using "${text}" action...`, {'''
 
 FLAG_DECLARATION = "this._logger.info('Waiting for Google Meet pre-join controls...', {"
-FLAG_PATCHED = "let beOnMeetAskedToJoin = false;\\n                " + FLAG_DECLARATION
+FLAG_PATCHED = "let beOnMeetAskedToJoin = false;\n                " + FLAG_DECLARATION
 
 CALLBACK_END = '''                };
                 let waitTimeout;'''
