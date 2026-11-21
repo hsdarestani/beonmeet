@@ -146,4 +146,16 @@ jobs:
                 if any(key in ln.lower() for key in ('authorization','apikey','password','secret','bearer','token=')):ln='[REDACTED]'
                 print('JOIN_COMPILED_CODE',i+1,ln[:360])
             PY
+            python3 - <<'PY'
+            import subprocess
+            from pathlib import Path
+            path=subprocess.check_output(['docker','inspect','-f','{{range .Mounts}}{{if eq .Destination "/usr/src/app/dist/bots/GoogleMeetBot.js"}}{{.Source}}{{end}}{{end}}','beonmeet-worker-five'],text=True).strip()
+            lines=Path(path).read_text().splitlines()
+            for a,b in [(830,950),(1200,1338)]:
+                print('RECORD_FLOW_REGION',a,b)
+                for i in range(a-1,min(b,len(lines))):
+                    line=lines[i]
+                    if any(q in line.lower() for q in ('authorization','apikey','password','secret','bearer','token=')):line='[REDACTED]'
+                    print('RECORD_FLOW_LINE',i+1,line[:450])
+            PY
             echo LIVE_BEONMEET_LOGIN_READ_ONLY_SMOKE_PASS
