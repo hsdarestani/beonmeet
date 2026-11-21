@@ -22,45 +22,29 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import subprocess,json,re,urllib.parse,collections
-            p=subprocess.run(["docker","logs","--since","2026-11-21T12:57:00Z","--until","2026-11-21T13:13:00Z","beonmeet-worker-five"],capture_output=True,text=True,timeout=27)
+            import subprocess,json,re,urllib.parse
+            p=subprocess.run(["docker","logs","--since","2026-11-21T12:57:00Z","--until","2026-11-21T13:12:00Z","beonmeet-worker-five"],capture_output=True,text=True,timeout=24)
             lines=(p.stdout+"\n"+p.stderr).splitlines()
-            labels=["Google Meet Bot was redirected away from the meeting while waiting for admission","Meet lobby state unconfirmed after join click","Can't update the bot status","Cant finish wait at the lobby check","Closing the browser on error"]
-            summaries=[]
+            targets=("Google Meet Bot was redirected away","Cant finish wait at the lobby check","Meet lobby state unconfirmed","Closing the browser on error")
             for idx,line in enumerate(lines):
-                if not any(label.lower() in line.lower() for label in labels):continue
-                when=line[1:24] if line.startswith("[2026-") else "unknown"
-                kind=next((name for name in labels if name.lower() in line.lower()),"other")
-                # Logger data is appended on same line or a following JSON line.
-                raw=line.split(" {",1)[-1] if " {" in line else ""
-                if not raw.startswith("{"):
-                    if idx+1<len(lines) and lines[idx+1].lstrip().startswith("{"):raw=lines[idx+1].strip()
-                data={}
-                try:data=json.loads(raw)
-                except Exception:pass
-                url=str(data.get("currentUrl") or data.get("url") or "")
+                if not any(x in line for x in targets):continue
+                window="\n".join(lines[idx:idx+24])
+                ts=line[1:24] if line.startswith("[2026") else "unknown"
+                urlmatch=re.search(r'(?:currentUrl|redirectedFromMeetUrl)[^"\n]*["\x27]\s*:\s*["\x27]([^"\x27\n]+)',window)
+                url=urlmatch.group(1) if urlmatch else ""
                 parsed=urllib.parse.urlparse(url)
-                host=parsed.hostname or ""
-                if host.endswith("accounts.google.com"):kind_url="google_login"
-                elif host.endswith("meet.google.com"):kind_url="google_meet"
-                elif host.endswith("google.com"):kind_url="google_other"
-                elif url.startswith("chrome-error:"):kind_url="chrome_error"
-                elif url.startswith("about:"):kind_url="about_blank"
-                elif url.startswith("data:"):kind_url="data"
-                elif url.startswith("https://"):kind_url="external_https"
-                elif url:kind_url="other_protocol"
-                else:kind_url="missing_in_logs"
-                body=str(data.get("bodyText") or "")
-                flags={key:word in body.lower() for key,word in (
-                    ("sign_in","sign in"),("couldnt_join","couldn't join"),("cant_join","can't join"),
-                    ("something_wrong","something went wrong"),("request","request"),("meeting","meeting"),
-                    ("error","error"),("not_found","not found"),("ask_to_join","ask to join"),
-                    ("try_again","try again"),("code","code"),("account","account"),
-                    ("access_denied","access denied"),("service","service unavailable"))}
-                summaries.append({"when":when,"event":kind[:68],"redirect_category":kind_url,"path_kind":("meeting" if parsed.path.startswith("/") and re.match(r"/[a-z]{3}-[a-z]{4}-[a-z]{3}",parsed.path) else ("auth" if "auth" in parsed.path or "signin" in parsed.path else ("other" if parsed.path else "none"))),"body_len":len(body),"flags":{k:v for k,v in flags.items() if v},"fields":sorted(data.keys())[:14]})
-            print("REDIRECT_DIAGNOSTIC",json.dumps(summaries[-30:]))
-            for line in lines[-130:]:
-                if line.startswith("[2026-11-21T") and any(x in line for x in ("Retry count", "Success clicked using","Google Meet Bot was redirected","Recording started","Meeting job permanently failed","Closing the browser on error")):
-                    print("LAST_KNOWN_PHASE",line[1:24],next((x for x in ("Retry count", "Success clicked using","Google Meet Bot was redirected","Recording started","Meeting job permanently failed","Closing the browser on error") if x in line),"other"))
-            print("REDIRECT_DIAGNOSTIC_COMPLETE")
+                hostname=parsed.hostname or ""
+                if hostname.endswith("accounts.google.com"):cat="google_account"
+                elif hostname.endswith("meet.google.com"):cat="google_meet"
+                elif hostname.endswith("google.com"):cat="other_google"
+                elif url.startswith("chrome-error:"):cat="chrome_error"
+                elif url.startswith("about:"):cat="about"
+                elif url.startswith("https:"):cat="other_https"
+                elif url:cat="unknown_scheme"
+                else:cat="not_in_24_lines"
+                bodymatch=re.search(r'(?:bodyText|redirectedFromMeetBodyText)[^"\n]*["\x27]\s*:\s*["\x27]([^"\x27\n]*)',window)
+                body=bodymatch.group(1) if bodymatch else ""
+                markers=[m for m in ("sign in","you cannot join","can't join","not allowed","something went wrong","sorry","request to join","pending","Google Meet","meeting","refresh","rejoin","error","log in","access","can't connect","contact the meeting host") if m.lower() in body.lower()]
+                print("REDIRECT_LOG_STRUCT",json.dumps({"at":ts,"event":("redirect" if "redirected away" in line else "other"),"window_lines":len(lines[idx:idx+24]),"line_len":len(line),"leading_brace":line.find("{"),"current_url_category":cat,"path_category":("auth" if any(t in parsed.path.lower() for t in ("login","signin","auth")) else ("sorry" if "sorry" in parsed.path.lower() else ("other" if parsed.path else "none"))),"body_markers":markers,"body_chars_sample":len(body),"keys_found":list(dict.fromkeys(re.findall(r'["]([A-Za-z][A-Za-z0-9_]+)["]\s*:',window)))[:25]}))
+            print("REDIRECT_LOG_INSPECTION_COMPLETE")
             PY
