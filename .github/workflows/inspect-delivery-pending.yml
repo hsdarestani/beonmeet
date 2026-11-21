@@ -26,16 +26,27 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,urllib.request,datetime
+            import json,urllib.request,datetime,subprocess
             from pathlib import Path
             print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            for name,port,path in (("controller",8109,"/health"),("worker_one",9124,"/capacity"),("worker_five",9126,"/capacity")):
-                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+path,timeout=5) as r:d=json.load(r)
+            for name,port,uri in (("controller",8109,"/health"),("worker_five",9126,"/capacity"),("worker_single",9124,"/capacity")):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+uri,timeout=5) as r:d=json.load(r)
                 d=d.get("data",d)
-                keys=("ok","free_queue","premium_queue","pending_delivery_jobs","active_delivery_jobs","runningJobs","availableSlots","maxConcurrentJobs")
-                print("LIVE_COUNTERS",name,json.dumps({k:d.get(k) for k in keys if k in d},sort_keys=True))
+                keys=("ok","pending_delivery_jobs","active_delivery_jobs","free_queue","premium_queue","runningJobs","availableSlots","maxConcurrentJobs")
+                print("LIVE_STATUS",name,json.dumps({k:d.get(k) for k in keys if k in d}))
             state=json.loads(Path("data/state.json").read_text())
-            print("PENDING_DURABLE_COUNT",len(state.get("pending_deliveries") or {}))
-            print("PENDING_RECOVERY_FLAGS",[{"video":bool(x.get("video_delivered")),"audio":bool(x.get("audio_delivered")),"transcript":bool(x.get("transcript_delivered"))} for x in (state.get("pending_deliveries") or {}).values() if isinstance(x,dict)])
-            print("SAFETY_COUNTERS_CURRENT")
+            for x in (state.get("pending_deliveries") or {}).values():
+                if not isinstance(x,dict):continue
+                p=Path(str(x.get("file_path") or x.get("source_path") or ""))
+                print("RECOVERY_STAGE",json.dumps({"video_delivered":bool(x.get("video_delivered")),"audio_delivered":bool(x.get("audio_delivered")),
+                    "transcript_delivered":bool(x.get("transcript_delivered")),
+                    "file_exists":p.is_file(),"attempts":int(x.get("attempts") or x.get("retry_count") or 0)}))
+            for container,pathname in (
+                ("beonmeet-worker-five","/usr/src/app/dist/middleware/disk-uploader.js"),
+                ("beonmeet-worker-five","/usr/src/app/dist/bots/GoogleMeetBot.js")):
+                t=subprocess.run(["docker","exec",container,"grep","-c",
+                    "chmod(instance.folderPath(), 0o2770)" if "uploader" in pathname else "const recordingQuality =",pathname],
+                    capture_output=True,text=True,timeout=8)
+                print("INSTALLED_RECORDER_PATCH",("permissions" if "uploader" in pathname else "quality"),t.returncode==0)
+            print("POST_RELEASE_RUNTIME_AUDIT_COMPLETE")
             PY
