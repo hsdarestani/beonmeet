@@ -26,38 +26,25 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import os,subprocess,json,urllib.request,datetime,re
+            import os,subprocess,json
             from pathlib import Path
-            lock=Path("/var/lock/pars-vds-bot-deploy.lock")
-            print("LOCK_DIAG_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            st=lock.stat()
-            print("LOCK_FILE_INODE",st.st_ino)
-            owners=[]
-            for proc in Path("/proc").iterdir():
-                if not proc.name.isdecimal():continue
-                fd_dir=proc/"fd"
-                try:
-                    descriptors=fd_dir.iterdir()
-                except (OSError,PermissionError):continue
-                for fd in descriptors:
-                    try:
-                        target=fd.resolve(strict=False)
-                        if str(target)==str(lock.resolve()):
-                            com=(proc/"comm").read_text().strip()
-                            status=(proc/"status").read_text()
-                            ppid=re.search(r"PPid:\s*(\d+)",status)
-                            owners.append({"pid":int(proc.name),"ppid":int(ppid.group(1)) if ppid else -1,"comm":com,"fd":fd.name})
-                    except (OSError,PermissionError):continue
-            print("LOCK_OPEN_PROCESS_DESCRIPTORS",json.dumps(owners[:60]))
-            for line in Path("/proc/locks").read_text().splitlines():
-                if str(st.st_ino) in line:
-                    print("KERNEL_LOCK_SUMMARY",line[:140])
-            p=subprocess.run(["docker","ps","-a","--format","{{.Names}}|{{.Status}}"],capture_output=True,text=True,timeout=12)
-            print("QA_CONTAINERS",[x for x in p.stdout.splitlines() if "beonmeet-five-qa" in x])
-            for port in (9124,9126):
-                try:
-                    with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=5) as r:x=json.load(r)
-                    print("WORKER_RUNNING",port,int((x.get("data") or x).get("runningJobs") or 0))
-                except Exception as e:print("WORKER_STATUS_ERROR",port,type(e).__name__)
-            print("LOCK_OWNER_READONLY_AUDIT_DONE")
+            markers=("beonmeet-five-balanced","beonmeet-five-qa-chrome","qa-five-balanced-av","five_sustained_av_smoke")
+            for pid in (2655475,2655478,2656085):
+                p=Path("/proc")/str(pid)
+                if not p.exists():print("HOST_PID",pid,"GONE");continue
+                b=(p/"cmdline").read_bytes().replace(b"\x00",b" ").decode(errors="replace")
+                st=(p/"status").read_text()
+                info={}
+                for key in ("Name","State","PPid"):
+                    for line in st.splitlines():
+                        if line.startswith(key+":"):
+                            info[key]=line.split(":",1)[1].strip()
+                info["qa_marker"]=any(x in b for x in markers)
+                info["docker_exec"]=("docker exec" in b)
+                print("HOST_PID",pid,json.dumps(info))
+            p=subprocess.run(["docker","ps","-a","--filter","name=beonmeet-five-qa-chrome","--format","{{.Names}}|{{.State}}|{{.Status}}"],capture_output=True,text=True,timeout=10)
+            print("QA_CONTAINER",p.stdout.strip().splitlines())
+            r=subprocess.run(["docker","exec","beonmeet-worker-five","sh","-c","for p in /proc/[0-9]*/cmdline; do grep -q 'beonmeet-five-balanced-qa.js' \u0022$p\u0022 2>/dev/null && echo \u0022$p\u0022; done"],capture_output=True,text=True,timeout=12)
+            print("QA_WORKER_PROC_MATCHES_COUNT",len(r.stdout.splitlines()))
+            print("EXACT_QA_ORPHAN_AUDIT_COMPLETE")
             PY
