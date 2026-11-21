@@ -1,0 +1,121 @@
+name: One-time install BeOnMeet Chrome CDP watchdog
+
+on:
+  push:
+    branches: [ops/install-chrome-cdp-watchdog-20261121]
+    paths:
+      - .github/workflows/install-cdp-watchdog-once.yml
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - name: Guarded install of dedicated BeOnMeet-only CDP health service
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 6m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST; exit 1 ;; esac
+            test "$(id -u)" = 0
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 60 9
+            cd /opt/beonmeet
+            release=d7e4b3e2c981e964176b0e004f3b9760830b4cbb
+            git fetch -q origin main
+            git merge-base --is-ancestor "$release" FETCH_HEAD
+            target=/opt/beonmeet/scripts/chrome_cdp_watchdog.py
+            service=/etc/systemd/system/beonmeet-cdp-watchdog.service
+            timer=/etc/systemd/system/beonmeet-cdp-watchdog.timer
+            test ! -e "$target" && test ! -L "$target"
+            test ! -e "$service" && test ! -L "$service"
+            test ! -e "$timer" && test ! -L "$timer"
+            python3 - <<'PY'
+            import subprocess,json,urllib.request
+            with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=8) as r:h=json.load(r)
+            assert h.get("ok"),"Controller unhealthy"
+            for name in ("beonmeet-worker-five","beonmeet-worker-single","beonmeet-chrome-single"):
+                assert subprocess.check_output(["docker","inspect","--format","{{.State.Running}}",name],text=True).strip()=="true",name
+            for name in ("camcam-shared-api-1","camcam-shared-pet-1","camcam-shared-archive-1","camcam-shared-petarchive-1"):
+                assert subprocess.check_output(["docker","inspect","--format","{{.State.Health.Status}}",name],text=True).strip()=="healthy",name
+            print("PRECHECK_BEONMEET_AND_CAMCAM_PASS")
+            PY
+            stage=$(mktemp /opt/beonmeet/.stage-cdp-watchdog-XXXXXXXX.py)
+            git show "$release:scripts/chrome_cdp_watchdog.py" > "$stage"
+            python3 -m py_compile "$stage"
+            changed=0
+            finished=0
+            rollback() {
+              if [ "$changed" = 1 ] && [ "$finished" = 0 ];then
+                systemctl disable --now beonmeet-cdp-watchdog.timer >/dev/null 2>&1 || true
+                rm -f "$target" "$service" "$timer"
+                systemctl daemon-reload
+                echo CDP_WATCHDOG_INSTALL_ROLLED_BACK
+              fi
+              rm -f "$stage"
+            }
+            trap rollback EXIT
+            changed=1
+            install -D -m 0644 "$stage" "$target"
+            cat >"$service" <<'UNIT'
+            [Unit]
+            Description=BeOnMeet Chrome CDP health probe and idle-only self-healing
+            After=docker.service beonmeet-controller.service
+            Wants=docker.service
+
+            [Service]
+            Type=oneshot
+            User=root
+            WorkingDirectory=/opt/beonmeet
+            ExecStart=/usr/bin/python3 /opt/beonmeet/scripts/chrome_cdp_watchdog.py
+            TimeoutStartSec=120
+            UNIT
+            cat >"$timer" <<'TIMER'
+            [Unit]
+            Description=Periodic idle-safe Playwright CDP verification for BeOnMeet
+
+            [Timer]
+            OnBootSec=3min
+            OnUnitInactiveSec=2min
+            RandomizedDelaySec=15s
+            AccuracySec=10s
+            Persistent=false
+            Unit=beonmeet-cdp-watchdog.service
+
+            [Install]
+            WantedBy=timers.target
+            TIMER
+            chmod 0644 "$service" "$timer"
+            systemctl daemon-reload
+            systemctl enable --now beonmeet-cdp-watchdog.timer
+            test "$(systemctl is-active beonmeet-cdp-watchdog.timer)" = active
+            test "$(systemctl is-enabled beonmeet-cdp-watchdog.timer)" = enabled
+            echo CDP_WATCHDOG_TIMER_INSTALLED
+            # Release the deployment lock for an actual service run. The watchdog
+            # obtains that same lock itself and skips if another release is active.
+            flock -u 9
+            systemctl start beonmeet-cdp-watchdog.service
+            result=$(systemctl show -p Result --value beonmeet-cdp-watchdog.service)
+            test "$result" = success
+            journalctl -u beonmeet-cdp-watchdog.service -n 12 --no-pager -o cat |
+              grep -E 'CDP_WATCHDOG_PLAYWRIGHT_HEALTHY|CDP_WATCHDOG_SKIP_ACTIVE_OR_UNKNOWN_JOBS' >/dev/null
+            flock -w 60 9
+            test "$(systemctl is-active beonmeet-cdp-watchdog.timer)" = active
+            curl -fsS --max-time 10 https://beonmeet.smarbiz.sbs/health >/dev/null
+            for name in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1; do
+              test "$(docker inspect --format '{{.State.Health.Status}}' "$name")" = healthy
+            done
+            finished=1
+            trap - EXIT
+            rm -f "$stage"
+            echo CDP_WATCHDOG_PERSISTENTLY_INSTALLED_VERIFIED
+            echo CAMCAM_UNCHANGED
