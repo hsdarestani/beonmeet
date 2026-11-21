@@ -6,7 +6,13 @@
 const fs = require('fs');
 const {chromium} = require('playwright');
 const SECONDS = Math.max(30, Math.min(600, Number(process.env.QA_SECONDS) || 180));
-const OUTDIR = '/tmp/beonmeet-five-sustained-20261119';
+const OUTDIR = process.env.QA_OUTDIR || '/tmp/beonmeet-five-sustained-20261119';
+if(!OUTDIR.startsWith('/tmp/beonmeet-five-')) throw Error('QA output must remain in test-only /tmp directory');
+const WIDTH = Math.max(640, Math.min(1280, Number(process.env.QA_WIDTH) || 640));
+const HEIGHT = Math.max(360, Math.min(720, Number(process.env.QA_HEIGHT) || 360));
+const FPS = Math.max(5, Math.min(15, Number(process.env.QA_FPS) || 8));
+const VIDEO_BPS = Math.max(200000, Math.min(1500000, Number(process.env.QA_VIDEO_BPS) || 320000));
+const AUDIO_BPS = Math.max(48000, Math.min(128000, Number(process.env.QA_AUDIO_BPS) || 64000));
 const CDP_URL = 'http://beonmeet-five-qa-chrome:9223';
 const RATES = [220,330,440,550,660];
 fs.mkdirSync(OUTDIR, {recursive:false});
@@ -16,7 +22,7 @@ let browser, pages=[];
 const startedAt=Date.now();
 
 async function main() {
-  console.log('QA_AV_START seconds='+SECONDS+' output='+OUTDIR);
+  console.log('QA_AV_START '+JSON.stringify({seconds:SECONDS,width:WIDTH,height:HEIGHT,fps:FPS,videoBits:VIDEO_BPS,audioBits:AUDIO_BPS,output:OUTDIR}));
   browser = await chromium.connectOverCDP(CDP_URL, {timeout:12000});
   const ctx=browser.contexts()[0] || await browser.newContext();
   for (let i=0; i<5; i++) {
@@ -31,9 +37,9 @@ async function main() {
     });
     const res=await p.evaluate(async ({index, tone})=>{
       let canvas=document.createElement('canvas');
-      canvas.width=640;canvas.height=360;document.body.appendChild(canvas);
+      canvas.width=width;canvas.height=height;document.body.appendChild(canvas);
       const g=canvas.getContext('2d',{alpha:false});
-      const video=canvas.captureStream(8);
+      const video=canvas.captureStream(fps);
       const audioContext=new AudioContext({sampleRate:48000});
       const sine=audioContext.createOscillator();
       sine.type='sine';sine.frequency.value=tone;
@@ -46,25 +52,25 @@ async function main() {
       const stream=new MediaStream(tracks);
       const mime=['video/webm;codecs=vp8,opus','video/webm;codecs=vp8','video/webm'].find(s=>MediaRecorder.isTypeSupported(s));
       if(!mime)throw Error('VP8 MediaRecorder codec missing');
-      const rec=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:320000,audioBitsPerSecond:64000});
+      const rec=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:videoBps,audioBitsPerSecond:audioBps});
       let frames=0, errors=0, chunksSent=0;
       let upload=Promise.resolve();
       const t0=performance.now();
       const draw=()=>{
         g.fillStyle='hsl('+(index*64+frames%360)+',52%,24%)';
-        g.fillRect(0,0,640,360);
-        const x=(frames*5) % 555;
+        g.fillRect(0,0,width,height);
+        const x=(frames*5) % (width-85);
         g.fillStyle='white';
         g.fillRect(x,100,85,95);
         g.fillStyle='hsl('+(index*64)+',90%,57%)';
         g.font='bold 30px sans-serif';
         g.fillText('QA STREAM '+(index+1),24,55);
         g.font='18px sans-serif';
-        g.fillText('frame '+frames+' / tone '+tone+' Hz',24,325);
+        g.fillText('frame '+frames+' / tone '+tone+' Hz',24,height-35);
         frames++;
       };
       draw();
-      const drawTimer=setInterval(draw,125);
+      const drawTimer=setInterval(draw,Math.round(1000/fps));
       rec.onerror=e=>{errors++;console.error('QA recorder error '+index,e.error && e.error.message)};
       rec.ondataavailable=(e)=>{
         if(e.data.size===0){errors++;return;}
@@ -94,7 +100,7 @@ async function main() {
           codec:rec.mimeType};
       }};
       return {index,tone,codec:rec.mimeType,contextState:audioContext.state};
-    },{index:i,tone:RATES[i]});
+    },{index:i,tone:RATES[i],width:WIDTH,height:HEIGHT,fps:FPS,videoBps:VIDEO_BPS,audioBps:AUDIO_BPS});
     console.log('QA_AV_PAGE_READY '+JSON.stringify(res));
   }
   console.log('QA_ALL_FIVE_RECORDERS_STARTED');
@@ -121,7 +127,7 @@ async function main() {
     bytes:fs.existsSync(paths[i])?fs.statSync(paths[i]).size:0,
     receivedChunks:received[i].chunks}));
   console.log('QA_AV_RESULTS '+JSON.stringify(stats));
-  const fail=stats.filter(v=>v.errors||v.frames<SECONDS*4||
+  const fail=stats.filter(v=>v.errors||v.frames<SECONDS*Math.max(4,Math.floor(FPS*.55))||
     v.durationSeconds<SECONDS-5||v.bytes<SECONDS*1200||v.receivedChunks<SECONDS/5||
     v.audioTracks!==1||v.videoTracks!==1);
   if(fail.length) throw Error('Recording assertions failed for '+fail.map(x=>x.index).join(','));
