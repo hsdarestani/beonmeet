@@ -26,19 +26,16 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import subprocess,json
-            cmd=["docker","exec","beonmeet-worker-five","sh","-c","find /usr/src/app/dist -type f \\( -iname '*uploader*' -o -iname '*upload*' \\) | head -30"]
-            p=subprocess.run(cmd,capture_output=True,text=True,timeout=18)
-            paths=p.stdout.splitlines()
-            print("UPLOADER_COMPILED_FILE_COUNT",len(paths))
-            for path in paths:
-                if not path.endswith(".js"):continue
-                p=subprocess.run(["docker","exec","beonmeet-worker-five","cat",path],capture_output=True,text=True,timeout=18)
-                lines=p.stdout.splitlines()
-                matches=[i for i,line in enumerate(lines) if ("mkdir(" in line or "mkdirSync(" in line) and ("folderPath" in line or "recursive" in line)]
-                if not matches:continue
-                print("COMPILED_UPLOADER_PATH",path)
-                for i in matches[:5]:
-                    print("COMPILED_MKDIR_LINES",i+1,repr("\n".join(lines[max(0,i-4):i+6])[:1000]))
-            print("UPLOADER_COMPILED_STATIC_AUDIT_COMPLETE")
+            import json,urllib.request,datetime
+            from pathlib import Path
+            print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
+            for name,port,path in (("controller",8109,"/health"),("worker_one",9124,"/capacity"),("worker_five",9126,"/capacity")):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+path,timeout=5) as r:d=json.load(r)
+                d=d.get("data",d)
+                keys=("ok","free_queue","premium_queue","pending_delivery_jobs","active_delivery_jobs","runningJobs","availableSlots","maxConcurrentJobs")
+                print("LIVE_COUNTERS",name,json.dumps({k:d.get(k) for k in keys if k in d},sort_keys=True))
+            state=json.loads(Path("data/state.json").read_text())
+            print("PENDING_DURABLE_COUNT",len(state.get("pending_deliveries") or {}))
+            print("PENDING_RECOVERY_FLAGS",[{"video":bool(x.get("video_delivered")),"audio":bool(x.get("audio_delivered")),"transcript":bool(x.get("transcript_delivered"))} for x in (state.get("pending_deliveries") or {}).values() if isinstance(x,dict)])
+            print("SAFETY_COUNTERS_CURRENT")
             PY
