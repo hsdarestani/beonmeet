@@ -22,30 +22,25 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,subprocess,re,datetime
-            print("DEEP_DIAG_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            p=subprocess.run(["docker","logs","--since","2026-11-21T16:39:00Z","beonmeet-worker-five"],capture_output=True,text=True,timeout=24)
-            raw=(p.stdout+"\n"+p.stderr).splitlines()
-            tags=("pre-join controls","Success clicked using","Joined","admission","lobby","recording","Retry count","Unexpected","Error","failed","waiting","redirect","Timeout")
-            for line in raw:
-                if not line.startswith("[2026-11-21T"):continue
-                ts=line[1:24]
-                if ts<"2026-11-21T16:40" or ts>"2026-11-21T17:05":continue
-                msg=line.split("] ",4)[-1].split(" {",1)[0].strip()
-                if not any(k.lower() in msg.lower() for k in tags):continue
-                msg=re.sub(r"https?://\S+","[URL]",msg)
-                msg=re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}","[EMAIL]",msg)
-                msg=re.sub(r"\b[a-z]{3}-[a-z]{4}-[a-z]{3}\b","[MEET]",msg)
-                if any(x in msg.lower() for x in ("token","secret","password","authorization")):msg="[REDACTED]"
-                print("WORKER_EVENT",ts,msg[:180])
-            p=subprocess.run(["docker","exec","beonmeet-worker-five","cat","/usr/src/app/dist/bots/GoogleMeetBot.js"],capture_output=True,text=True,timeout=20)
-            code=p.stdout
-            for name,marker in (("PREJOIN_WAIT","Waiting for Google Meet pre-join controls"),("WAIT_TIMEOUT","let waitTimeout;"),("LOBBY_WAIT","waitAtLobbyPromise"),("RECORD_BEGIN","Begin recording"),("CHECK_IN_MEETING","isInMeeting"),("RECORDING_STARTED_CALLBACK","recording-started"),("ENTRY_VERIFY","waitForMeetingJoin"),("JOIN_CLICK","const possibleTexts =")):
-                idx=code.find(marker)
-                print("RECORDER_CODE_MARKER",name,idx)
-                if idx>=0:
-                    print("RECORDER_CODE_FRAGMENT_BEGIN",name)
-                    print(code[max(0,idx-450):idx+3100])
-                    print("RECORDER_CODE_FRAGMENT_END",name)
-            print("OPEN_TRUSTED_DEEP_DIAG_COMPLETE")
+            import subprocess,json,urllib.request,datetime
+            print("JOIN_STATE_VERIFY_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
+            for port in (8109,9124,9126):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+("/health" if port==8109 else "/capacity"),timeout=6) as resp:data=json.load(resp)
+                d=data.get("data",data)
+                print("STATUS",port,json.dumps({k:d.get(k) for k in ("ok","free_queue","premium_queue","pending_delivery_jobs","active_delivery_jobs","runningJobs","availableSlots") if k in d}))
+            code=subprocess.run(["docker","exec","beonmeet-worker-five","cat","/usr/src/app/dist/bots/GoogleMeetBot.js"],capture_output=True,text=True,timeout=20).stdout
+            start=code.find("waitAtLobbyPromise =")
+            print("LOBBY_SOURCE_START",start)
+            if start>=0:
+                print("LOBBY_SOURCE_BEGIN")
+                print(code[start:start+11000])
+                print("LOBBY_SOURCE_END")
+            p=subprocess.run(["docker","stats","--no-stream","--format","{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.PIDs}}","beonmeet-worker-five","beonmeet-chrome-single"],capture_output=True,text=True,timeout=12)
+            print("RESOURCE_USAGE",p.stdout.strip().splitlines())
+            try:
+                txt=open("/proc/meminfo").read()
+                m=int(next(x.split()[1] for x in txt.splitlines() if x.startswith("MemAvailable:")))
+                print("HOST_MEMORY_AVAILABLE_MIB",round(m/1024))
+            except Exception:pass
+            print("JOIN_SOURCE_STATE_INSPECTION_DONE")
             PY
