@@ -72,7 +72,7 @@ jobs:
             chrome_image=$(docker inspect -f '{{.Config.Image}}' beonmeet-chrome-single)
             docker run -d --name "$qa" --network beonmeet-single               --memory=1650m --memory-swap=1800m --cpus=1.25 --pids-limit=220               --shm-size=256m --restart=no               -e CHROME_URL=about:blank -e CHROME_WINDOW_SIZE=1024,768               "$chrome_image" >/dev/null
             git fetch -q origin main
-            release=70c9a51bb0818b1fb807e1fca4270ce4565e2ce6
+            release=8f9c9272f55820456e384f0a7e513741cce37a17
             git merge-base --is-ancestor "$release" FETCH_HEAD
             git show "$release:tests/five_sustained_av_smoke.js" > "$stage/qa.js"
             chmod 0644 "$stage/qa.js"
