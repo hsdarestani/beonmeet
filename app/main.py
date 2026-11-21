@@ -730,10 +730,14 @@ async def _free_recording_allowed(
         return True
 
     remaining = int(entitlement.get("remaining_seconds") or 0)
-    pending = _pending_free_recordings(str(chat_id), exclude_event_id=event_id) if include_pending else 0
-    # Reserve one hour per in-flight free recording, same conservative
-    # concurrency approach used for paid sessions.
-    if remaining > pending * 3600:
+    # Welcome credit is a wallet of recording SECONDS, not a one-session pass.
+    # No minutes have been consumed while a recorder is queued, connecting,
+    # waiting for host approval or failing to enter. A stale "joining" event
+    # must never block an unused 15-minute (or even 1-second) remainder.
+    # Actual usage is debited idempotently only after successful video delivery
+    # by record_recording(), which caps free-only debits at available balance.
+    # Concurrency is controlled separately by the worker pool and join dedup.
+    if remaining > 0:
         return True
 
     if notify:
@@ -936,6 +940,53 @@ async def launch_meeting(
     if not busy and notify_start:
         await tg_text(chat_id, t(chat_id, "dispatch_retry", meet_url=meet_url))
     return False
+
+
+async def join_progress_loop() -> None:
+    """Send truthful progress before Google Meet is actually joined.
+
+    Recorder acceptance is not admission. If Chrome or the pre-join UI hangs,
+    the user previously heard nothing for minutes, even though their credit
+    remains completely untouched. This loop reports distinct non-success
+    states once per event, without inventing a lobby/admission status.
+    """
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            for event_id, launched in list(state.setdefault("launched_events", {}).items()):
+                if not isinstance(launched, dict):
+                    continue
+                if str(launched.get("status") or "") != "joining":
+                    continue
+                chat_id = str(launched.get("chat_id") or "")
+                started_raw = str(launched.get("launched_at") or "")
+                if not chat_id or not started_raw:
+                    continue
+                try:
+                    started = isoparse(started_raw)
+                    age_seconds = (now - started).total_seconds()
+                except Exception:
+                    continue
+                if age_seconds < 0:
+                    continue
+                key = "join_slow_notified_at" if age_seconds >= 90 else (
+                    "join_connecting_notified_at" if age_seconds >= 12 else ""
+                )
+                if not key or launched.get(key):
+                    continue
+                await tg_text(
+                    chat_id,
+                    t(chat_id, "join_still_unconfirmed" if key == "join_slow_notified_at" else "join_connecting"),
+                )
+                # The event may be removed by a successful callback while we
+                # awaited Telegram: do not resurrect it.
+                current = state.setdefault("launched_events", {}).get(event_id)
+                if isinstance(current, dict) and current.get("status") == "joining":
+                    current[key] = datetime.now(timezone.utc).isoformat()
+                    await save_state()
+        except Exception as exc:
+            print("join progress loop error:", type(exc).__name__, flush=True)
+        await asyncio.sleep(4)
 
 
 async def worker_health_loop() -> None:
@@ -2128,6 +2179,7 @@ async def startup() -> None:
     asyncio.create_task(calendar_loop())
     asyncio.create_task(queue_loop())
     asyncio.create_task(worker_health_loop())
+    asyncio.create_task(join_progress_loop())
     asyncio.create_task(state_cleanup_loop())
     asyncio.create_task(delivery_recovery_loop())
     asyncio.create_task(premium_upgrade_backfill_loop())

@@ -38,6 +38,7 @@ jobs:
           python3 tests/cloud_init_render_test.py
           node --check tests/five_sustained_av_smoke.js
           python3 tests/low_resource_capture_patch_test.py
+          python3 tests/capture_quality_profile_test.py
           python3 -m py_compile patches/patch_low_resource_compiled_recorder.py
           bash -n scripts/activate_five_on_shared_vps.sh
           bash -n scripts/rollback_five_on_shared_vps.sh
