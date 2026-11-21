@@ -22,42 +22,17 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,subprocess,urllib.request,datetime,collections,re,hashlib
-            from pathlib import Path
-            print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            state=json.loads(Path("data/state.json").read_text())
-            launches=[]
-            for eid,v in (state.get("launched_events") or {}).items():
-                if not isinstance(v,dict) or "cru-ggpe-nwi" not in str(v.get("meet_url") or ""):continue
-                launches.append({"id_hash":hashlib.sha256(str(eid).encode()).hexdigest()[:8],"status":v.get("status"),"launched":v.get("launched_at"),"waiting":v.get("waiting_since"),"recording":v.get("recording_started_at"),"updated":v.get("updated_at"),"connecting_notice":bool(v.get("join_connecting_notified_at")),"slow_notice":bool(v.get("join_slow_notified_at"))})
-            print("TARGET_MEET_EVENTS",json.dumps(launches[-10:]))
-            for label,port,path in (("controller",8109,"/health"),("five",9126,"/capacity"),("single",9124,"/capacity")):
-                try:
-                    with urllib.request.urlopen("http://127.0.0.1:"+str(port)+path,timeout=5) as res:d=json.load(res)
-                    d=d.get("data",d)
-                    print("HEALTH",label,json.dumps({k:d.get(k) for k in ("ok","free_queue","premium_queue","pending_delivery_jobs","active_delivery_jobs","runningJobs","availableSlots","maxConcurrentJobs") if k in d}))
-                except Exception as e:print("HEALTH_ERROR",label,type(e).__name__)
-            phrases={
-               "accepted":["Meeting job accepted"],"launch":["Launching browser"],"navigate":["Navigating to Google Meet URL"],"prejoin":["Waiting for Google Meet pre-join controls"],"guest":["Guest pre-join detected"],"click":["Success clicked using"],"click_rejected":["Google Meet did not accept the trusted Ask to join click"],"unconfirmed":["Meet lobby state unconfirmed after join click"],"lobby":["waiting for the host to admit"],"timeout":["join request timed out","TimeoutError"],"retry":["Retrying","Retry count"],"record":["Begin recording","Recording started"],"record_stop":["Recording stopped"],"error":["Error executing","Protocol error","Target closed","Connection closed","Meeting job permanently failed"]}
-            for container in ("beonmeet-worker-five","beonmeet-worker-single"):
-                p=subprocess.run(["docker","logs","--since","2026-11-21T12:56:00Z",container],capture_output=True,text=True,timeout=28)
-                raw=(p.stdout+"\n"+p.stderr).splitlines()
-                timeline=[];seen={}
-                for line in raw:
-                    if not line.startswith("[2026-11-21T"):continue
-                    corr=line.split("[correlationId: ",1)[-1].split("]",1)[0] if "[correlationId: " in line else "shared"
-                    if corr not in seen:seen[corr]="job"+str(len(seen)+1)
-                    msg=line.split("] ",4)[-1].split(" {",1)[0]
-                    hits=[k for k,terms in phrases.items() if any(t.lower() in msg.lower() for t in terms)]
-                    if hits:timeline.append([line[1:24],seen[corr],hits])
-                print("WORKER_PHASES",container,json.dumps(timeline[-100:]))
-                print("WORKER_LINES",container,len(raw),"jobs",len(seen))
-            journal=subprocess.run(["journalctl","-u","beonmeet-controller","--since","2026-11-21 12:56:00 UTC","--no-pager","-o","short-iso"],capture_output=True,text=True,timeout=25).stdout
-            callbacks=[]
-            for line in journal.splitlines():
-                ts=re.search(r"2026-11-21T\d{2}:\d{2}:\d{2}",line)
-                m=re.search(r'"(POST|GET) (/[a-zA-Z0-9_/-]+) HTTP/1\.1" (\d{3})',line)
-                if m and m.group(2).startswith("/internal/"):callbacks.append([ts.group(0) if ts else "unknown",m.group(2),m.group(3)])
-            print("CONTROLLER_CALLBACKS",json.dumps(callbacks[-50:]))
-            print("JOIN_INCIDENT_AUDIT_COMPLETE")
+            import subprocess,json
+            p=subprocess.run(["docker","logs","--since","2026-11-21T12:57:00Z","--until","2026-11-21T13:05:30Z","beonmeet-worker-five"],capture_output=True,text=True,timeout=25)
+            msgs=[]
+            for line in (p.stdout+"\n"+p.stderr).splitlines():
+                if not line.startswith("[2026-11-21T"):continue
+                msg=line.split("] ",4)[-1].split(" {",1)[0].strip()
+                if "http" not in msg and "@" not in msg and len(msg)<170:msgs.append([line[1:24],msg])
+            print("WORKER_MESSAGES",json.dumps(msgs[-100:]))
+            code=subprocess.run(["docker","exec","beonmeet-worker-five","cat","/usr/src/app/dist/bots/GoogleMeetBot.js"],capture_output=True,text=True,timeout=20).stdout
+            i=code.find("let waitTimeout;")
+            if i<0:raise RuntimeError("Join loop not found")
+            print("JOIN_LOOP_SOURCE",code[i:i+9000])
+            print("JOIN_DIAG_COMPLETE")
             PY
