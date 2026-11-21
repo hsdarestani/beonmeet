@@ -26,40 +26,28 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import collections,datetime,json,sqlite3,subprocess
+            import collections,datetime,json,subprocess,urllib.request
             from pathlib import Path
             print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
             state=json.loads(Path("data/state.json").read_text())
             pending=state.get("pending_deliveries") or {}
             print("PENDING_COUNT",len(pending))
-            for val in list(pending.values())[-10:]:
-                if not isinstance(val,dict):continue
+            for val in list(pending.values())[-4:]:
                 entry=str(val.get("file_path") or val.get("source_path") or val.get("raw_path") or "")
                 p=Path(entry) if entry else None
-                print("PENDING_FILE",json.dumps({
-                    "has_pointer":bool(entry),
-                    "source_exists":bool(p and p.is_file()),
-                    "source_bytes":p.stat().st_size if p and p.is_file() else 0,
-                    "video_delivered":bool(val.get("video_delivered")),
-                    "audio_delivered":bool(val.get("audio_delivered")),
-                    "transcript_delivered":bool(val.get("transcript_delivered")),
-                    "attempts":int(val.get("attempts") or val.get("retry_count") or 0)}))
-            logs=subprocess.run(["journalctl","-u","beonmeet-controller","--since","2026-11-21 11:30:00 UTC","--no-pager","-o","short-iso"],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=25).stdout
-            signatures=("premium downstream delivery incomplete","audio delivery error","transcription error","primary transcription failed","delivery recovery error","ffmpeg","BrokenPipeError","RuntimeError","TimeoutError","FileNotFoundError","OSError","HTTPStatusError","no space left","meeting dispatch")
-            found=collections.Counter()
-            for line in logs.splitlines():
-                for term in signatures:
-                    if term.lower() in line.lower():found[term]+=1
-            print("CONTROLLER_ERROR_SIGNALS",json.dumps(dict(found),sort_keys=True))
-            db=sqlite3.connect("file:/opt/beonmeet/data/beonmeet.db?mode=ro",uri=True);db.row_factory=sqlite3.Row
-            uid=str(((state.get("requests") or {}).get("https://meet.google.com/krq-dnch-odn") or {}).get("chat_id") or "")
-            print("SCREENSHOT_REQUEST_MATCHED",bool(uid))
-            if uid:
-                rows=db.execute("SELECT kind,seconds_delta FROM credit_entries WHERE telegram_id=?",(uid,)).fetchall()
-                total=sum(int(z["seconds_delta"]) for z in rows)
-                trial=sum(int(z["seconds_delta"]) for z in rows if z["kind"]=="trial")
-                used=-sum(int(z["seconds_delta"]) for z in rows if z["kind"]=="recording")
-                recordings=db.execute("SELECT COUNT(*) n,COALESCE(SUM(duration_seconds),0) sec FROM recordings WHERE telegram_id=?",(uid,)).fetchone()
-                print("SCREENSHOT_ACCOUNT_WALLET",json.dumps({"remaining_seconds":max(0,total),"trial_granted_seconds":max(0,trial),"recording_used_seconds":used,"recordings":int(recordings["n"]),"delivered_recording_seconds":int(recordings["sec"])}))
-            print("PENDING_AND_WALLET_AUDIT_DONE")
+                if not p or not p.is_file():continue
+                cmd=["ffprobe","-hide_banner","-v","error","-show_entries","format=duration,bit_rate,format_name:stream=codec_type,codec_name,width,height,r_frame_rate,channels,sample_rate","-of","json",str(p)]
+                res=subprocess.run(cmd,capture_output=True,text=True,timeout=20)
+                if res.returncode==0:
+                    dat=json.loads(res.stdout)
+                    print("PENDING_MEDIA_FORMAT",json.dumps(dat))
+                else:
+                    print("PENDING_MEDIA_FORMAT","ffprobe_failed","returncode",res.returncode)
+            h=urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=5)
+            d=json.load(h)
+            print("PENDING_ACTIVE_COUNTERS",json.dumps({k:d.get(k) for k in ("pending_delivery_jobs","active_delivery_jobs","ok")}))
+            for port in (9124,9126):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=5) as r:x=json.load(r)
+                print("ACTIVE_RECORDER",port,int((x.get("data",x)).get("runningJobs") or 0))
+            print("PENDING_MEDIA_AUDIT_FINISHED")
             PY
