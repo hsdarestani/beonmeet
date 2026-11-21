@@ -1,0 +1,58 @@
+name: BeOnMeet read-only pending delivery safety audit
+
+on:
+  push:
+    branches: [ops/inspect-delivery-pending-20261121]
+    paths:
+      - .github/workflows/inspect-delivery-pending.yml
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - name: Read delivery state before controller-only release
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 4m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,datetime,urllib.request,collections,os,subprocess
+            from pathlib import Path
+            now=datetime.datetime.now(datetime.timezone.utc)
+            print("AUDIT_UTC",now.isoformat())
+            def load(port,ep):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+ep,timeout=5) as r:
+                    data=json.load(r)
+                return data.get("data",data)
+            h=load(8109,"/health")
+            print("HEALTH_COUNTS",json.dumps({k:h.get(k) for k in ("ok","free_queue","premium_queue","pending_delivery_jobs","active_delivery_jobs","transcription_concurrency")},sort_keys=True))
+            for p in (9124,9126):
+                v=load(p,"/capacity")
+                print("RECORDER_CAPACITY",p,json.dumps({k:v.get(k) for k in ("runningJobs","maxConcurrentJobs","availableSlots")},sort_keys=True))
+            st=Path("data/state.json")
+            if st.is_file():
+                x=json.loads(st.read_text())
+                pending=x.get("pending_deliveries") or {}
+                print("DURABLE_PENDING_COUNT",len(pending))
+                for value in list(pending.values())[-14:]:
+                    if not isinstance(value,dict):continue
+                    ts=str(value.get("updated_at") or value.get("created_at") or "")
+                    try:age=int((now-datetime.datetime.fromisoformat(ts)).total_seconds()/60)
+                    except Exception:age=-1
+                    print("DURABLE_PENDING_STAGE",json.dumps({"age_minutes":age,
+                      "video_delivered":bool(value.get("video_delivered")),"audio_delivered":bool(value.get("audio_delivered")),
+                      "transcript_delivered":bool(value.get("transcript_delivered")),
+                      "retries":int(value.get("attempts") or value.get("retry_count") or 0)}))
+            print("MEMORY_AVAILABLE_KIB",next(x.split()[1] for x in Path("/proc/meminfo").read_text().splitlines() if x.startswith("MemAvailable:")))
+            print("PENDING_DELIVERY_SAFETY_INSPECTION_FINISHED")
+            PY
