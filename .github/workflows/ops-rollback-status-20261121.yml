@@ -46,7 +46,7 @@ jobs:
                         k,v=s.split('=',1)
                         if k in ('WHISPER_MODEL','RECOVERY_WHISPER_MODEL','WHISPER_CPU_THREADS','TRANSCRIPTION_CHUNK_SECONDS'):vals[k]=v
                 print('ROLLBACK_STT_ENV',vals)
-            code,logs=run(['journalctl','-u','beonmeet-controller','--since','15 minutes ago','--no-pager','-o','cat'])
+            code,logs=run(['journalctl','-u','beonmeet-controller','--since','6 minutes ago','--no-pager','-o','cat'])
             def clean(s):
                 s=re.sub(r'https?://[^\\s]+','[URL]',s)
                 s=re.sub(r'(?i)[\\w.+-]+@[\\w.-]+','[EMAIL]',s)
@@ -56,7 +56,7 @@ jobs:
             terms=('traceback','importerror','modulenotfound','exception','failed to','error:','systemd','uvicorn','stopping','started','segfault','killed','started server','application startup','address already in use')
             matches=[clean(x) for x in logs if any(t in x.lower() for t in terms)]
             print('ROLLBACK_DIAGNOSTIC_LINES',len(matches))
-            for l in matches[-55:]:print('ROLLBACK_LOG',l)
+            for l in matches[-90:]:print('ROLLBACK_LOG',l)
             for port in (9124,9126):
                 try:
                     with urllib.request.urlopen(f'http://127.0.0.1:{port}/capacity',timeout=6) as r:h=json.load(r)
