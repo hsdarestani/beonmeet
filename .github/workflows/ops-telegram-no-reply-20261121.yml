@@ -1,0 +1,118 @@
+name: URGENT BeOnMeet Telegram no-reply diagnostic (read only)
+on:
+  push:
+    branches: [ops/telegram-not-responding-diagnostic-20261121]
+    paths: [.github/workflows/ops-telegram-no-reply-20261121.yml]
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Inspect controller, Telegram API reachability, polling errors and host pressure (no updates consumed)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 4m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1;; esac
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import os,json,subprocess,urllib.request,urllib.error,datetime,time,re,shutil
+            from pathlib import Path
+            def run(argv,timeout=12):
+                p=subprocess.run(argv,capture_output=True,text=True,timeout=timeout)
+                return p.returncode,p.stdout,p.stderr
+            def health(url):
+                try:
+                    with urllib.request.urlopen(url,timeout=8) as r:
+                        d=json.load(r)
+                    return {'ok':d.get('ok'),'queue_free':d.get('free_queue'),
+                      'queue_premium':d.get('premium_queue'),'active_delivery':d.get('active_delivery_jobs'),
+                      'pending_delivery':d.get('pending_delivery_jobs'),
+                      'remote_workers':d.get('remote_workers'),
+                      'max_concurrent_meetings':d.get('max_concurrent_meetings')}
+                except Exception as e:return {'error_type':type(e).__name__}
+            print('BOT_DIAG_UTC',datetime.datetime.now(datetime.timezone.utc).isoformat())
+            for endpoint in ('http://127.0.0.1:8109/health','https://beonmeet.smarbiz.sbs/health'):
+                print('BOT_DIAG_HEALTH',endpoint,json.dumps(health(endpoint)))
+            rc,out,_=run(['systemctl','show','beonmeet-controller','-p','ActiveState','-p','SubState','-p','NRestarts','-p','MainPID','-p','ExecMainStatus','-p','ActiveEnterTimestamp'])
+            print('BOT_DIAG_SERVICE',out.replace('\\n',' | ')[:650])
+            if Path('/opt/beonmeet/.env').exists():
+                whitelist=('WHISPER_MODEL','RECOVERY_WHISPER_MODEL','WHISPER_CPU_THREADS','TRANSCRIPTION_CONCURRENCY','TELEGRAM_API_BASE')
+                vars={}
+                for line in Path('/opt/beonmeet/.env').read_text().splitlines():
+                    if '=' in line and not line.startswith('#'):
+                        k,v=line.split('=',1)
+                        if k in whitelist:vars[k]=v
+                print('BOT_DIAG_SAFE_CONFIG',json.dumps(vars))
+            # Read token within the server; NEVER print token, chat ID, text or bot name.
+            token=None
+            for line in Path('/opt/beonmeet/.env').read_text().splitlines():
+                if line.startswith('TELEGRAM_BOT_TOKEN='):token=line.split('=',1)[1].strip().strip('"').strip("'")
+            print('BOT_DIAG_TOKEN_PRESENT',bool(token))
+            if token:
+                for method in ('getMe','getWebhookInfo'):
+                    try:
+                        req=urllib.request.Request('https://api.telegram.org/bot'+token+'/'+method,headers={'User-Agent':'BeOnMeet-Diagnostic'})
+                        with urllib.request.urlopen(req,timeout=12) as res:
+                            d=json.load(res)
+                        result=d.get('result') or {}
+                        fields={'ok':d.get('ok')}
+                        if method=='getWebhookInfo':
+                            fields.update({'webhook_set':bool(result.get('url')),'pending_update_count':result.get('pending_update_count'),
+                              'last_error_date':result.get('last_error_date'),'last_error_message_type': 'present' if result.get('last_error_message') else 'absent'})
+                        else:fields.update({'bot_is_active':bool(result.get('id')),'can_read_all_group_messages':result.get('can_read_all_group_messages')})
+                        print('BOT_DIAG_TG_API',method,json.dumps(fields))
+                    except urllib.error.HTTPError as e:
+                        print('BOT_DIAG_TG_API',method,'HTTP_ERROR',e.code)
+                    except Exception as e:
+                        print('BOT_DIAG_TG_API',method,'FAILED',type(e).__name__)
+            rc,journal,_=run(['journalctl','-u','beonmeet-controller','--since','45 minutes ago','--no-pager','-o','short-iso'],timeout=20)
+            lines=journal.splitlines()
+            terms=('telegram loop error','telegram polling','telegram profile','too many requests','retryafter','conflict','getupdates','timed out','connection reset','unauthorized','forbidden','rate limit','transcription','memoryerror','signal 9','oom','failed to start','started server process','application startup complete','bot token')
+            related=[l for l in lines if any(t in l.lower() for t in terms)]
+            def category(l):
+                s=l.lower()
+                if 'telegram loop error' in s:return 'TELEGRAM_LOOP_EXCEPTION'
+                if 'getupdates' in s and ('409' in s or 'conflict' in s):return 'TG_GETUPDATES_CONFLICT'
+                if '429' in s or 'too many requests' in s:return 'TG_RATE_LIMIT'
+                if '401' in s or 'unauthorized' in s:return 'TG_AUTH_FAILURE'
+                if '403' in s or 'forbidden' in s:return 'TG_FORBIDDEN'
+                if 'timed out' in s or 'timeout' in s:return 'TIMEOUT'
+                if 'transcription' in s:return 'TRANSCRIPTION'
+                if 'failed to start' in s or 'oom' in s or 'memoryerror' in s:return 'RESOURCE_FAILURE'
+                if 'startup complete' in s:return 'CONTROLLER_STARTED'
+                return 'OTHER'
+            from collections import Counter
+            counts=Counter(category(l) for l in related)
+            print('BOT_DIAG_LOG_COUNTERS_45M',json.dumps(counts))
+            # Do not print contents of Telegram messages, tokens, identifiers or opaque URLs.
+            print('BOT_DIAG_RECENT_LOG_CATEGORIES',[(l[:25],category(l)) for l in related[-35:]])
+            total=int(next(x.split()[1] for x in Path('/proc/meminfo').read_text().splitlines() if x.startswith('MemTotal:')))
+            avail=int(next(x.split()[1] for x in Path('/proc/meminfo').read_text().splitlines() if x.startswith('MemAvailable:')))
+            print('BOT_DIAG_MEMORY_MB',round(total/1024),round(avail/1024))
+            print('BOT_DIAG_DISK_FREE_GB',round(shutil.disk_usage('/').free/1024**3,2))
+            print('BOT_DIAG_LOAD_1_5_15',Path('/proc/loadavg').read_text().split()[:3])
+            rc,out,_=run(['ps','-eo','comm,%cpu,%mem,etime,args','--sort=-%cpu'])
+            # NO args: may contain tokens; only command name and percent.
+            safe=[]
+            for line in out.splitlines()[1:16]:
+                bits=line.split()
+                if len(bits)>=4:safe.append({'cmd':bits[0][:35],'cpu':bits[1],'mem':bits[2],'elapsed':bits[3]})
+            print('BOT_DIAG_TOP_PROCESSES',json.dumps(safe))
+            for port in (9124,9126):
+                try:
+                    with urllib.request.urlopen('http://127.0.0.1:'+str(port)+'/capacity',timeout=5) as r:d=json.load(r)
+                    print('BOT_DIAG_WORKER',port,d.get('data') or d)
+                except Exception as e:print('BOT_DIAG_WORKER',port,type(e).__name__)
+            for n in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                rc,out,_=run(['docker','inspect','-f','{{.State.Health.Status}}',n])
+                print('BOT_DIAG_CAMCAM',n,out.strip() if rc==0 else 'unavailable')
+            print('BOT_DIAG_COMPLETE')
+            PY
