@@ -1,0 +1,57 @@
+name: Inspect failed private Chrome link setup without revealing secrets
+on:
+  push:
+    branches: [ops/start-private-chrome-google-login-20261121]
+    paths: [.github/workflows/diagnose-login-gateway-prereqs.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Read-only categorize login gateway setup preconditions
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 3m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,subprocess,urllib.request
+            from pathlib import Path
+            conf={}
+            for raw in Path(".env").read_text().splitlines():
+                line=raw.strip()
+                if "=" in line and not line.startswith("#"):
+                    key,val=line.split("=",1)
+                    conf[key.strip()]=val.strip()
+            print("BOT_CONFIG_PRESENT",{"telegram":len(conf.get("TELEGRAM_BOT_TOKEN",""))>=25,"api_base":bool(conf.get("TELEGRAM_API_BASE"))})
+            st=json.loads(Path("data/state.json").read_text())
+            n="cru-ggpe-nwi";allids=set();matched=0
+            for k,v in (st.get("requests") or {}).items():
+                if n in str(k) and isinstance(v,dict):
+                    matched+=1
+                    cid=str(v.get("chat_id") or "")
+                    if cid.isdigit():allids.add(cid)
+            print("TELEGRAM_OWNER_CHAT_MATCHES",{"records":matched,"unique_ids":len(allids),"recipient_resolvable":len(allids)==1})
+            for p in ("/etc/nginx/sites-enabled/shared-vps-https-beonmeet.smarbiz.sbs","/opt/beonmeet/.temporary-google-login/active.json"):
+                path=Path(p)
+                print("LOGIN_PATH_EXISTS",path.name,path.exists())
+                if path.name.startswith("shared") and path.exists():
+                    s=path.read_text()
+                    print("NGINX_CONFIG_PRECONDITIONS",{"site_count":s.count("server_name beonmeet.smarbiz.sbs;"),"location_4space":s.count("    location / {"),"location_8space":s.count("        location / {"),"has_existing_temp_login":"location ^~ /beonmeet-login-" in s})
+            for port,ep in ((8109,"/health"),(9124,"/capacity"),(9126,"/capacity"),(6081,"/vnc.html")):
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}{ep}",timeout=5) as r:
+                        print("PORT_STATUS",port,r.status)
+                except Exception as e:print("PORT_STATUS_ERROR",port,type(e).__name__)
+            for name in ("camcam-shared-api-1","camcam-shared-pet-1","camcam-shared-archive-1","camcam-shared-petarchive-1"):
+                p=subprocess.run(["docker","inspect","-f","{{.State.Health.Status}}",name],capture_output=True,text=True,timeout=8)
+                print("SHARED_HEALTH",name,p.stdout.strip())
+            print("PRIVATE_CHROME_SETUP_DIAGNOSTIC_DONE")
+            PY
