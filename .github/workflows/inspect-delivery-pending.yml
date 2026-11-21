@@ -26,33 +26,89 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,datetime,sqlite3,subprocess,urllib.request
+            import json,subprocess,urllib.request,datetime,collections,re,hashlib
             from pathlib import Path
             now=datetime.datetime.now(datetime.timezone.utc)
-            print("AUDIT_UTC",now.isoformat())
+            print("INCIDENT_AUDIT_UTC",now.isoformat())
+            meet_fragment="cru-ggpe-nwi"
             state=json.loads(Path("data/state.json").read_text())
-            pending=state.get("pending_deliveries") or {}
-            completed=state.get("completed_deliveries") or {}
-            print("FINAL_PENDING_COUNT",len(pending))
-            matched=[]
-            for val in completed.values():
-                if not isinstance(val,dict):continue
-                try:ago=(now-datetime.datetime.fromisoformat(str(val.get("completed_at") or ""))).total_seconds()
-                except Exception:continue
-                if -120<ago<3600:
-                    src=Path(str(val.get("source_path") or ""))
-                    matched.append({"minutes_ago":round(ago/60,1),"source_absent":not src.exists(),"has_receipt":bool(val.get("completed_at"))})
-            print("RECENT_CONFIRMED_DELIVERY_RECEIPTS",json.dumps(sorted(matched,key=lambda x:x["minutes_ago"])[:8]))
-            db=sqlite3.connect("file:/opt/beonmeet/data/beonmeet.db?mode=ro",uri=True)
-            req=(state.get("requests") or {}).get("https://meet.google.com/krq-dnch-odn") or {}
-            uid=str(req.get("chat_id") or "")
-            if uid:
-                rows=db.execute("SELECT kind,seconds_delta FROM credit_entries WHERE telegram_id=?",(uid,)).fetchall()
-                net=sum(int(val) for _,val in rows)
-                consumed=-sum(int(val) for kind,val in rows if kind=="recording")
-                recording_count=db.execute("SELECT COUNT(*) FROM recordings WHERE telegram_id=?",(uid,)).fetchone()[0]
-                print("ACCOUNT_RECONCILIATION",json.dumps({"wallet_seconds":net,"debited_seconds":consumed,"recording_count":recording_count}))
-            with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=6) as res:h=json.load(res)
-            print("FINAL_HEALTH",{k:h.get(k) for k in ("ok","pending_delivery_jobs","active_delivery_jobs","free_queue","premium_queue","max_concurrent_meetings")})
-            print("FINAL_PREVIOUS_RECORDING_RECONCILIATION_COMPLETE")
+            launches=[]
+            for eid,x in (state.get("launched_events") or {}).items():
+                if isinstance(x,dict) and meet_fragment in str(x.get("meet_url") or ""):
+                    launches.append({"id_hash":hashlib.sha256(str(eid).encode()).hexdigest()[:8],
+                         "status":x.get("status"),"launched_at":x.get("launched_at"),
+                         "waiting_since":x.get("waiting_since"),"started":bool(x.get("recording_started_at")),
+                         "notice":bool(x.get("join_connecting_notified_at")),
+                         "slow_notice":bool(x.get("join_slow_notified_at"))})
+            print("MATCHING_MEET_LAUNCHED_EVENTS",json.dumps(launches))
+            matches=0
+            for key,obj in (state.get("requests") or {}).items():
+                if meet_fragment in str(key) or (isinstance(obj,dict) and meet_fragment in json.dumps(obj)):
+                    matches+=1
+            print("MATCHING_MEET_REQUEST_COUNT",matches)
+            print("CURRENT_LAUNCH_COUNTS",dict(collections.Counter(str(v.get("status")) for v in (state.get("launched_events") or {}).values() if isinstance(v,dict))))
+            for label,url in (("controller","http://127.0.0.1:8109/health"),
+                              ("five","http://127.0.0.1:9126/capacity"),
+                              ("single","http://127.0.0.1:9124/capacity")):
+                try:
+                    with urllib.request.urlopen(url,timeout=6) as resp:d=json.load(resp)
+                    d=d.get("data",d)
+                    keys=("ok","free_queue","premium_queue","pending_delivery_jobs","active_delivery_jobs","runningJobs","availableSlots")
+                    print("LIVE_STATUS",label,json.dumps({k:d.get(k) for k in keys if k in d}))
+                except Exception as err:print("STATUS_ERROR",label,type(err).__name__)
+            phases=[
+              ("accepted","Meeting job accepted"),
+              ("launch_browser","Launching browser"),
+              ("navigate","Navigating to Google Meet URL"),
+              ("prejoin_wait","Waiting for Google Meet pre-join controls"),
+              ("prejoin_ready","Google Meet pre-join controls"),
+              ("guest","Guest pre-join detected"),
+              ("ask_join_click",'Success clicked using "Ask to join"'),
+              ("join_now_click",'Success clicked using "Join now"'),
+              ("admission_sent","BeOnMeet admission callback"),
+              ("admission","waiting for the host to admit"),
+              ("recording_start","Begin recording"),
+              ("recording_mime","Media Recorder actual mime type"),
+              ("job_failed","Meeting job permanently failed"),
+              ("retry","Retry count:"),
+              ("failure","Error executing task"),
+              ("closed","Meeting slot released"),
+              ("stopped","Recording stopped"),
+              ("confirmed","Admitted to meeting"),
+              ("api_rejected","Controller returned"),
+              ("error_timeout","TimeoutError"),
+              ("prejoin_timeout","pre-join controls are not ready"),
+              ("ask_join","Ask to join"),
+              ("lobby","lobby"),
+              ("join","join") ]
+            for container in ("beonmeet-worker-five","beonmeet-worker-single"):
+                p=subprocess.run(["docker","logs","--since","2026-11-21T12:25:00Z",container],capture_output=True,text=True,timeout=35)
+                ids={};timeline=[];counts=collections.Counter();raw=p.stdout+"\n"+p.stderr
+                for line in raw.splitlines():
+                    if not line.startswith("[2026-11-21T"):continue
+                    stamp=line[1:24]
+                    corr=line.split("[correlationId: ",1)[-1].split("]",1)[0] if "[correlationId: " in line else "shared"
+                    if corr not in ids:ids[corr]="job"+str(len(ids)+1)
+                    msg=line.split("] ",4)[-1].split(" {",1)[0]
+                    hits=[key for key,needle in phases if needle.lower() in msg.lower()]
+                    hits=list(dict.fromkeys(hits))
+                    if hits:
+                        counts.update(hits)
+                        timeline.append([stamp,ids[corr],hits[:6]])
+                print("RECORDER_EVENT_COUNTS",container,json.dumps(dict(counts)))
+                print("RECORDER_EVENT_TIMELINE",container,json.dumps(timeline[-130:]))
+                print("RECORDER_LINES_COUNT",container,len(raw.splitlines()))
+            log=subprocess.run(["journalctl","-u","beonmeet-controller","--since","2026-11-21 12:25:00 UTC","--no-pager","-o","short-iso"],capture_output=True,text=True,timeout=30).stdout
+            endpoints=[];errors=collections.Counter()
+            for line in log.splitlines():
+                ts=re.search(r"2026-11-21T\d{2}:\d{2}:\d{2}",line)
+                when=ts.group(0) if ts else "unknown"
+                m=re.search(r'"(POST|GET) (/[a-zA-Z0-9_/-]+) HTTP/1\.1" (\d{3})',line)
+                if m and m.group(2).startswith("/internal/"):
+                    endpoints.append([when,m.group(1),m.group(2),m.group(3)])
+                for sig in ("join progress loop error","telegram loop error","dispatch error","waiting for admission","recording started","callback error","retry"):
+                    if sig in line.lower():errors[sig]+=1
+            print("CONTROLLER_CALLBACK_TIMELINE",json.dumps(endpoints[-55:]))
+            print("CONTROLLER_ERROR_CATEGORY_COUNTS",json.dumps(dict(errors)))
+            print("INCIDENT_AUDIT_COMPLETE")
             PY
