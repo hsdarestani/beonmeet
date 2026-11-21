@@ -44,12 +44,17 @@ jobs:
                     st=item.lstat()
                     if st.st_uid!=0:continue
                     mode=stat.S_IMODE(st.st_mode)
-                    if item.is_dir() and mode==0o700:
-                        changed.append((str(item),mode,0o755))
-                    elif item.is_file() and mode in (0o600,0o700):
-                        changed.append((str(item),mode,0o644 if mode==0o600 else 0o755))
+                    if item.is_dir() and (mode & 0o055)!=0o055:
+                        changed.append((str(item),mode,mode | 0o055))
+                    elif item.is_file() and (mode & 0o004)==0:
+                        # Pip wheel shared objects can retain executable-only
+                        # 0711 mode under umask 077; all users need read access.
+                        new_mode = mode | 0o444
+                        if mode & 0o100:
+                            new_mode |= 0o111
+                        changed.append((str(item),mode,new_mode))
             assert 0<len(changed)<50000,"Unexpected count of restricted site-package files"
-            backup=Path("/opt/beonmeet/.whisper-permissions-backup-20261121-v4.json")
+            backup=Path("/opt/beonmeet/.whisper-permissions-backup-20261121-v5.json")
             assert not backup.exists(),"Prior permissions repair already ran"
             backup.write_text(json.dumps({"modified_at":datetime.now(timezone.utc).isoformat(),
                 "entries":[[str(Path(p).relative_to(root)),old] for p,old,_ in changed]}))
