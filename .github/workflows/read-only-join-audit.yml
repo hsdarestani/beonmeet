@@ -26,54 +26,37 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import subprocess,datetime,collections,json,re
+            import os,json,datetime,subprocess,collections,urllib.request,hashlib
             from pathlib import Path
-            def run(args):
-                try:
-                    p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=30)
-                    return p.stdout
-                except Exception:return ""
-            print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            for port in ("9124","9126"):
-                import urllib.request
-                try:
-                    with urllib.request.urlopen("http://127.0.0.1:"+port+"/capacity",timeout=4) as r: dat=json.load(r)
-                    print("WORKER_CAPACITY",port,json.dumps(dat.get("data",dat),sort_keys=True))
-                except Exception as e:print("WORKER_CAPACITY_ERROR",port,type(e).__name__)
-            p=Path("data/state.json")
-            if p.is_file():
-                try:
-                    st=json.loads(p.read_text())
-                    statuses=collections.Counter(str(v.get("status","unknown")) for v in st.get("launched_events",{}).values() if isinstance(v,dict))
-                    print("LAUNCHED_STATUS_COUNTS",json.dumps(dict(statuses),sort_keys=True))
-                    for v in sorted(st.get("launched_events",{}).values(),key=lambda x:str(x.get("launched_at","")),reverse=True)[:9]:
-                        print("LAUNCHED_EVENT",json.dumps({"status":v.get("status"),"launched_at":v.get("launched_at"),
-                                "recording_started":bool(v.get("recording_started_at")),"waiting_admission":bool(v.get("waiting_since"))}))
-                    print("JOIN_QUEUE_COUNT",len(st.get("join_queue") or []))
-                except Exception as e:print("STATE_READ_ERROR",type(e).__name__)
-            raw=run(["docker","logs","--since","2026-11-21T10:40:00Z","beonmeet-worker-five"])
-            ids={};lines=[]
+            now=datetime.datetime.now(datetime.timezone.utc)
+            print("AUDIT_UTC",now.isoformat())
+            def run(a):
+                p=subprocess.run(a,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=25)
+                return p.stdout
+            d=json.loads(Path("data/state.json").read_text())
+            vals=[]
+            for key,v in d.get("launched_events",{}).items():
+                if not isinstance(v,dict):continue
+                try:age=int((now-datetime.datetime.fromisoformat(v.get("launched_at"))).total_seconds()/60)
+                except Exception:age=-1
+                vals.append({"age_minutes":age,"status":v.get("status"),"pool":v.get("pool"),"chat_hash":hashlib.sha256(str(v.get("chat_id","")).encode()).hexdigest()[:5],"meet_hash":hashlib.sha256(str(v.get("meet_url","")).encode()).hexdigest()[:5]})
+            print("LAUNCHED_ANONYMIZED",json.dumps(sorted(vals,key=lambda x:x["age_minutes"])[:12]))
+            for p in (9126,9124):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(p)+"/capacity",timeout=5) as f:x=json.load(f)
+                print("WORKER_CAPACITY",p,json.dumps(x.get("data",x)))
+            print("HOST_MEMORY",run(["free","-m"]).splitlines()[1].split()[1:5])
+            print("HOST_DISK",run(["df","-h","/dev/shm"]).splitlines()[-1].split()[1:5])
+            print("DOCKER_RESOURCE_STATUS",run(["docker","stats","--no-stream","--format","{{.Name}} {{.CPUPerc}} {{.MemUsage}}","beonmeet-worker-five","beonmeet-chrome-single"]).strip().splitlines())
+            raw=run(["docker","logs","--since","2026-11-21T10:43:00Z","beonmeet-worker-five"])
+            types=("Meeting job permanently failed","Retry count","Attempt to end meeting","Recording upload result","Error executing task","Failed to load resource","Google Meet pre-join controls","Browser","page closed","Target closed","meeting job finished","Meeting job accepted")
+            events=[]
             for line in raw.splitlines():
                 if not line.startswith("[2026-11-21T"):continue
                 at=line[1:24]
-                key=line.split("[correlationId: ",1)[1].split("]",1)[0] if "[correlationId: " in line else "shared"
-                if key not in ids:ids[key]="job"+str(len(ids)+1)
-                msg=line.split("] ",4)[-1].split(" {",1)[0].strip()
-                if not any(t in msg.lower() for t in ("launch","retry","failed","error","join","pre-join","record","waiting","enter","click","browser","connected","disconnected","login","concurrent","timeout","ask to","no button","page","close","processing")):continue
-                details=[]
-                for code in ("EACCES","ECONNREFUSED","ETIMEDOUT","TimeoutError","TargetClosedError","ProtocolError","NotFoundError","Error: Target page","Browser has been closed","Navigation failed","net::ERR_","chrome is unreachable"):
-                    if code in line:details.append(code)
-                if len(msg)>135 or "http" in msg or "@" in msg:msg="[redacted]"
-                lines.append([at,ids[key],msg,details])
-            print("WORKER_EVENTS_LAST",json.dumps(lines[-95:]))
-            # Correlate without exposing user id or meeting content.
-            print("WORKER_RUNS",len(ids)-int("shared" in ids))
-            raw=run(["docker","exec","beonmeet-chrome-single","sh","-c","curl -fsS --max-time 3 http://127.0.0.1:9222/json/list || true"])
-            try:
-                tabs=json.loads(raw)
-                print("CHROME_DEBUG_TABS",json.dumps({"total":len(tabs),"meet_tabs":sum("meet.google.com" in str(x.get("url","")) for x in tabs),
-                   "sign_in_tabs":sum("accounts.google.com" in str(x.get("url","")) for x in tabs),
-                   "error_tabs":sum("chrome-error" in str(x.get("url","")) for x in tabs)}))
-            except Exception as e:print("CHROME_DEBUG_TABS_UNAVAILABLE",type(e).__name__)
-            print("RECORDER_STATE_INSPECTION_DONE")
+                m=line.split("] ",4)[-1].split(" {",1)[0]
+                if any(k.lower() in m.lower() for k in types):
+                    if len(m)>130 or "@" in m or "http" in m:m="[REDACTED]"
+                    events.append([at,m])
+            print("LATER_WORKER_EVENTS",json.dumps(events[-55:]))
+            print("POST_JOIN_CAPACITY_AUDIT_DONE")
             PY
