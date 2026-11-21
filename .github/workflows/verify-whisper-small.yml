@@ -42,6 +42,15 @@ jobs:
             test "$(df -Pk /opt/beonmeet | awk 'NR==2 {print $4}')" -ge 3300000
             mkdir -p data/whisper-models
             runuser -u beonmeet -- test -w data/whisper-models || chown -R beonmeet:beonmeet data/whisper-models
+            # Keep cache private, but writable by the same non-root account
+            # that executes transcription in the controller.
+            mkdir -p /opt/beonmeet/.cache/huggingface
+            chown beonmeet:beonmeet /opt/beonmeet/.cache
+            chmod 0700 /opt/beonmeet/.cache
+            chown -R beonmeet:beonmeet /opt/beonmeet/.cache/huggingface
+            chmod 0700 /opt/beonmeet/.cache/huggingface
+            runuser -u beonmeet -- test -w /opt/beonmeet/.cache/huggingface
+            echo PRIVATE_HUGGINGFACE_CACHE_WRITABLE_FOR_CONTROLLER
             timeout 230 runuser -u beonmeet -- .venv/bin/python - <<'PY'
             from faster_whisper import WhisperModel
             print("WHISPER_SMALL_LOADING",flush=True)
