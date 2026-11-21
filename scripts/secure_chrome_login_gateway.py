@@ -183,14 +183,17 @@ def setup() -> None:
     if STATE.exists():
         raise RuntimeError("A temporary login session already exists")
     health()
+    print("LOGIN_STAGE_HEALTH_OK", flush=True)
     # Validate destination and Telegram routing BEFORE changing proxy.
     read_bot_config()
     owner_chat_id()
+    print("LOGIN_STAGE_TELEGRAM_DESTINATION_OK", flush=True)
     site = SITE.read_text()
     assert site.count("server_name beonmeet.smarbiz.sbs;") == 1
     anchor = "    location / {"
     assert site.count(anchor) == 1
     assert "location ^~ /beonmeet-login-" not in site
+    print("LOGIN_STAGE_REVERSE_PROXY_SHAPE_OK", flush=True)
     route_id = secrets.token_urlsafe(17).replace("-", "a").replace("_", "b")
     route = f"/beonmeet-login-{route_id}/"
     username = "setup"
@@ -204,6 +207,7 @@ def setup() -> None:
     passwd_file.write_text(username + ":" + result.stdout.strip() + "\n")
     os.chown(passwd_file, 0, grp.getgrnam("www-data").gr_gid)
     os.chmod(passwd_file, 0o640)
+    print("LOGIN_STAGE_PASSWORD_HASH_READY", flush=True)
     begin = f"    # BEONMEET_PRIVATE_LOGIN_BEGIN_{route_id}\n"
     end = f"    # BEONMEET_PRIVATE_LOGIN_END_{route_id}\n"
     block = (
@@ -227,10 +231,16 @@ def setup() -> None:
     original = site
     try:
         atomically_write_config(site.replace(anchor, block + anchor, 1))
+        print("LOGIN_STAGE_NGINX_CONFIG_WRITTEN", flush=True)
         execute(["nginx", "-t"])
+        print("LOGIN_STAGE_NGINX_SYNTAX_VALID", flush=True)
         execute(["systemctl", "reload", "nginx"])
+        print("LOGIN_STAGE_NGINX_RELOADED", flush=True)
         # No public access possible without Basic Auth.
-        if probe(route, None) != 401 or probe(route, password) != 200:
+        unauth_status = probe(route, None)
+        auth_status = probe(route, password)
+        print("LOGIN_STAGE_PROXY_TEST_STATUSES", unauth_status, auth_status, flush=True)
+        if unauth_status != 401 or auth_status != 200:
             raise RuntimeError("HTTPS proxy was not verified as locked down")
         STATE.write_text(json.dumps({
             "begin": begin, "end": end,
@@ -259,6 +269,7 @@ def setup() -> None:
             "این لینک بعد از انقضا خودکار بسته می‌شود."
         )
         send_telegram(message)
+        print("LOGIN_STAGE_TELEGRAM_SENT", flush=True)
         print("SECURE_LOGIN_LINK_SENT_ONLY_TO_REQUESTING_TELEGRAM_CHAT")
         print("NGINX_BASIC_AUTH_401_AND_200_VERIFIED")
         print("LOGIN_GATEWAY_EXPIRY_SCHEDULED",TTL_MINUTES)
