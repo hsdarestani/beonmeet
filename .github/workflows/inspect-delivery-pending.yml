@@ -26,18 +26,25 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,urllib.request,subprocess
+            import subprocess,sys,site,stat,os,glob
             from pathlib import Path
-            state=json.loads(Path("data/state.json").read_text())
-            p=list((state.get("pending_deliveries") or {}).values())
-            print("PENDING_COUNT",len(p))
-            for item in p:
-                if not isinstance(item,dict):continue
-                print("PENDING_FLAGS",json.dumps({"attempts":item.get("attempts"),"video":item.get("video_delivered"),"audio":item.get("audio_delivered"),"transcript":item.get("transcript_delivered")}))
-            r=subprocess.run(["/opt/beonmeet/.venv/bin/python","-c","from faster_whisper import WhisperModel; import av,ctranslate2; print('runtime_deps_healthy')"],capture_output=True,text=True,timeout=18)
-            print("WHISPER_IMPORT_HEALTH",r.returncode==0)
-            for port in (9124,9126):
-                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=5) as resp:d=json.load(resp)
-                print("RUNNING_JOBS",port,(d.get("data",d)).get("runningJobs"))
-            print("POST_DEPENDENCY_RECOVERY_STATUS_DONE")
+            # Derive exact venv site-packages path, never show personal paths.
+            p=subprocess.run([".venv/bin/python","-c","import sysconfig;print(sysconfig.get_paths()['purelib'])"],capture_output=True,text=True)
+            root=Path(p.stdout.strip())
+            print("PYENV_SITEPKG_EXISTS",root.is_dir())
+            for name in ("faster_whisper","av","ctranslate2","tokenizers","huggingface_hub","onnxruntime","coloredlogs","humanfriendly","flatbuffers"):
+                matches=[x for x in root.iterdir() if x.name==name or x.name.startswith(name.replace("_","-")+"-")]
+                for x in matches[:3]:
+                    st=x.stat()
+                    print("INSTALLED_PACKAGE_PERMISSIONS",name,"dir" if x.is_dir() else "file",oct(stat.S_IMODE(st.st_mode)),"uid",st.st_uid,"gid",st.st_gid)
+            for name in ("faster_whisper","ctranslate2"):
+                path=root/name
+                if path.is_dir():
+                    for child in list(path.iterdir())[:3]:
+                        st=child.stat()
+                        print("PACKAGE_CHILD_MODE",name,oct(stat.S_IMODE(st.st_mode)),"uid",st.st_uid,"type","dir" if child.is_dir() else "file")
+            result=subprocess.run(["runuser","-u","beonmeet","--",".venv/bin/python","-c","import faster_whisper,sys;print('module_file',faster_whisper.__file__,'path_count',len(faster_whisper.__path__))"],capture_output=True,text=True)
+            print("SERVICE_IMPORT_EXIT",result.returncode)
+            print("SERVICE_IMPORT_STDERR_CLASS",result.stderr.splitlines()[-1][:120] if result.stderr else "none")
+            print("WHISPER_PACKAGE_ACL_DIAG_DONE")
             PY
