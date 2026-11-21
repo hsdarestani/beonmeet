@@ -26,14 +26,33 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import subprocess,os
-            targets=["/opt/beonmeet/.venv","/opt/beonmeet/.venv/bin","/opt/beonmeet/.venv/lib","/opt/beonmeet/.venv/lib/python3.12","/opt/beonmeet/.venv/lib/python3.12/site-packages"]
-            for p in targets:
-                print("VENV_DIR",os.path.basename(p),oct(os.stat(p).st_mode & 0o777))
-            for mod in ("faster_whisper","av","ctranslate2","onnxruntime"):
-                c="import "+mod
-                r=subprocess.run(["runuser","-u","beonmeet","--",".venv/bin/python","-c",c],capture_output=True,text=True,timeout=20)
-                last=r.stderr.splitlines()[-1] if r.stderr else "none"
-                print("MODULE_IMPORT",mod,"exit",r.returncode,"error_kind",last.split(":",1)[0][:80])
-            print("IMPORT_DIAGNOSTIC_COMPLETE")
+            import json,datetime,sqlite3,subprocess,urllib.request
+            from pathlib import Path
+            now=datetime.datetime.now(datetime.timezone.utc)
+            print("AUDIT_UTC",now.isoformat())
+            state=json.loads(Path("data/state.json").read_text())
+            pending=state.get("pending_deliveries") or {}
+            completed=state.get("completed_deliveries") or {}
+            print("FINAL_PENDING_COUNT",len(pending))
+            matched=[]
+            for val in completed.values():
+                if not isinstance(val,dict):continue
+                try:ago=(now-datetime.datetime.fromisoformat(str(val.get("completed_at") or ""))).total_seconds()
+                except Exception:continue
+                if -120<ago<3600:
+                    src=Path(str(val.get("source_path") or ""))
+                    matched.append({"minutes_ago":round(ago/60,1),"source_absent":not src.exists(),"has_receipt":bool(val.get("completed_at"))})
+            print("RECENT_CONFIRMED_DELIVERY_RECEIPTS",json.dumps(sorted(matched,key=lambda x:x["minutes_ago"])[:8]))
+            db=sqlite3.connect("file:/opt/beonmeet/data/beonmeet.db?mode=ro",uri=True)
+            req=(state.get("requests") or {}).get("https://meet.google.com/krq-dnch-odn") or {}
+            uid=str(req.get("chat_id") or "")
+            if uid:
+                rows=db.execute("SELECT kind,seconds_delta FROM credit_entries WHERE telegram_id=?",(uid,)).fetchall()
+                net=sum(int(val) for _,val in rows)
+                consumed=-sum(int(val) for kind,val in rows if kind=="recording")
+                recording_count=db.execute("SELECT COUNT(*) FROM recordings WHERE telegram_id=?",(uid,)).fetchone()[0]
+                print("ACCOUNT_RECONCILIATION",json.dumps({"wallet_seconds":net,"debited_seconds":consumed,"recording_count":recording_count}))
+            with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=6) as res:h=json.load(res)
+            print("FINAL_HEALTH",{k:h.get(k) for k in ("ok","pending_delivery_jobs","active_delivery_jobs","free_queue","premium_queue","max_concurrent_meetings")})
+            print("FINAL_PREVIOUS_RECORDING_RECONCILIATION_COMPLETE")
             PY
