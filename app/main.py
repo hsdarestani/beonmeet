@@ -149,6 +149,7 @@ state: dict[str, Any] = {
     "auto_registered_events": {},
     "user_languages": {},
     "pending_deliveries": {},
+    "completed_deliveries": {},
     "recording_downloads": {},
     "premium_recoveries": {},
     "free_limit_notified": {},
@@ -171,6 +172,7 @@ def load_state() -> None:
     state.setdefault("auto_registered_events", {})
     state.setdefault("user_languages", {})
     state.setdefault("pending_deliveries", {})
+    state.setdefault("completed_deliveries", {})
     state.setdefault("recording_downloads", {})
     state.setdefault("premium_recoveries", {})
     state.setdefault("free_limit_notified", {})
@@ -1092,6 +1094,19 @@ async def state_cleanup_loop() -> None:
                     except Exception:
                         pass
                     downloads.pop(token, None)
+                    changed = True
+
+            # A missing upload source is acknowledged as a duplicate only when
+            # an earlier successful delivery receipt exists. Retain receipts for
+            # two days to cover upstream retry windows without unbounded state.
+            completed = state.setdefault("completed_deliveries", {})
+            for key, receipt in list(completed.items()):
+                try:
+                    finished = isoparse(str((receipt or {}).get("completed_at") or ""))
+                except Exception:
+                    finished = now - timedelta(days=3)
+                if now - finished > timedelta(days=2):
+                    completed.pop(key, None)
                     changed = True
 
             # Finished/stale launch records have no purpose after two days.
@@ -3401,6 +3416,12 @@ async def _process_recording_locked(data: dict[str, Any], raw_path: Path) -> dic
     try:
         data = {**data, "_pending_id": pending_id}
         result = await _process_recording_inner(data, raw_path)
+        state.setdefault("completed_deliveries", {})[pending_id] = {
+            "chat_id": chat_id,
+            "source_path": str(raw_path),
+            "filename": str(data.get("filename") or raw_path.name),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
         state.setdefault("pending_deliveries", {}).pop(pending_id, None)
         await save_state()
         return result
@@ -3423,10 +3444,19 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
     lock = delivery_locks.setdefault(pending_id, asyncio.Lock())
 
     async with lock:
-        # A duplicate retry can arrive after the first delivery already completed
-        # and removed the source file. Treat it as idempotent success.
-        if not raw_path.exists() and pending_id not in state.setdefault("pending_deliveries", {}):
-            return {"ok": True, "duplicate": True, "pending_id": pending_id}
+        # HTTP 200 tells the recorder it may delete its only copy. Never return
+        # success for a missing file unless a matching persisted completion
+        # receipt proves that the video was actually delivered to Telegram.
+        if not raw_path.exists():
+            receipt = state.setdefault("completed_deliveries", {}).get(pending_id) or {}
+            if (
+                str(receipt.get("chat_id") or "") == chat_id
+                and str(receipt.get("source_path") or "") == str(raw_path)
+                and str(receipt.get("filename") or "") == str(data.get("filename") or raw_path.name)
+                and receipt.get("completed_at")
+            ):
+                return {"ok": True, "duplicate": True, "pending_id": pending_id}
+            raise HTTPException(status_code=404, detail="Recording source missing: no verified delivery receipt")
         return await _process_recording_locked(data, raw_path)
 
 
