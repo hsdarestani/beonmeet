@@ -13,8 +13,11 @@ CLICK = '''buttonClicked = true;
                                 this._logger.info(`Success clicked using "${text}" action...`, {'''
 CLICK_PATCHED = '''buttonClicked = true;
                                 // Remember when the host must approve a guest.
-                                var beOnMeetAskedToJoin = /Ask to join|Teilnahme erbitten/i.test(text);
+                                beOnMeetAskedToJoin = /Ask to join|Teilnahme erbitten/i.test(text);
                                 this._logger.info(`Success clicked using "${text}" action...`, {'''
+
+FLAG_DECLARATION = "this._logger.info('Waiting for Google Meet pre-join controls...', {"
+FLAG_PATCHED = "let beOnMeetAskedToJoin = false;\\n                " + FLAG_DECLARATION
 
 CALLBACK_END = '''                };
                 let waitTimeout;'''
@@ -31,15 +34,18 @@ CALLBACK_PATCHED = '''                };
 def patched_source(source: str) -> str:
     if "beOnMeetAskedToJoin" in source:
         raise ValueError("Already patched; refuse double application")
+    if source.count(FLAG_DECLARATION) != 1:
+        raise ValueError("Expected exactly one prejoin logging anchor")
     if source.count(CLICK) != 2:
         raise ValueError(f"Expected two click paths, got {source.count(CLICK)}")
     if source.count(CALLBACK_END) != 1:
         raise ValueError("Expected exactly one admission helper exit anchor")
     if source.count("const notifyBeOnMeetWaitingForAdmission = async () => {") != 1:
         raise ValueError("Missing original secured admission callback")
-    output = source.replace(CLICK, CLICK_PATCHED)
+    output = source.replace(FLAG_DECLARATION, FLAG_PATCHED, 1)
+    output = output.replace(CLICK, CLICK_PATCHED)
     output = output.replace(CALLBACK_END, CALLBACK_PATCHED, 1)
-    assert output.count("beOnMeetAskedToJoin") == 3
+    assert output.count("beOnMeetAskedToJoin") == 4
     return output
 
 
