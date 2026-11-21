@@ -22,27 +22,28 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,os,stat,subprocess,datetime
-            from pathlib import Path
-            print("PROFILE_AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            p=subprocess.run(["docker","inspect","-f","{{json .Mounts}}","beonmeet-chrome-single"],capture_output=True,text=True,timeout=8)
-            assert p.returncode==0
-            mounts=json.loads(p.stdout)
-            m=next(x for x in mounts if x.get("Destination")=="/tmp/chrome-profile")
-            source=Path(m["Source"])
-            print("CHROME_PROFILE_MOUNT",json.dumps({"bind_type":m.get("Type"),"read_write":m.get("RW"),"host_path_under_tmp":str(source).startswith("/tmp/"),"host_path_under_beonmeet":str(source).startswith("/opt/beonmeet/"),"host_source_exists":source.is_dir()}))
-            for item in (source,source/"Default",source/"Default"/"Network",source/"Default"/"Network"/"Cookies",source/"Default"/"Cookies",source/"Local State",source/"Default"/"Preferences"):
-                if item.exists():
-                    st=item.stat()
-                    age_hr=(datetime.datetime.now(datetime.timezone.utc).timestamp()-st.st_mtime)/3600
-                    print("PROFILE_PATH_METADATA",json.dumps({"basename":item.name,"is_directory":item.is_dir(),"size_bytes":st.st_size if item.is_file() else None,"mtime_hours_ago":round(age_hr,2),"mode":oct(stat.S_IMODE(st.st_mode))}))
-            p=subprocess.run(["docker","inspect","-f","{{json .Config.Cmd}}","beonmeet-chrome-single"],capture_output=True,text=True,timeout=8)
-            cmds=json.loads(p.stdout) if p.returncode==0 else []
-            flags=[x.split("=",1)[0] for x in cmds if isinstance(x,str) and x.startswith("--")]
-            print("CHROME_STARTUP_FLAG_NAMES",flags[:40])
-            p=subprocess.run(["docker","inspect","-f","{{json .Config.Env}}","beonmeet-chrome-single"],capture_output=True,text=True,timeout=8)
-            env=json.loads(p.stdout) if p.returncode==0 else []
-            keys=[v.split("=",1)[0] for v in env if "=" in v]
-            print("CHROME_PROFILE_ENV_KEY_PRESENCE",json.dumps({k:k in keys for k in ("CHROME_USER_DATA_DIR","CHROME_PROFILE_DIR","CHROME_URL","GOOGLE_EMAIL","GOOGLE_PASSWORD","CHROME_REMOTE_DEBUGGING_PORT")}))
-            print("PROFILE_METADATA_AUDIT_COMPLETE")
+            import json,subprocess,shlex,re
+            name="beonmeet-chrome-single"
+            p=subprocess.run(["docker","inspect","-f","{{json .Config.Entrypoint}}|{{json .Config.Cmd}}",name],capture_output=True,text=True,timeout=8)
+            if p.returncode!=0:raise RuntimeError("Chrome container unavailable")
+            entry,cmd=p.stdout.strip().split("|",1)
+            e=json.loads(entry) or []
+            c=json.loads(cmd) or []
+            print("CHROME_LAUNCH_EXEC_BASENAMES",[str(x).split("/")[-1] for x in e])
+            print("CHROME_CMD_BASENAMES",[str(x).split("/")[-1] for x in c if x and not str(x).startswith("-")])
+            p=subprocess.run(["docker","exec",name,"ps","-e","-o","args="],capture_output=True,text=True,timeout=10)
+            lines=p.stdout.splitlines()
+            chrome=[x for x in lines if "--remote-debugging-port" in x and ("chrome" in x or "chromium" in x)]
+            dirs=[]
+            for line in chrome[:8]:
+                m=re.search(r"--user-data-dir(?:=|\s+)(\S+)",line)
+                dirs.append({"present":bool(m),"matches_persisted_mount":bool(m and m.group(1).strip("'\"")=="/tmp/chrome-profile")})
+            print("LIVE_CHROME_PROFILE_FLAGS",json.dumps(dirs))
+            entrypaths=[x for x in e+c if isinstance(x,str) and x.startswith("/") and x.endswith((".sh",".py"))]
+            for script in entrypaths:
+                p=subprocess.run(["docker","exec",name,"sh","-c","test -r \"$1\" && cat \"$1\"","-",script],capture_output=True,text=True,timeout=8)
+                if p.returncode:continue
+                lower=p.stdout.lower()
+                print("STARTUP_SCRIPT_PROFILE_BEHAVIOR",json.dumps({"basename":script.rsplit("/",1)[-1],"wipes_user_data_dir":any(x in lower for x in ("rm -rf /tmp/chrome-profile","rm -rf \"$chrome_profile\"","rm -rf \"$user_data_dir\"","rm -rf $chrome_profile")),"uses_mktemp":("mktemp" in lower),"mentions_persisted_profile":("/tmp/chrome-profile" in lower)}))
+            print("CHROME_PROFILE_LAUNCH_PATH_AUDIT_DONE")
             PY
