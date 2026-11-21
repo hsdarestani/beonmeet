@@ -61,7 +61,12 @@ class DiskUploader implements IUploader {
       logger,
       meetingLink,
     );
-    await fs.promises.mkdir(instance.folderPath(), { recursive: true });
+    // The controller (UID 999, shared GID 987) creates MP3, MP4 and
+    // transcript outputs next to the worker's WebM file. The default 0755
+    // mkdir permissions silently break these deliverables and free recordings.
+    // Explicit chmod also repairs preexisting 2755 per-user directories.
+    await fs.promises.mkdir(instance.folderPath(), { recursive: true, mode: 0o2770 });
+    await fs.promises.chmod(instance.folderPath(), 0o2770);
     return instance;
   }
 
