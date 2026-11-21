@@ -39,3 +39,42 @@ jobs:
             echo "WORKER_ERROR_COUNT=$(docker logs --since 60m beonmeet-worker-five 2>&1 | grep -Eci 'Error|Failed|timeout|admission|join' || true)"
             echo "CHROME_ERROR_COUNT=$(docker logs --since 60m beonmeet-chrome-single 2>&1 | grep -Eci 'Error|Failed|timeout|crash' || true)"
             echo "READ_ONLY_AUDIT_DONE"
+
+            python3 - <<'PY'
+            import collections, json, re, subprocess
+            def run(*args):
+                p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=35)
+                return p.stdout
+            for service in ("beonmeet-worker-five","beonmeet-chrome-single"):
+                lines=run("docker","logs","--since","120m",service).splitlines()
+                keys=("join","error","fail","time","admiss","wait","browser","chrome","record","job","meet","start","captcha","sign in","signed")
+                counts=collections.Counter()
+                recent=[]
+                for line in lines:
+                    low=line.lower()
+                    for key in keys:
+                        if key in low:counts[key]+=1
+                    if any(x in low for x in ("error","failed","fail","timeout","join","waiting","admission","accepted","job store","record")):
+                        # Hide URLs, Google Meet codes, emails, identifiers and tokens,
+                        # then retain only short messages needed for triage.
+                        clean=re.sub(r"https?://[^\\s\\\"']+","[URL]",line)
+                        clean=re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}","[EMAIL]",clean)
+                        clean=re.sub(r"\\b[a-z]{3}-[a-z]{4}-[a-z]{3}\\b","[MEET_CODE]",clean,flags=re.I)
+                        clean=re.sub(r'(?i)(token|password|secret|authorization|cookie)[=:]\\s*[^,; }]+',r'\\1=[REDACTED]',clean)
+                        clean=re.sub(r"\\b[A-Za-z0-9_\\-]{24,}\\b","[ID]",clean)
+                        clean=re.sub(r"(?<!\\w)\\d{6,}(?!\\w)","[NUM]",clean)
+                        clean=clean[:240]
+                        recent.append(clean)
+                print("DETAIL_"+service+"_TOTAL_LINES",len(lines))
+                print("DETAIL_"+service+"_KEYWORD_COUNTS",json.dumps(dict(counts),sort_keys=True))
+                print("DETAIL_"+service+"_RECENT_MESSAGES_BEGIN")
+                for line in recent[-24:]:print(line)
+                print("DETAIL_"+service+"_RECENT_MESSAGES_END")
+            for service in ("beonmeet-worker-five","beonmeet-chrome-single"):
+                raw=run("docker","inspect","--format","{{json .Config.Env}}",service)
+                try:
+                    env=json.loads(raw)
+                    keys={e.split("=",1)[0] for e in env if "=" in e}
+                    print("CONFIG_"+service,json.dumps({k:(k in keys) for k in ("GOOGLE_CHROME_CDP_URL","CONTROLLER_RECORDING_STARTED_URL","CONTROLLER_WAITING_FOR_ADMISSION_URL","CONTROLLER_UPLOAD_URL","INTERNAL_SECRET","MAX_CONCURRENT_MEETINGS","CHROME_URL","CHROME_USER_DATA_DIR")}))
+                except Exception:print("CONFIG_"+service+"_INSPECT_ERROR")
+            PY
