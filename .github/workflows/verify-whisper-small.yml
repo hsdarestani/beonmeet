@@ -1,0 +1,57 @@
+name: Preflight BeOnMeet small Whisper model on shared VPS
+
+on:
+  push:
+    branches: [ops/verify-whisper-model-20261121]
+    paths:
+      - .github/workflows/verify-whisper-small.yml
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - name: Prepare small multilingual model without touching meetings or customer media
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 6m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,subprocess,urllib.request
+            from pathlib import Path
+            with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=6) as r:h=json.load(r)
+            assert h.get("ok") and int(h.get("active_delivery_jobs") or 0)==0,"Controller occupied"
+            for port in (9124,9126):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=6) as r:d=json.load(r)
+                assert int((d.get("data") or d).get("runningJobs") or 0)==0,"Live recorder in progress"
+            for name in ("camcam-shared-api-1","camcam-shared-pet-1","camcam-shared-archive-1","camcam-shared-petarchive-1"):
+                assert subprocess.check_output(["docker","inspect","--format","{{.State.Health.Status}}",name],text=True).strip()=="healthy"
+            free=int(next(line.split()[1] for line in Path("/proc/meminfo").read_text().splitlines() if line.startswith("MemAvailable:")))
+            assert free>=1700000,"Insufficient memory headroom for model preparation"
+            print("SMALL_MODEL_PRECHECK_IDLE_AND_MEMORY_PASS")
+            PY
+            test "$(df -Pk /opt/beonmeet | awk 'NR==2 {print $4}')" -ge 3300000
+            mkdir -p data/whisper-models
+            runuser -u beonmeet -- test -w data/whisper-models || chown -R beonmeet:beonmeet data/whisper-models
+            timeout 230 runuser -u beonmeet -- .venv/bin/python - <<'PY'
+            from faster_whisper import WhisperModel
+            print("WHISPER_SMALL_LOADING",flush=True)
+            model=WhisperModel("small",device="cpu",compute_type="int8",
+                cpu_threads=2,num_workers=1,download_root="/opt/beonmeet/data/whisper-models")
+            print("WHISPER_SMALL_MODEL_READY",flush=True)
+            PY
+            echo "WHISPER_SMALL_PYTHON_MODEL_PREPARED"
+            test "$(systemctl is-active beonmeet-controller)" = active
+            for name in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1; do
+              test "$(docker inspect --format '{{.State.Health.Status}}' "$name")" = healthy
+            done
+            echo "MODEL_PREPARATION_CAMCAM_UNCHANGED"
