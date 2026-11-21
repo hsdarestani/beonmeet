@@ -175,3 +175,5 @@ jobs:
             echo LIVE_BEONMEET_LOGIN_READ_ONLY_SMOKE_PASS
 
 # Recovery rollout observation: read-only service and queue snapshot.
+
+# final read-only production health after isolated five-recording QA.
