@@ -26,24 +26,22 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,datetime,subprocess
+            import os,json,subprocess,re
             from pathlib import Path
-            print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            state=json.loads(Path("data/state.json").read_text())
-            pending=state.get("pending_deliveries") or {}
-            print("PENDING_COUNT",len(pending))
-            signatures=("RuntimeError","OSError","FileNotFoundError","MemoryError","Model","model","Whisper","whisper","NotImplementedError","CTranslate2","does not support","No such file","out of memory","RuntimeError","PermissionError","Killed","download","HTTPStatusError","CUDA","Allocation","KeyError","AssertionError","AttributeError","TypeError","ValueError","ConnectionError","traceback","ffmpeg","unknown")
-            for p in list(pending.values())[-4:]:
+            x=json.loads(Path("data/state.json").read_text())
+            a=list((x.get("pending_deliveries") or {}).values())
+            for p in a:
                 if not isinstance(p,dict):continue
-                msg=str(p.get("last_error") or "")
-                last=msg.split("transcript=",1)[1] if "transcript=" in msg else msg
-                found=[x for x in signatures if x.lower() in last.lower()]
-                print("TRANSCRIPT_ERROR_MARKERS",json.dumps({"attempts":int(p.get("attempts") or 0),
-                  "audio_delivered":bool(p.get("audio_delivered")),
-                  "transcript_delivered":bool(p.get("transcript_delivered")),"markers":sorted(set(found))}))
-            logs=subprocess.run(["journalctl","-u","beonmeet-controller","--since","2026-11-21 11:50:00 UTC","--no-pager","-o","cat"],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=25).stdout
-            n=sum("transcription error:" in line for line in logs.splitlines())
-            start=sum("primary transcription failed" in line for line in logs.splitlines())
-            print("TRANSCRIPTION_LOG_SUMMARY",json.dumps({"errors":n,"primary_failed":start}))
-            print("TRANSCRIPT_RECOVERY_ERROR_CLASS_AUDIT_DONE")
+                s=str(p.get("last_error") or "")
+                tr=s.split("transcript=",1)[-1]
+                signatures=("RuntimeError","OSError","FileNotFoundError","MemoryError","Whisper","model","Download","HuggingFace","Connection","HTTP","401","403","429","500","503","Timeout","CTranslate2","int8","CPU","thread","corrupt","allocator","OpenMP","ct2","out of memory","Killed","permission denied","EACCES","not found","missing","unavailable","HTTPSConnectionPool")
+                print("TRANSCRIPT_ERROR_FINGERPRINT",json.dumps({"type_prefix":tr.split("(",1)[0][:90],"markers":[t for t in signatures if t.lower() in tr.lower()],"chars":len(tr),"attempts":p.get("attempts"),"audio_delivered":p.get("audio_delivered")}))
+            modelroot=Path("/opt/beonmeet/data/whisper-models")
+            print("WHISPER_CACHE_EXISTS",modelroot.is_dir())
+            if modelroot.is_dir():
+                print("WHISPER_CACHE_TOPLEVEL_ENTRIES",len(list(modelroot.iterdir())))
+                print("WHISPER_CACHE_TOTAL_MB",round(sum(p.stat().st_size for p in modelroot.rglob("*") if p.is_file())/1048576,1))
+            p=subprocess.run(["systemctl","show","beonmeet-controller","-p","MemoryCurrent","-p","CPUUsageNSec"],capture_output=True,text=True)
+            print("CONTROLLER_RESOURCES",p.stdout.strip().replace("\n"," | "))
+            print("TRANSCRIPT_ERROR_FINGERPRINT_DONE")
             PY
