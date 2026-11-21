@@ -8,7 +8,7 @@ permissions:
 jobs:
   hotfix:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Verify browser-context quality regression
@@ -22,7 +22,7 @@ jobs:
           port: 9011
           username: root
           password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
-          command_timeout: 6m
+          command_timeout: 17m
           script: |
             set -eu
             umask 077
@@ -63,9 +63,9 @@ jobs:
                     with urllib.request.urlopen(f'http://127.0.0.1:{port}/capacity',timeout=6) as r:d=json.load(r)
                     if int((d.get('data') or d).get('runningJobs') or 0)>0:return False
                 return True
-            for i in range(30):
+            for i in range(150):
                 if idle():break
-                if i==29:raise RuntimeError('Recording, queue or delivery active; abort without restart')
+                if i==149:raise RuntimeError('Recording, queue or delivery active; abort without restart')
                 time.sleep(6)
             for name in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
                 assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',name],text=True).strip()=='healthy'
