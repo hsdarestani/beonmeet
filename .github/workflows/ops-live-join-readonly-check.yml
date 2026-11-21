@@ -158,4 +158,18 @@ jobs:
                     if any(q in line.lower() for q in ('authorization','apikey','password','secret','bearer','token=')):line='[REDACTED]'
                     print('RECORD_FLOW_LINE',i+1,line[:450])
             PY
+            python3 - <<'PY'
+            import subprocess,re
+            from pathlib import Path
+            path=subprocess.check_output(['docker','inspect','-f','{{range .Mounts}}{{if eq .Destination "/usr/src/app/dist/bots/GoogleMeetBot.js"}}{{.Source}}{{end}}{{end}}','beonmeet-worker-five'],text=True).strip()
+            lines=Path(path).read_text().splitlines()
+            print('EVALUATE_SIGNATURE',lines[763].strip())
+            print('EVALUATE_ARGS_KEYS',[(i+1,lines[i].strip()) for i in range(1303,1314) if not any(x in lines[i].lower() for x in ('secret','token','password','bearer'))])
+            p=subprocess.run(['docker','logs','--since','25m','beonmeet-worker-five'],text=True,capture_output=True,timeout=10)
+            for pat in ('process is not defined','ReferenceError','page.evaluate','error recording','recording failed','MediaRecorder actual mime type','Waiting for recording duration','recording-start'):
+                hits=[re.sub(r'https?://[^\\s]+','[URL]',x)[:250] for x in (p.stdout+'\\n'+p.stderr).splitlines() if pat.lower() in x.lower()]
+                print('RECORDER_LOG_PHRASE',pat,'COUNT',len(hits))
+                if hits and pat.lower() in ('process is not defined','referenceerror'):print('RECORDER_LOG_SAMPLE',hits[-1])
+            print('CAPTURE_ENV_VALUES',subprocess.run(['docker','exec','beonmeet-worker-five','sh','-c','printf "%s" "${BEONMEET_CAPTURE_QUALITY:-UNSET}"'],text=True,capture_output=True,timeout=6).stdout.strip()[:32])
+            PY
             echo LIVE_BEONMEET_LOGIN_READ_ONLY_SMOKE_PASS
