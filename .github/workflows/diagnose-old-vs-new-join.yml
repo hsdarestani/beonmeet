@@ -16,7 +16,7 @@ jobs:
           host: 143.20.60.195
           port: 9011
           username: root
-          password: \${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
           command_timeout: 5m
           script: |
             set -eu
