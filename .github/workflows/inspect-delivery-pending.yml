@@ -26,23 +26,23 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,subprocess
+            import json,os,subprocess,stat
             from pathlib import Path
-            st=json.loads(Path("data/state.json").read_text())
-            for x in list((st.get("pending_deliveries") or {}).values())[-3:]:
+            state=json.loads(Path("data/state.json").read_text())
+            for x in list((state.get("pending_deliveries") or {}).values())[-5:]:
                 if not isinstance(x,dict):continue
-                raw=str(x.get("file_path") or x.get("source_path") or x.get("raw_path") or "")
-                p=Path(raw) if raw else None
+                v=str(x.get("file_path") or x.get("source_path") or x.get("raw_path") or "")
+                p=Path(v) if v else None
                 if not p or not p.is_file():continue
-                commands=[
-                    ("full_audio_decode",["ffmpeg","-hide_banner","-nostdin","-v","error","-i",str(p),"-vn","-f","null","-"]),
-                    ("full_mp3_null",["ffmpeg","-hide_banner","-nostdin","-v","error","-i",str(p),"-vn","-ac","1","-ar","44100","-c:a","libmp3lame","-b:a","64k","-f","mp3","-y","/dev/null"])]
-                for label,cmd in commands:
-                    try:
-                        r=subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,timeout=25)
-                        phrases=("Invalid data found","Error","failed","No such file","Unknown encoder","Header missing","Invalid argument","Packet corrupt","Could not","Conversion failed","not found","Too many","End of file","Non-monotonous")
-                        print("FULL_PERSISTED_AUDIO_DECODE",label,"exit",r.returncode,"signatures",sorted(set(k for k in phrases if k.lower() in r.stderr.lower())))
-                    except Exception as exc:
-                        print("FULL_PERSISTED_AUDIO_DECODE",label,"exception",type(exc).__name__)
-            print("FULL_MEDIA_DECODE_PROBE_COMPLETE")
+                print("MEDIA_OWNER_UID",p.stat().st_uid,"MEDIA_OWNER_GID",p.stat().st_gid)
+                for label,part in (("recording_root",Path("/recordings")),("source_parent",p.parent)):
+                    st=part.stat()
+                    probe=subprocess.run(["runuser","-u","beonmeet","--","test","-w",str(part)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=6)
+                    print("DIR_PERMISSIONS",label,{"mode":oct(stat.S_IMODE(st.st_mode)),"uid":st.st_uid,"gid":st.st_gid,"controller_can_write":probe.returncode==0})
+                out=p.with_suffix(".mp3")
+                print("DERIVED_MP3_EXISTS",out.exists())
+                if out.exists():
+                    st=out.stat()
+                    print("DERIVED_MP3_META",{"bytes":st.st_size,"mode":oct(stat.S_IMODE(st.st_mode)),"uid":st.st_uid,"gid":st.st_gid})
+            print("PENDING_OUTPUT_DIRECTORY_PERMISSIONS_CHECK_DONE")
             PY
