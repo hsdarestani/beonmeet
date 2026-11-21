@@ -61,3 +61,60 @@ assert 'hours=expires_hours' in MAIN
 assert 'download_url, download_hours = await create_recording_download(' in MAIN
 assert 'hours=download_hours' in MAIN
 print("PREMIUM_RETENTION_72H_TEST_PASS")
+
+
+# A missing file on the controller must never be acknowledged to the recorder
+# unless a verified, persisted delivery receipt matches the exact event/chat/path.
+# Without this guard, the recorder deletes its only WebM copy on a false 200.
+import ast
+import asyncio
+from typing import Any
+
+class HttpError(Exception):
+    def __init__(self, status_code, detail):
+        super().__init__(detail)
+        self.status_code = status_code
+
+async def completed_stub(*args, **kwargs):
+    return {"ok": True, "processed": True}
+
+module = ast.parse(MAIN)
+fn_node = next(n for n in module.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "_process_recording")
+env = {
+    "Any": Any, "Path": Path, "asyncio": asyncio,
+    "state": {"pending_deliveries": {}, "completed_deliveries": {}},
+    "delivery_locks": {},
+    "HTTPException": HttpError,
+    "_process_recording_locked": completed_stub,
+}
+exec(compile(ast.fix_missing_locations(ast.Module(body=[fn_node], type_ignores=[])), "app/main.py", "exec"), env)
+process = env["_process_recording"]
+source = Path("/unmounted-recorder-path/recording-test-missing.webm")
+data = {"userId": "123", "eventId": "evt-1", "filename": source.name}
+
+for case in ("no_receipt", "different_chat", "different_filename", "different_source"):
+    env["state"]["completed_deliveries"] = {}
+    if case != "no_receipt":
+        env["state"]["completed_deliveries"]["evt-1"] = {
+            "chat_id": "456" if case == "different_chat" else "123",
+            "filename": "other.webm" if case == "different_filename" else source.name,
+            "source_path": "/other/source.webm" if case == "different_source" else str(source),
+            "completed_at": "2026-11-21T10:00:00+00:00",
+        }
+    try:
+        asyncio.run(process(data, source))
+    except HttpError as error:
+        assert error.status_code == 404, (case, error)
+    else:
+        raise AssertionError(f"Unverified missing recording must fail closed: {case}")
+
+env["state"]["completed_deliveries"]["evt-1"] = {
+    "chat_id": "123", "filename": source.name, "source_path": str(source),
+    "completed_at": "2026-11-21T10:00:00+00:00",
+}
+assert asyncio.run(process(data, source))["duplicate"] is True
+
+assert "state.setdefault(\"completed_deliveries\", {})[pending_id]" in MAIN
+assert '"completed_deliveries": {}' in MAIN
+assert 'state.setdefault("completed_deliveries", {})' in MAIN
+print("MISSING_RECORDING_MUST_NOT_ACK_SUCCESS_TEST_PASS")
