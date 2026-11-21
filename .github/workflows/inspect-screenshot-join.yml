@@ -1,0 +1,127 @@
+name: Read-only BeOnMeet screenshot incident audit
+
+on:
+  push:
+    branches: [ops/inspect-screenshot-meet-failure-20261121]
+    paths:
+      - .github/workflows/inspect-screenshot-join.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - name: Correlate recent join errors safely without recording or personal data
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 6m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import collections, datetime, hashlib, json, re, subprocess, urllib.request, os
+            from pathlib import Path
+            def run(args, timeout=40):
+                try:
+                    p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=timeout)
+                    return p.stdout
+                except Exception as ex:return "PROCESS_ERROR_"+type(ex).__name__
+            print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
+            print("CONTROLLER_STATE",run(["systemctl","is-active","beonmeet-controller"]).strip())
+            print("CONTROLLER_CODE_IS_NEW","join_already_processing" in Path("app/main.py").read_text())
+            for label,url in (
+                ("controller","http://127.0.0.1:8109/health"),
+                ("worker_five","http://127.0.0.1:9126/capacity"),
+                ("worker_single","http://127.0.0.1:9124/capacity"),
+            ):
+                try:
+                    with urllib.request.urlopen(url,timeout=5) as resp:data=json.load(resp)
+                    data=data.get("data",data)
+                    keys=("ok","active_delivery_jobs","pending_delivery_jobs","free_queue","premium_queue","healthy_free_workers","runningJobs","maxConcurrentJobs","availableSlots")
+                    print("LIVE_STATUS",label,json.dumps({k:data[k] for k in keys if k in data},sort_keys=True))
+                except Exception as e:print("LIVE_STATUS_ERROR",label,type(e).__name__)
+            for name in ("beonmeet-worker-five","beonmeet-worker-single","beonmeet-chrome-single"):
+                try:
+                    state=json.loads(run(["docker","inspect","--format","{{json .State}}",name]))
+                    print("CONTAINER_STATE",name,json.dumps({k:state.get(k) for k in ("Status","Running","Restarting","OOMKilled","ExitCode")}))
+                except Exception:print("CONTAINER_STATE",name,"unavailable")
+            # Include just 4-letter known meeting-code match, never reveal URL itself.
+            meet_key="krq-dnch-odn"
+            try:
+                st=json.loads(Path("data/state.json").read_text())
+                reqs=st.get("requests") or {}
+                matching=sum(meet_key in k for k in reqs.keys())
+                launch=[]
+                for v in (st.get("launched_events") or {}).values():
+                    if not isinstance(v,dict) or meet_key not in str(v.get("meet_url") or ""):continue
+                    launch.append({"status":v.get("status"),"launched_at":v.get("launched_at"),"waiting":bool(v.get("waiting_since")),"recording":bool(v.get("recording_started_at"))})
+                print("SCREENSHOT_MEET_MATCHED_REQUESTS",matching)
+                print("SCREENSHOT_MEET_LAUNCHES",json.dumps(launch[-12:]))
+            except Exception as e:print("STATE_SUMMARY_ERROR",type(e).__name__)
+            phrases=[
+              ("job_accepted","Meeting job accepted"),("google_accepted","Google Meet job accepted"),
+              ("launch_browser","Launching browser"),("prejoin_wait","Waiting for Google Meet pre-join controls"),
+              ("prejoin_failed","Google Meet pre-join controls are not ready yet"),
+              ("guest_detected","Guest pre-join detected"),("ask_join_click",'Success clicked using "Ask to join"'),
+              ("join_now_click",'Success clicked using "Join now"'),
+              ("join_request_sent","BeOnMeet admission callback"),("host_admission_wait","waiting for the host to admit"),
+              ("host_join_timeout","timed out"),("retry_attempt","Retry count:"),
+              ("recording_begin","Begin recording"),("recording_started","Media Recorder actual mime type"),
+              ("recording_upload","Recording delivered to BeOnMeet controller"),
+              ("job_failed","Meeting job permanently failed"),
+              ("join_error","Closing the browser on error"),
+              ("slot_released","Meeting slot released"),
+              ("google_denied","You can't join this call"),("login","sign in"),
+              ("cdp_error","ECONNREFUSED"),("target_closed","Target closed"),
+              ("page_crash","Page crashed"),
+            ]
+            for name in ("beonmeet-worker-five","beonmeet-worker-single"):
+                raw=run(["docker","logs","--since","2026-11-21T10:55:00Z",name])
+                ids={};timeline=[];counts=collections.Counter()
+                for line in raw.splitlines():
+                    if not line.startswith("[2026-11-21T"):continue
+                    stamp=line[1:24]
+                    parts=line.split("[correlationId: ",1)
+                    corr=parts[1].split("]",1)[0] if len(parts)>1 else "shared"
+                    if corr not in ids:ids[corr]="job"+str(len(ids)+1)
+                    msg=line.split("] ",4)[-1].split(" {",1)[0]
+                    hit=[key for key,phrase in phrases if phrase.lower() in msg.lower()]
+                    for h in hit:counts[h]+=1
+                    if hit:timeline.append([stamp,ids[corr],hit])
+                print("WORKER_SINCE_RELEASE",name,"lines",len(raw.splitlines()),"jobs",len(ids),json.dumps(dict(counts),sort_keys=True))
+                print("WORKER_TIMELINE",name,json.dumps(timeline[-100:]))
+            controller=run(["journalctl","-u","beonmeet-controller","--since","2026-11-21 10:55:00 UTC","--no-pager","-o","short-iso"])
+            endpoints=collections.Counter();recent=[]
+            for line in controller.splitlines():
+                if "HTTP/1.1" in line:
+                    match=re.search(r'"(POST|GET) (/[a-z0-9/_-]+) HTTP/1.1" ([0-9]{3})',line,re.I)
+                    if match:
+                        path,status=match.group(2),match.group(3)
+                        if path.startswith("/internal/"):
+                            endpoints[path+":"+status]+=1
+                            tm=re.search(r"2026-11-21T[0-9:]+",line)
+                            recent.append([(tm.group(0) if tm else "time_missing"),path,status])
+            print("CONTROLLER_CALLBACK_COUNTS",json.dumps(dict(endpoints),sort_keys=True))
+            print("CONTROLLER_CALLBACK_LAST",json.dumps(recent[-25:]))
+            try:
+                raw=run(["docker","exec","beonmeet-chrome-single","sh","-c","curl -fsS --max-time 5 http://127.0.0.1:9222/json/list"])
+                tabs=json.loads(raw)
+                cats=collections.Counter()
+                for tab in tabs:
+                    url=str(tab.get("url",""))
+                    if "meet.google.com" in url:cats["meet"]+=1
+                    elif "accounts.google.com" in url:cats["google_account"]+=1
+                    elif "chrome://" in url:cats["chrome"]+=1
+                    else:cats["other"]+=1
+                print("CHROME_TABS",json.dumps(dict(cats),sort_keys=True))
+            except Exception as exc:print("CHROME_TABS_ERROR",type(exc).__name__)
+            print("SCREENSHOT_JOIN_AUDIT_FINISHED")
+            PY
