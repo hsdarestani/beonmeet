@@ -1,0 +1,73 @@
+name: One-time fix BeOnMeet recording directory ownership
+
+on:
+  push:
+    branches: [ops/fix-recording-directory-ownership-20261121]
+    paths:
+      - .github/workflows/repair-recording-directory-once.yml
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Safely correct only the BeOnMeet tmpfs directory owner
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 5m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST; exit 1 ;; esac
+            test "$(id -u)" = 0
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 60 9
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json, pathlib, subprocess, urllib.request
+            target=pathlib.Path("/dev/shm/beonmeet")
+            assert target.is_dir() and not target.is_symlink(), "Unexpected recording directory"
+            owner=subprocess.check_output(["systemctl","show","-p","User","--value","beonmeet-controller"],text=True).strip()
+            assert owner in ("", "root"), "Controller is nonroot: need coordinated group permissions"
+            with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=8) as res: health=json.load(res)
+            assert health.get("ok") is True, "Controller not healthy"
+            for key in ("free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs"):
+                assert int(health.get(key) or 0)==0, "Controller not idle: "+key
+            for port in (9124,9126):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=8) as res:
+                    capacity=json.load(res)
+                assert int((capacity.get("data") or capacity).get("runningJobs") or 0)==0, "Recorder busy"
+            for name in ("beonmeet-worker-five","beonmeet-worker-single"):
+                container=json.loads(subprocess.check_output(["docker","inspect",name],text=True))[0]
+                mounts=[m for m in container.get("Mounts") or [] if m.get("Destination")=="/recordings"]
+                assert len(mounts)==1 and mounts[0].get("Source")=="/dev/shm/beonmeet" and mounts[0].get("RW"), "Unexpected recordings mount"
+                assert container.get("State",{}).get("Running"), "Recorder not running"
+                uid=subprocess.check_output(["docker","exec",name,"id","-u"],text=True).strip()
+                assert uid=="1001", "Unexpected recorder uid"
+            for name in ("camcam-shared-api-1","camcam-shared-pet-1","camcam-shared-archive-1","camcam-shared-petarchive-1"):
+                status=subprocess.check_output(["docker","inspect","--format","{{.State.Health.Status}}",name],text=True).strip()
+                assert status=="healthy", "Neighbor service unhealthy: "+name
+            st=target.stat()
+            assert (st.st_uid,st.st_gid) in ((0,0),(1001,1001)), "Unexpected preexisting recording owner"
+            assert st.st_mode & 0o777==0o755, "Unexpected recording mode; inspect manually"
+            print("PRECHECK_PASS_IDLE_SHARED_HOST_SAFE")
+            print("ORIGINAL_DIRECTORY_OWNER_UID",st.st_uid,"GID",st.st_gid,"MODE",oct(st.st_mode & 0o777))
+            PY
+            chown 1001:1001 /dev/shm/beonmeet
+            for name in beonmeet-worker-five beonmeet-worker-single; do
+              docker exec "$name" sh -lc 'test -w /recordings; d=$(mktemp -d /recordings/.beonmeet-write-probe-XXXXXX); test -d "$d"; rmdir "$d"'
+              echo "RECORDER_DIRECTORY_WRITE_TEST_PASS:$name"
+            done
+            stat -c 'FINAL_RECORDING_DIR_OWNER=%u:%g MODE=%a' /dev/shm/beonmeet
+            curl -fsS --max-time 6 http://127.0.0.1:8109/health >/dev/null
+            for name in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1; do
+              test "$(docker inspect --format '{{.State.Health.Status}}' "$name")" = healthy
+            done
+            echo RECORDING_DIRECTORY_OWNERSHIP_REPAIRED_NO_RESTART
