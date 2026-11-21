@@ -109,6 +109,17 @@ jobs:
               rm -rf "$stage"
             }
             trap rollback EXIT
+            python3 - <<'PY'
+            import json,urllib.request
+            with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=5) as r:h=json.load(r)
+            assert h.get("ok")
+            for key in ("free_queue","premium_queue","active_delivery_jobs"):
+                assert int(h.get(key) or 0)==0,"Controller became busy"
+            for p in (9124,9126):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(p)+"/capacity",timeout=5) as r:d=json.load(r)
+                assert int((d.get("data") or d).get("runningJobs") or 0)==0,"Recorder became busy"
+            print("IMMEDIATE_PRE_RESTART_IDLE_RECHECK_PASS")
+            PY
             changed=1
             install -m 644 "$stage/main.py" app/main.py
             install -m 644 "$stage/i18n.py" app/i18n.py
