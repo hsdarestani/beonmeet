@@ -49,7 +49,7 @@ jobs:
                     elif item.is_file() and mode in (0o600,0o700):
                         changed.append((str(item),mode,0o644 if mode==0o600 else 0o755))
             assert 0<len(changed)<50000,"Unexpected count of restricted site-package files"
-            backup=Path("/opt/beonmeet/.whisper-permissions-backup-20261121-v3.json")
+            backup=Path("/opt/beonmeet/.whisper-permissions-backup-20261121-v4.json")
             assert not backup.exists(),"Prior permissions repair already ran"
             backup.write_text(json.dumps({"modified_at":datetime.now(timezone.utc).isoformat(),
                 "entries":[[str(Path(p).relative_to(root)),old] for p,old,_ in changed]}))
@@ -70,6 +70,14 @@ jobs:
                     redacted=re.sub(r"/[^ ,:\\x27\\x22)]+","[PATH]",last)
                     print("SERVICE_IMPORT_FAILURE_CLASS",last.split(":",1)[0][:85])
                     print("SERVICE_IMPORT_FAILURE_SUMMARY",redacted[:230])
+                    if ": cannot open shared object file:" in last:
+                        libpath=last.split(": ",1)[1].split(": cannot open",1)[0]
+                        from pathlib import Path
+                        lib=Path(libpath)
+                        print("LIBRARY_DENIED_NAME",lib.name[:120])
+                        print("LIBRARY_DENIED_EXISTS",lib.exists())
+                        if lib.exists():
+                            print("LIBRARY_DENIED_MODE",oct(lib.stat().st_mode & 0o777),"UID",lib.stat().st_uid)
                 assert user.returncode==0, "Nonroot Whisper import failed, reverting"
                 assert "SERVICE_WHISPER_IMPORT_PASS" in user.stdout
                 print("NONROOT_SERVICE_IMPORTS_VERIFIED")
