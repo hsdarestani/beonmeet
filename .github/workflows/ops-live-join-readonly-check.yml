@@ -127,4 +127,23 @@ jobs:
                     print("WORKER_DURATION_SETTING",vals[0] if vals else prefix+'<unset>')
             print("JOIN_TRIAGE_READ_ONLY_COMPLETE")
             PY
+            python3 - <<'PY'
+            from pathlib import Path
+            import subprocess
+            container='beonmeet-worker-five'
+            path=subprocess.check_output(['docker','inspect','-f','{{range .Mounts}}{{if eq .Destination "/usr/src/app/dist/bots/GoogleMeetBot.js"}}{{.Source}}{{end}}{{end}}',container],text=True).strip()
+            lines=Path(path).read_text().splitlines()
+            print('JOIN_COMPILED_FILE_LINES',len(lines))
+            patterns=['External browser page closed in join finally','Begin recording...','finally {','Closing the browser on error','this.page.close','await this.page.close','recordMeeting','isJoining','startRecording']
+            hits=[(i,p) for i,l in enumerate(lines) for p in patterns if p in l]
+            print('JOIN_COMPILED_HITS',[(i+1,p) for i,p in hits][-60:])
+            anchors=[i for i,p in hits if p in ('External browser page closed in join finally','Begin recording...')]
+            selected=set()
+            for i in anchors:
+                selected.update(range(max(0,i-105),min(len(lines),i+120)))
+            for i in sorted(selected):
+                ln=lines[i]
+                if any(key in ln.lower() for key in ('authorization','apikey','password','secret','bearer','token=')):ln='[REDACTED]'
+                print('JOIN_COMPILED_CODE',i+1,ln[:360])
+            PY
             echo LIVE_BEONMEET_LOGIN_READ_ONLY_SMOKE_PASS
