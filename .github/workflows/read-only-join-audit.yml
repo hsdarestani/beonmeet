@@ -26,37 +26,18 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import os,json,datetime,subprocess,collections,urllib.request,hashlib
-            from pathlib import Path
-            now=datetime.datetime.now(datetime.timezone.utc)
-            print("AUDIT_UTC",now.isoformat())
-            def run(a):
-                p=subprocess.run(a,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=25)
-                return p.stdout
-            d=json.loads(Path("data/state.json").read_text())
-            vals=[]
-            for key,v in d.get("launched_events",{}).items():
-                if not isinstance(v,dict):continue
-                try:age=int((now-datetime.datetime.fromisoformat(v.get("launched_at"))).total_seconds()/60)
-                except Exception:age=-1
-                vals.append({"age_minutes":age,"status":v.get("status"),"pool":v.get("pool"),"chat_hash":hashlib.sha256(str(v.get("chat_id","")).encode()).hexdigest()[:5],"meet_hash":hashlib.sha256(str(v.get("meet_url","")).encode()).hexdigest()[:5]})
-            print("LAUNCHED_ANONYMIZED",json.dumps(sorted(vals,key=lambda x:x["age_minutes"])[:12]))
-            for p in (9126,9124):
-                with urllib.request.urlopen("http://127.0.0.1:"+str(p)+"/capacity",timeout=5) as f:x=json.load(f)
-                print("WORKER_CAPACITY",p,json.dumps(x.get("data",x)))
-            print("HOST_MEMORY",run(["free","-m"]).splitlines()[1].split()[1:5])
-            print("HOST_DISK",run(["df","-h","/dev/shm"]).splitlines()[-1].split()[1:5])
-            print("DOCKER_RESOURCE_STATUS",run(["docker","stats","--no-stream","--format","{{.Name}} {{.CPUPerc}} {{.MemUsage}}","beonmeet-worker-five","beonmeet-chrome-single"]).strip().splitlines())
-            raw=run(["docker","logs","--since","2026-11-21T10:43:00Z","beonmeet-worker-five"])
-            types=("Meeting job permanently failed","Retry count","Attempt to end meeting","Recording upload result","Error executing task","Failed to load resource","Google Meet pre-join controls","Browser","page closed","Target closed","meeting job finished","Meeting job accepted")
-            events=[]
-            for line in raw.splitlines():
-                if not line.startswith("[2026-11-21T"):continue
-                at=line[1:24]
-                m=line.split("] ",4)[-1].split(" {",1)[0]
-                if any(k.lower() in m.lower() for k in types):
-                    if len(m)>130 or "@" in m or "http" in m:m="[REDACTED]"
-                    events.append([at,m])
-            print("LATER_WORKER_EVENTS",json.dumps(events[-55:]))
-            print("POST_JOIN_CAPACITY_AUDIT_DONE")
+            import subprocess
+            js="/usr/src/app/dist/bots/GoogleMeetBot.js"
+            source=subprocess.check_output(["docker","exec","beonmeet-worker-five","cat",js],timeout=20).decode()
+            print("COMPILED_JS_BYTES",len(source))
+            needles=["Success clicked using", "notifyBeOnMeetWaitingForAdmission", "WAITING_FOR_HOST_TO_ADMIT_BOT", "Google Meet pre-join controls are not ready yet", "Join now", "Ask to join"]
+            for word in needles:
+                pos=source.find(word)
+                print("NEEDLE",word,"COUNT",source.count(word),"POS",pos)
+                if pos>=0:
+                    snippet=source[max(0,pos-560):pos+460]
+                    print("STATIC_SOURCE_CONTEXT_START",word)
+                    print(snippet)
+                    print("STATIC_SOURCE_CONTEXT_END")
+            print("COMPILED_RECORDER_STATIC_INSPECTION_PASS")
             PY
