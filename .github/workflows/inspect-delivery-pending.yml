@@ -26,29 +26,38 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import subprocess
-            p=subprocess.run(["docker","exec","beonmeet-worker-five","cat","/usr/src/app/dist/bots/GoogleMeetBot.js"],capture_output=True,text=True,timeout=22)
-            assert p.returncode==0
-            s=p.stdout
-            markers=[
-             ("prejoin_click","Success clicked using"),
-             ("lobby_helper","const notifyBeOnMeetWaitingForAdmission"),
-             ("admission_notice","if (beOnMeetAskedToJoin)"),
-             ("waiting_loop","let waitTimeout;"),
-             ("unable_to_join","Meeting join failed"),
-             ("cancel_wait","waiting for the host to admit"),
-             ("prejoin_wait","Waiting for Google Meet pre-join controls"),
-             ("join_true","hasJoined"),
-             ("is_in_meeting","isInMeeting")
-            ]
-            for name,needle in markers:
-                i=s.find(needle)
-                print("COMPILED_JOIN_MARKER",name,i)
-                if i>=0:
-                    left=260 if name not in ("lobby_helper","waiting_loop","prejoin_click") else 1200
-                    right=1500 if name not in ("lobby_helper","waiting_loop","prejoin_click") else 3100
-                    print("SOURCE_BEGIN",name)
-                    print(s[max(0,i-left):i+right])
-                    print("SOURCE_END",name)
-            print("COMPILED_JOIN_LOGIC_INSPECTION_COMPLETE")
+            import os,subprocess,json,urllib.request,datetime,re
+            from pathlib import Path
+            lock=Path("/var/lock/pars-vds-bot-deploy.lock")
+            print("LOCK_DIAG_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
+            st=lock.stat()
+            print("LOCK_FILE_INODE",st.st_ino)
+            owners=[]
+            for proc in Path("/proc").iterdir():
+                if not proc.name.isdecimal():continue
+                fd_dir=proc/"fd"
+                try:
+                    descriptors=fd_dir.iterdir()
+                except (OSError,PermissionError):continue
+                for fd in descriptors:
+                    try:
+                        target=fd.resolve(strict=False)
+                        if str(target)==str(lock.resolve()):
+                            com=(proc/"comm").read_text().strip()
+                            status=(proc/"status").read_text()
+                            ppid=re.search(r"PPid:\s*(\d+)",status)
+                            owners.append({"pid":int(proc.name),"ppid":int(ppid.group(1)) if ppid else -1,"comm":com,"fd":fd.name})
+                    except (OSError,PermissionError):continue
+            print("LOCK_OPEN_PROCESS_DESCRIPTORS",json.dumps(owners[:60]))
+            for line in Path("/proc/locks").read_text().splitlines():
+                if str(st.st_ino) in line:
+                    print("KERNEL_LOCK_SUMMARY",line[:140])
+            p=subprocess.run(["docker","ps","-a","--format","{{.Names}}|{{.Status}}"],capture_output=True,text=True,timeout=12)
+            print("QA_CONTAINERS",[x for x in p.stdout.splitlines() if "beonmeet-five-qa" in x])
+            for port in (9124,9126):
+                try:
+                    with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=5) as r:x=json.load(r)
+                    print("WORKER_RUNNING",port,int((x.get("data") or x).get("runningJobs") or 0))
+                except Exception as e:print("WORKER_STATUS_ERROR",port,type(e).__name__)
+            print("LOCK_OWNER_READONLY_AUDIT_DONE")
             PY
