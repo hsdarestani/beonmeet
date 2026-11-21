@@ -36,4 +36,14 @@ jobs:
               docker inspect --format '{{range .Mounts}}mount_type={{.Type}} target={{.Destination}} readwrite={{.RW}} source_type=host_bind{{println}}{{end}}' "$name" || true
               docker exec "$name" sh -c 'id; stat -c "recordings_mode=%a owner=%u group=%g type=%F" /recordings; test -w /recordings && echo writable=yes || echo writable=no' || true
             done
+            echo "CONTROLLER_USER=$(systemctl show -p User --value beonmeet-controller)"
+            echo "CONTROLLER_GROUP=$(systemctl show -p Group --value beonmeet-controller)"
+            controller_user=$(systemctl show -p User --value beonmeet-controller)
+            if [ -n "$controller_user" ]; then
+              echo "CONTROLLER_ID:"
+              id "$controller_user"
+              if runuser -u "$controller_user" -- test -w /dev/shm/beonmeet; then echo "CONTROLLER_VOLUME_WRITE=yes"; else echo "CONTROLLER_VOLUME_WRITE=no"; fi
+            fi
+            echo "SETFACL_AVAILABLE=$(command -v setfacl || echo no)"
+            echo "GETFACL_AVAILABLE=$(command -v getfacl || echo no)"
             echo "PERMISSIONS_AUDIT_FINISHED"
