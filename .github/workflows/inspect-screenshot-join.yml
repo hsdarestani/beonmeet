@@ -26,59 +26,48 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import subprocess,datetime,json,urllib.request
+            import json,subprocess,urllib.request,datetime
             print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
             for port in (9124,9126):
-                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=5) as res:d=json.load(res)
-                print("RUNNING_JOBS",port,(d.get("data",d)).get("runningJobs"))
-            js=r'''
-            (async()=>{
-              const raw=process.env.GOOGLE_CHROME_CDP_URL;
-              if(!raw){console.log("CDP_ENV_MISSING");return;}
-              let url;
-              try{url=new URL(raw);}catch{console.log("CDP_URL_PARSE_FAILED");return;}
-              const host=url.hostname;
-              console.log("CDP_SCHEME",url.protocol);
-              console.log("CDP_HOST_KIND",host==="localhost"||host.startsWith("127.")?"localhost":(host.includes("docker")||host.includes("chrome")?"container": "other"));
-              console.log("CDP_HOST_PORT",url.port||"default");
-              let wsUrl;
-              try{
-                const req=new AbortController();
-                const timeout=setTimeout(()=>req.abort(),7000);
-                const response=await fetch(raw.replace(/\/$/,"")+"/json/version",{signal:req.signal});
-                clearTimeout(timeout);
-                console.log("CDP_HTTP_STATUS",response.status);
-                const value=await response.json();
-                wsUrl=value.webSocketDebuggerUrl;
-                console.log("CDP_BROWSER_PRODUCT",String(value.Browser||"").split("/")[0]);
-                if(wsUrl){
-                  const ws=new URL(wsUrl);
-                  console.log("CDP_WS_HOST_EQUALS_HTTP",ws.hostname===url.hostname);
-                  console.log("CDP_WS_PORT_EQUALS_HTTP",ws.port===url.port);
-                }else console.log("CDP_WS_URL_MISSING");
-              }catch(e){console.log("CDP_FETCH_ERROR_CLASS",e.name);return;}
-              const wsClass=typeof WebSocket;
-              console.log("WEBSOCKET_GLOBAL_KIND",wsClass);
-              if(wsUrl&&wsClass==="function"){
-                await new Promise(resolve=>{
-                  let done=false;
-                  const finish=(msg)=>{if(done)return;done=true;console.log("CDP_WS_HANDSHAKE",msg);resolve()};
-                  const timer=setTimeout(()=>{try{sock.close()}catch{};finish("timeout")},7000);
-                  let sock;
-                  try{
-                    sock=new WebSocket(wsUrl);
-                    sock.onopen=()=>{clearTimeout(timer);try{sock.close()}catch{};finish("open")};
-                    sock.onerror=()=>{clearTimeout(timer);finish("error")};
-                    sock.onclose=()=>{clearTimeout(timer);finish("closed")};
-                  }catch(e){clearTimeout(timer);finish("exception_"+e.name)}
-                });
-              }
-            })().catch(e=>console.log("DIAGNOSTIC_JS_ERROR_CLASS",e.name));
-            '''
-            p=subprocess.run(["docker","exec","beonmeet-worker-five","node","-e",js],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=32)
-            print("WORKER_CDP_PROBE_EXIT",p.returncode)
-            for line in p.stdout.splitlines():
-                if any(line.startswith(k) for k in ("CDP_","WEBSOCKET_","DIAGNOSTIC_")):
-                    print(line[:150])
-            print("WORKER_CDP_NETWORK_AUDIT_DONE")
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=6) as res:d=json.load(res)
+                n=int((d.get("data",d)).get("runningJobs") or 0)
+                print("RUNNING_JOBS",port,n)
+                assert n==0,"Skip browser test: customer work running"
+            js=r"""
+            (async function(){
+             let phase="module";
+             try{
+               const m=require('playwright-extra');
+               const chromium=m.chromium;
+               const raw=process.env.GOOGLE_CHROME_CDP_URL;
+               if(!raw)throw Error("CDP_URL_MISSING");
+               phase="cdp_connect";
+               console.log("BROWSER_STAGE",phase,"begin");
+               const browser=await chromium.connectOverCDP(raw,{timeout:12000});
+               console.log("BROWSER_STAGE",phase,"success");
+               phase="context";
+               const all=browser.contexts();
+               const ctx=all[0] ?? await browser.newContext();
+               console.log("BROWSER_STAGE",phase,"success","existing_contexts",all.length);
+               ctx.setDefaultTimeout(9000);
+               phase="new_page";
+               const page=await ctx.newPage();
+               console.log("BROWSER_STAGE",phase,"success");
+               phase="close_page";
+               await page.close({timeout:9000});
+               console.log("BROWSER_STAGE",phase,"success");
+               console.log("BROWSER_PROBE_RESULT","SUCCESS");
+             }catch(e){
+               const msg=String(e?.message||"");
+               const markers=["Timeout","Protocol error","Target closed","ECONNREFUSED","ETIMEDOUT","WebSocket","Browser closed","Connection closed","Failed to launch","ERR_CONNECTION_RESET"];
+               console.log("BROWSER_PROBE_RESULT","FAIL","phase",phase,"error_class",e?.name||"Unknown","markers",JSON.stringify(markers.filter(t=>msg.includes(t))));
+             }
+             process.exit(0);
+            })();
+            """
+            p=subprocess.run(["docker","exec","beonmeet-worker-five","node","-e",js],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=39)
+            print("NODE_DIAGNOSTIC_EXIT",p.returncode)
+            for l in p.stdout.splitlines():
+                if l.startswith("BROWSER_"):print(l[:400])
+            print("SAFE_CDP_PLAYWRIGHT_TEST_COMPLETE")
             PY
