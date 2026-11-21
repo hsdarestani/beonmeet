@@ -1,0 +1,54 @@
+name: Inspect browser login gateway prerequisites
+on:
+  push:
+    branches: [ops/secure-chrome-reauth-20261121]
+    paths: [.github/workflows/inspect-login-gateway.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check TLS gateway and browser UI loopback
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 3m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import urllib.request,subprocess,json,re
+            from pathlib import Path
+            for path in ("/etc/nginx/sites-enabled/shared-vps-https-beonmeet.smarbiz.sbs","/etc/nginx/sites-available/shared-vps-https-beonmeet.smarbiz.sbs"):
+                p=Path(path)
+                if not p.is_file():continue
+                data=p.read_text()
+                # Do not emit credentials, request headers or certificate keys.
+                lines=[]
+                for line in data.splitlines():
+                    l=line.strip()
+                    if l.startswith(("server","listen ","location ","proxy_pass ","include ","ssl_certificate ","auth_basic ","root ","access_log ")):
+                        if l.startswith(("ssl_certificate ","auth_basic ","access_log ")):
+                            l=l.split()[0]+" [REDACTED]"
+                        lines.append(l[:160])
+                print("HTTPS_CONF_FOUND",p.name)
+                print("HTTPS_DIRECTIVE_SHAPE",json.dumps(lines[:75]))
+                print("HTTPS_BRACES",data.count("{"),data.count("}"))
+                break
+            for url in ("http://127.0.0.1:6081/vnc.html","http://127.0.0.1:6081/"):
+                try:
+                    with urllib.request.urlopen(url,timeout=5) as r:
+                        print("VNC_LOOPBACK_STATUS",r.status,r.headers.get("Content-Type",""))
+                except Exception as e:print("VNC_LOOPBACK_ERROR",type(e).__name__)
+            p=subprocess.run(["sh","-c","command -v openssl; command -v systemd-run; command -v nginx; command -v htpasswd || true"],capture_output=True,text=True,timeout=7)
+            print("AVAILABLE_GATEWAY_PROGRAMS",[Path(x).name for x in p.stdout.splitlines()])
+            req=json.loads(Path("/opt/beonmeet/data/state.json").read_text()).get("requests",{})
+            hits=[v for k,v in req.items() if "cru-ggpe-nwi" in k and isinstance(v,dict)]
+            print("TARGET_TEST_TELEGRAM_CHAT_AVAILABLE",any(str(x.get("chat_id") or "") for x in hits))
+            print("TELEGRAM_TOKEN_ENV_DEFINED",any(line.startswith("TELEGRAM_BOT_TOKEN=") for line in Path(".env").read_text().splitlines()))
+            print("LOGIN_GATEWAY_PREREQ_AUDIT_DONE")
+            PY
