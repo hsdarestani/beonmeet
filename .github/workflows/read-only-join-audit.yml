@@ -26,55 +26,14 @@ jobs:
             set -eu
             cd /opt/beonmeet
             echo "AUDIT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "CONTROLLER_SERVICE=$(systemctl is-active beonmeet-controller)"
-            echo "LIVE_SOURCE_CHECKSUM=$(sha256sum app/main.py | cut -c1-16)"
-            for name in beonmeet-worker-five beonmeet-worker-single beonmeet-chrome-single; do
-              echo "CONTAINER_$name=$(docker inspect --format '{{.State.Status}}' "$name" 2>/dev/null || echo missing)"
-              echo "OOM_$name=$(docker inspect --format '{{.State.OOMKilled}}' "$name" 2>/dev/null || echo unknown)"
+            echo "HOST_RECORDING_DIR:"
+            stat -c 'mode=%a owner=%u group=%g type=%F' /dev/shm/beonmeet || true
+            echo "HOST_SHM_CAPACITY:"
+            df -h /dev/shm | tail -n 1
+            for name in beonmeet-worker-five beonmeet-worker-single; do
+              echo "WORKER=$name"
+              docker inspect --format 'configured_user={{.Config.User}}' "$name" || true
+              docker inspect --format '{{range .Mounts}}mount_type={{.Type}} target={{.Destination}} readwrite={{.RW}} source_type=host_bind{{println}}{{end}}' "$name" || true
+              docker exec "$name" sh -c 'id; stat -c "recordings_mode=%a owner=%u group=%g type=%F" /recordings; test -w /recordings && echo writable=yes || echo writable=no' || true
             done
-            for target in http://127.0.0.1:8109/health http://127.0.0.1:9126/capacity; do
-              curl --silent --show-error --max-time 6 --output /dev/null --write-out 'ENDPOINT_STATUS=%{http_code}\n' "$target" || true
-            done
-            echo "CONTROLLER_ERROR_COUNT=$(journalctl -u beonmeet-controller --since '60 minutes ago' --no-pager -o cat | grep -Eci 'meeting dispatch error|meeting dispatch rejected|calendar loop error|telegram loop error|queue loop error' || true)"
-            echo "WORKER_ERROR_COUNT=$(docker logs --since 60m beonmeet-worker-five 2>&1 | grep -Eci 'Error|Failed|timeout|admission|join' || true)"
-            echo "CHROME_ERROR_COUNT=$(docker logs --since 60m beonmeet-chrome-single 2>&1 | grep -Eci 'Error|Failed|timeout|crash' || true)"
-            echo "READ_ONLY_AUDIT_DONE"
-
-            python3 - <<'PY'
-            import collections, json, re, subprocess
-            def run(*args):
-                p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=35)
-                return p.stdout
-            for service in ("beonmeet-worker-five","beonmeet-chrome-single"):
-                lines=run("docker","logs","--since","120m",service).splitlines()
-                keys=("join","error","fail","time","admiss","wait","browser","chrome","record","job","meet","start","captcha","sign in","signed")
-                counts=collections.Counter()
-                recent=[]
-                for line in lines:
-                    low=line.lower()
-                    for key in keys:
-                        if key in low:counts[key]+=1
-                    if any(x in low for x in ("error","failed","fail","timeout","join","waiting","admission","accepted","job store","record")):
-                        # Hide URLs, Google Meet codes, emails, identifiers and tokens,
-                        # then retain only short messages needed for triage.
-                        clean=re.sub(r"https?://[^\\s\\\"']+","[URL]",line)
-                        clean=re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}","[EMAIL]",clean)
-                        clean=re.sub(r"\\b[a-z]{3}-[a-z]{4}-[a-z]{3}\\b","[MEET_CODE]",clean,flags=re.I)
-                        clean=re.sub(r'(?i)(token|password|secret|authorization|cookie)[=:]\\s*[^,; }]+',r'\\1=[REDACTED]',clean)
-                        clean=re.sub(r"\\b[A-Za-z0-9_\\-]{24,}\\b","[ID]",clean)
-                        clean=re.sub(r"(?<!\\w)\\d{6,}(?!\\w)","[NUM]",clean)
-                        clean=clean[:240]
-                        recent.append(clean)
-                print("DETAIL_"+service+"_TOTAL_LINES",len(lines))
-                print("DETAIL_"+service+"_KEYWORD_COUNTS",json.dumps(dict(counts),sort_keys=True))
-                print("DETAIL_"+service+"_RECENT_MESSAGES_BEGIN")
-                for line in recent[-24:]:print(line)
-                print("DETAIL_"+service+"_RECENT_MESSAGES_END")
-            for service in ("beonmeet-worker-five","beonmeet-chrome-single"):
-                raw=run("docker","inspect","--format","{{json .Config.Env}}",service)
-                try:
-                    env=json.loads(raw)
-                    keys={e.split("=",1)[0] for e in env if "=" in e}
-                    print("CONFIG_"+service,json.dumps({k:(k in keys) for k in ("GOOGLE_CHROME_CDP_URL","CONTROLLER_RECORDING_STARTED_URL","CONTROLLER_WAITING_FOR_ADMISSION_URL","CONTROLLER_UPLOAD_URL","INTERNAL_SECRET","MAX_CONCURRENT_MEETINGS","CHROME_URL","CHROME_USER_DATA_DIR")}))
-                except Exception:print("CONFIG_"+service+"_INSPECT_ERROR")
-            PY
+            echo "PERMISSIONS_AUDIT_FINISHED"
