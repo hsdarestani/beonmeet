@@ -32,6 +32,7 @@ jobs:
           python3 tests/public_oauth_pages_test.py
           python3 tests/recorder_end_guard_test.py
           python3 tests/admission_notice_overlay_test.py
+          python3 tests/chrome_cdp_watchdog_test.py
           python3 tests/admin_google_email_test.py
           python3 tests/admin_google_clay_test.py
           python3 tests/cloud_init_render_test.py
