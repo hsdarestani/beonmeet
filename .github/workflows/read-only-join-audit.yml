@@ -26,21 +26,30 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import subprocess,urllib.request,json,datetime,collections
-            now=datetime.datetime.now(datetime.timezone.utc)
-            print("AUDIT_UTC",now.isoformat())
+            import datetime,subprocess,json,collections,urllib.request
+            from pathlib import Path
+            print("VERIFY_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
+            state=json.loads(Path("data/state.json").read_text())
+            counts=collections.Counter(str(v.get("status","unknown")) for v in state.get("launched_events",{}).values() if isinstance(v,dict))
+            print("STATE_COUNTS",json.dumps(dict(counts)))
             for port in (9124,9126):
-                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=8) as r:d=json.load(r)
-                print("WORKER_CAPACITY",port,json.dumps(d.get("data",d)))
-            p=subprocess.run(["docker","logs","--since","2026-11-21T10:49:00Z","beonmeet-worker-five"],capture_output=True,text=True,timeout=20)
-            terms=("Retry count:","Meeting job permanently failed","Meeting slot released","recording","joining","waiting","TimeoutError","Launching browser","Ask to join","meeting job finished","out of the meeting","Join request")
-            events=[]
-            for line in (p.stdout+p.stderr).splitlines():
-                if not line.startswith("[2026-11-21T"):continue
-                msg=line.split("] ",4)[-1].split(" {",1)[0]
-                if any(t.lower() in msg.lower() for t in terms):
-                    if "http" in msg or "@" in msg or len(msg)>130:msg="[REDACTED]"
-                    events.append([line[1:24],msg])
-            print("RECENT_WORKER_EVENTS",json.dumps(events[-75:]))
-            print("CURRENT_IDLE_CHECK_DONE")
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=5) as r:v=json.load(r)
+                print("CAPACITY",port,json.dumps(v.get("data",v)))
+            with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=5) as r:h=json.load(r)
+            print("CONTROLLER_HEALTH",json.dumps({k:h.get(k) for k in ("ok","free_queue","premium_queue","pending_delivery_jobs","healthy_free_workers")}))
+            page=subprocess.run(["docker","exec","beonmeet-chrome-single","sh","-c","curl -fsS --max-time 3 http://127.0.0.1:9222/json/list"],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=8)
+            if page.returncode==0:
+                targets=json.loads(page.stdout)
+                categories=collections.Counter()
+                for x in targets:
+                    u=str(x.get("url","")).lower();title=str(x.get("title","")).lower()
+                    if "meet.google.com" in u:cat="google_meet_tab"
+                    elif "accounts.google.com" in u:
+                        cat="accounts_sign_in_screen" if "sign in" in title or "sign-in" in title else "google_accounts_page"
+                    elif "chrome://" in u:cat="chrome_internal"
+                    else:cat="other_page"
+                    categories[cat]+=1
+                print("CHROME_PAGE_TYPES",json.dumps(dict(categories)))
+            else:print("CHROME_PAGE_TYPES","unavailable")
+            print("POST_DEPLOY_READONLY_VERIFICATION_COMPLETE")
             PY
