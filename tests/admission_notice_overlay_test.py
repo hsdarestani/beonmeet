@@ -16,6 +16,7 @@ source = (
     + module.CLICK + "\n"
     + module.CALLBACK_END + "\n"
 )
+assert chr(10) in module.FLAG_PATCHED, "Compiled JS must contain a real linebreak after the flag declaration"
 patched = module.patched_source(source)
 assert patched.count("let beOnMeetAskedToJoin = false") == 1
 assert patched.count("beOnMeetAskedToJoin = /Ask to join") == 2
