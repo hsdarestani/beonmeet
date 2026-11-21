@@ -27,124 +27,29 @@ jobs:
             case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
             cd /opt/beonmeet
             python3 - <<'PY'
-            import collections, datetime, json, os, re, subprocess, time, urllib.request
+            import os,json,pathlib,subprocess,sqlite3
             from pathlib import Path
-            now=datetime.datetime.now(datetime.timezone.utc)
-            def cmd(args, timeout=25):
-                try:
-                    p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=timeout,text=True)
-                    return p.stdout if p.returncode==0 else ''
-                except Exception:return ''
-            def categories(lines):
-                needles={
-                    "job_accepted": r"meeting job accepted|job accepted and started processing",
-                    "recording_started": r"recording.started|start recording|mediarecorder.start|recording is started",
-                    "recording_saved": r"recording delivered to beonmeet|upload recording to remote|upload successful",
-                    "recording_failed": r"meeting job permanently failed|error executing task after|knownerror.*exiting",
-                    "upload_error": r"delivery failed|unable to write recording|recording is empty|controller returned|upload.*error",
-                    "controller_delivery_error": r"delivery error|pending delivery recovery error|telegram.*error|ffmpeg.*error|recording.*error",
-                    "callback_received": r"recording.ready|recording.upload|internal.recording",
-                    "chrome_cdp": r"cdp|chromium|browser disconnected|target closed",
-                    "leave_meeting": r"leav.{0,30}(call|meeting)|end.{0,30}meeting|stop.{0,30}record",
-                    "permission_error": r"\bEACCES\b|permission denied",
-                    "missing_file": r"\bENOENT\b|no such file",
-                    "http_4xx_5xx": r"\b(40[0-9]|41[0-9]|42[0-9]|43[0-9]|44[0-9]|45[0-9]|46[0-9]|47[0-9]|48[0-9]|49[0-9]|50[0-9]|51[0-9]|52[0-9]|53[0-9])\b",
-                    "write_error": r"\b(EROFS|ENOSPC|EPERM)\b|write.*failed",
-                    "retry_pending": r"retrying pending delivery",
-                    "recorder_empty": r"no audio|empty recording|no chunks|zero bytes",
-                }
-                c=collections.Counter()
-                interesting=[]
-                for line in lines:
-                    low=line.lower()
-                    found=[name for name,pattern in needles.items() if re.search(pattern,line,re.I)]
-                    for name in found:c[name]+=1
-                    if found:
-                        time_match=re.search(r"2026-11-21[T ][0-9:.+-]+(?:Z)?",line)
-                        stamp=(time_match.group(0)[:23] if time_match else "unavailable")
-                        interesting.append((stamp,found))
-                return dict(c), interesting[-22:]
-            print("AUDIT_UTC",now.isoformat())
-            print("CONTROLLER",cmd(["systemctl","is-active","beonmeet-controller"]).strip())
-            for url in ("http://127.0.0.1:8109/health","http://127.0.0.1:9126/capacity"):
-                try:
-                    with urllib.request.urlopen(url,timeout=5) as res: data=json.load(res)
-                    values=data.get("data",data)
-                    allowed=("ok","free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs","runningJobs","availableSlots","maxConcurrentJobs","delivery_pipeline_busy")
-                    print("CAPACITY",json.dumps({k:values.get(k) for k in allowed if k in values},sort_keys=True))
-                except Exception as exc: print("CAPACITY_ERROR",type(exc).__name__)
-            p=Path("/dev/shm/beonmeet")
-            counts=collections.Counter()
-            recent=[]
-            if p.is_dir():
-                for root,dirs,files in os.walk(p):
-                    for file in files:
-                        fp=Path(root)/file
-                        try:
-                            stat=fp.stat()
-                            ext=fp.suffix.lower()
-                            if ext not in (".webm",".mp4",".mp3",".part",".tmp"):ext="other"
-                            counts[ext]+=1
-                            age=int(time.time()-stat.st_mtime)
-                            if age<86400: recent.append({"type":ext,"bytes":stat.st_size,"age_minutes":int(age/60),"owner_uid":stat.st_uid})
-                        except (OSError,ValueError):pass
-            print("RECORDING_FILES_COUNTS",json.dumps(dict(counts),sort_keys=True))
-            print("RECENT_RECORDING_FILES",json.dumps(sorted(recent,key=lambda x:x["age_minutes"])[:16],sort_keys=True))
-            for name,args in [
-                ("controller",["journalctl","-u","beonmeet-controller","--since","120 minutes ago","--no-pager","-o","short-iso"]),
-                ("worker_five",["docker","logs","--since","120m","beonmeet-worker-five"]),
-                ("worker_single",["docker","logs","--since","120m","beonmeet-worker-single"]),
-                ("chrome",["docker","logs","--since","120m","beonmeet-chrome-single"])]:
-                raw=cmd(args,timeout=35)
-                c,last=categories(raw.splitlines())
-                print("LOG_CATEGORY",name,"total_lines",len(raw.splitlines()),json.dumps(c,sort_keys=True))
-                print("LOG_EVENTS",name,json.dumps(last,ensure_ascii=True))
+            def safe(s):
+                return s if s in ("/recordings","/dev/shm/beonmeet","/tmp/beonmeet-recordings") else ("[OTHER_PATH]" if s else "[UNSET]")
+            pid=subprocess.check_output(["systemctl","show","-p","MainPID","--value","beonmeet-controller"],text=True).strip()
+            raw=Path("/proc/"+pid+"/environ").read_bytes().split(b"\\x00")
+            env=dict((x.split(b"=",1)[0].decode(errors="replace"),x.split(b"=",1)[1].decode(errors="replace")) for x in raw if b"=" in x)
+            root=env.get("RECORDING_TMP_DIR","/recordings")
+            print("CONTROLLER_RECORDING_ROOT",safe(root))
+            for pth in ("/recordings","/dev/shm/beonmeet"):
+                p=Path(pth)
+                print("HOST_MOUNT",safe(pth),"exists",p.exists(),"symlink",p.is_symlink(),
+                      "is_dir",p.is_dir(),"realpath",safe(os.path.realpath(pth)) if p.exists() else "[MISSING]")
             for name in ("beonmeet-worker-five","beonmeet-worker-single"):
-                raw=cmd(["docker","inspect","--format","{{json .Config.Env}}",name])
-                try:
-                    keys={line.split("=",1)[0] for line in json.loads(raw)}
-                    checks=["CONTROLLER_UPLOAD_URL","CONTROLLER_STREAM_UPLOAD_URL","CONTROLLER_RECORDING_STARTED_URL","CONTROLLER_WAITING_FOR_ADMISSION_URL","RECORDING_TMP_DIR","INTERNAL_SECRET"]
-                    print("WORKER_ENV_PRESENT",name,json.dumps({k:k in keys for k in checks},sort_keys=True))
-                except Exception:print("WORKER_ENV_PRESENT",name,"unavailable")
-            print("===TARGETED_COMPLETION_LOGS===")
-            for source,args in (
-                ("controller",["journalctl","-u","beonmeet-controller","--since","2026-11-21 10:02:00 UTC","--until","2026-11-21 10:08:00 UTC","--no-pager","-o","short-iso"]),
-                ("worker_five",["docker","logs","--since","2026-11-21T10:02:00Z","--until","2026-11-21T10:08:00Z","beonmeet-worker-five"])):
-                raw=cmd(args,timeout=35)
-                print("WINDOW",source,"LINES",len(raw.splitlines()))
-                for line in raw.splitlines()[-85:]:
-                    # Keep the event and error code but redact all quoted metadata
-                    # and never emit user IDs, meeting links, or arbitrary JSON.
-                    line=re.split(r"\\s+\\{",line,1)[0]
-                    line=re.sub(r"https?://[^\\s]+","[URL]",line)
-                    line=re.sub(r"(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}","[EMAIL]",line)
-                    line=re.sub(r"\\b[a-z]{3}-[a-z]{4}-[a-z]{3}\\b","[MEET_CODE]",line,flags=re.I)
-                    line=re.sub(r"\\b\\d{6,}\\b","[USER_ID]",line)
-                    line=re.sub(r"(?i)(token|authorization|password|secret)[=:]\\S+","[SECRET]",line)
-                    line=re.sub(r"\\b(?:[a-zA-Z0-9_\\-]{26,})\\b","[OPAQUE]",line)
-                    # Controller access logs may contain internal paths/ids.
-                    line=re.sub(r"\\d{1,3}(?:\\.\\d{1,3}){3}(?::\\d+)?","[ADDRESS]",line)
-                    if any(s in line.lower() for s in ("record","upload","controller","meeting","telegram","fail","error","ffmpeg","processing","finished","end","status","post /internal","api","job")):
-                        print("LOG",source,line[:220])
-            print("TARGETED_COMPLETION_LOGS_DONE")
-            import sqlite3
-            dbpath=Path("/opt/beonmeet/data/beonmeet.db")
-            if dbpath.exists():
-                try:
-                    db=sqlite3.connect(f"file:{dbpath}?mode=ro",uri=True,timeout=3)
-                    db.row_factory=sqlite3.Row
-                    rows=db.execute("""SELECT telegram_id,created_at,size_bytes,duration_seconds
-                        FROM recordings WHERE created_at >= ? AND created_at <= ?
-                        ORDER BY created_at DESC LIMIT 12""",
-                        ("2026-11-21T10:02:00","2026-11-21T10:08:00")).fetchall()
-                    print("AUDITED_RECORDING_ROWS",len(rows))
-                    for q in rows:
-                        matching=db.execute("""SELECT COUNT(*) FROM meeting_requests
-                            WHERE telegram_id=? AND created_at >= ? AND created_at <= ?""",
-                            (q["telegram_id"],"2026-11-21T09:45:00","2026-11-21T10:08:00")).fetchone()[0]
-                        print("RECORDING_ROW",json.dumps({"created_at":q["created_at"],"size_bytes":q["size_bytes"],
-                            "duration_seconds":q["duration_seconds"],"request_matches":matching}))
-                    db.close()
-                except Exception as exc: print("AUDITED_RECORDING_ROWS_ERROR",type(exc).__name__)
-            print("READ_ONLY_DELIVERY_DIAGNOSTICS_COMPLETE")
+                out=subprocess.check_output(["docker","inspect","--format","{{json .Config.Env}}",name],text=True)
+                parts=dict(v.split("=",1) for v in json.loads(out) if "=" in v)
+                print("WORKER",name,"ROOT",safe(parts.get("RECORDING_TMP_DIR","/recordings")))
+            live=Path("app/main.py").read_text()
+            print("LIVE_GHOST_SUCCESS_BRANCH_PRESENT","if not raw_path.exists() and pending_id not in state.setdefault" in live)
+            print("LIVE_UPLOAD_RECEIVER_PRESENT",'@app.post("/internal/recording-ready")' in live)
+            if Path("data/beonmeet.db").exists():
+                db=sqlite3.connect("file:/opt/beonmeet/data/beonmeet.db?mode=ro",uri=True)
+                n=db.execute("SELECT COUNT(*) FROM recordings WHERE created_at >= ? AND created_at <= ?",("2026-11-21T10:02:00","2026-11-21T10:08:00")).fetchone()[0]
+                print("RECORDINGS_DB_AT_SESSION",n)
+            print("READONLY_CONTROLLER_FILE_MAPPING_CHECK_DONE")
             PY
