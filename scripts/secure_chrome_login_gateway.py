@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import socket
 import ssl
 import subprocess
 import sys
@@ -115,8 +116,20 @@ def atomically_write_config(value: str) -> None:
 
 
 def probe(route: str, password: str | None) -> int:
-    context = ssl._create_unverified_context()  # Test *local* TLS listener only.
-    conn = http.client.HTTPSConnection("127.0.0.1", 443, timeout=7, context=context)
+    # Select the HTTPS virtual host by TLS SNI, not only the HTTP Host
+    # header. SNI=127.0.0.1 selects the server's unrelated default vhost.
+    # Keep network traffic on loopback and the private route behind auth.
+    class LocalVhostHTTPS(http.client.HTTPSConnection):
+        def connect(self) -> None:
+            raw = socket.create_connection(
+                ("127.0.0.1", self.port),
+                self.timeout,
+                self.source_address,
+            )
+            self.sock = self._context.wrap_socket(raw, server_hostname=HOST)
+
+    context = ssl._create_unverified_context()  # Local-only nginx probe.
+    conn = LocalVhostHTTPS(HOST, 443, timeout=7, context=context)
     headers = {"Host": HOST}
     if password is not None:
         value = base64.b64encode(f"setup:{password}".encode()).decode()
