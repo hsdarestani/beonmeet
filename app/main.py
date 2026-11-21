@@ -942,6 +942,53 @@ async def launch_meeting(
     return False
 
 
+async def join_progress_loop() -> None:
+    """Send truthful progress before Google Meet is actually joined.
+
+    Recorder acceptance is not admission. If Chrome or the pre-join UI hangs,
+    the user previously heard nothing for minutes, even though their credit
+    remains completely untouched. This loop reports distinct non-success
+    states once per event, without inventing a lobby/admission status.
+    """
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            for event_id, launched in list(state.setdefault("launched_events", {}).items()):
+                if not isinstance(launched, dict):
+                    continue
+                if str(launched.get("status") or "") != "joining":
+                    continue
+                chat_id = str(launched.get("chat_id") or "")
+                started_raw = str(launched.get("launched_at") or "")
+                if not chat_id or not started_raw:
+                    continue
+                try:
+                    started = isoparse(started_raw)
+                    age_seconds = (now - started).total_seconds()
+                except Exception:
+                    continue
+                if age_seconds < 0:
+                    continue
+                key = "join_slow_notified_at" if age_seconds >= 90 else (
+                    "join_connecting_notified_at" if age_seconds >= 12 else ""
+                )
+                if not key or launched.get(key):
+                    continue
+                await tg_text(
+                    chat_id,
+                    t(chat_id, "join_still_unconfirmed" if key == "join_slow_notified_at" else "join_connecting"),
+                )
+                # The event may be removed by a successful callback while we
+                # awaited Telegram: do not resurrect it.
+                current = state.setdefault("launched_events", {}).get(event_id)
+                if isinstance(current, dict) and current.get("status") == "joining":
+                    current[key] = datetime.now(timezone.utc).isoformat()
+                    await save_state()
+        except Exception as exc:
+            print("join progress loop error:", type(exc).__name__, flush=True)
+        await asyncio.sleep(4)
+
+
 async def worker_health_loop() -> None:
     global worker_health_cache
     while True:
@@ -2132,6 +2179,7 @@ async def startup() -> None:
     asyncio.create_task(calendar_loop())
     asyncio.create_task(queue_loop())
     asyncio.create_task(worker_health_loop())
+    asyncio.create_task(join_progress_loop())
     asyncio.create_task(state_cleanup_loop())
     asyncio.create_task(delivery_recovery_loop())
     asyncio.create_task(premium_upgrade_backfill_loop())
