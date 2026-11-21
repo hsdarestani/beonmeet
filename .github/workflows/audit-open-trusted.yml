@@ -22,25 +22,52 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import subprocess,json,urllib.request,datetime
-            print("JOIN_STATE_VERIFY_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            for port in (8109,9124,9126):
-                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+("/health" if port==8109 else "/capacity"),timeout=6) as resp:data=json.load(resp)
-                d=data.get("data",data)
-                print("STATUS",port,json.dumps({k:d.get(k) for k in ("ok","free_queue","premium_queue","pending_delivery_jobs","active_delivery_jobs","runningJobs","availableSlots") if k in d}))
-            code=subprocess.run(["docker","exec","beonmeet-worker-five","cat","/usr/src/app/dist/bots/GoogleMeetBot.js"],capture_output=True,text=True,timeout=20).stdout
-            start=code.find("waitAtLobbyPromise =")
-            print("LOBBY_SOURCE_START",start)
-            if start>=0:
-                print("LOBBY_SOURCE_BEGIN")
-                print(code[start:start+11000])
-                print("LOBBY_SOURCE_END")
-            p=subprocess.run(["docker","stats","--no-stream","--format","{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.PIDs}}","beonmeet-worker-five","beonmeet-chrome-single"],capture_output=True,text=True,timeout=12)
-            print("RESOURCE_USAGE",p.stdout.strip().splitlines())
-            try:
-                txt=open("/proc/meminfo").read()
-                m=int(next(x.split()[1] for x in txt.splitlines() if x.startswith("MemAvailable:")))
-                print("HOST_MEMORY_AVAILABLE_MIB",round(m/1024))
-            except Exception:pass
-            print("JOIN_SOURCE_STATE_INSPECTION_DONE")
+            import subprocess,json,datetime
+            print("ADMISSION_DOM_CHECK_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
+            js=r"""
+            (async()=>{
+              let timer=setTimeout(()=>process.exit(19),16000);
+              try {
+                const {chromium}=require('playwright-extra');
+                const b=await chromium.connectOverCDP(process.env.GOOGLE_CHROME_CDP_URL,{timeout:9500});
+                let i=0;
+                for(const ctx of b.contexts()) {
+                  for(const page of ctx.pages()){
+                    if(!page.url().startsWith('https://meet.google.com/'))continue;
+                    i++;
+                    const result=await page.evaluate(()=>{
+                      const buttons=Array.from(document.querySelectorAll('button'));
+                      const labels=buttons.map(b=>String(b.getAttribute('aria-label')||b.innerText||''));
+                      const body=(document.body?.innerText||'').toLowerCase();
+                      const re=(pattern)=>labels.some(x=>pattern.test(x));
+                      const counts=labels.filter(x=>/People|Personen|participant|Teilnehmer|افراد|شرکت‌کننده/i.test(x)).map(x=>x.replace(/[^\d]/g,'').slice(0,3)).filter(x=>!!x);
+                      return {
+                        has_leave_button:re(/Leave call|Anruf verlassen|تماس را ترک|Exit meeting/i),
+                        has_people_button:re(/People|Personen|participants|Teilnehmer|افراد/i),
+                        has_mic_toggle:re(/microphone|microfon|mikrofon|میکروفون/i),
+                        has_camera_toggle:re(/camera|kamera|دوربین/i),
+                        has_present_button:re(/present now|present screen|jetzt präsentieren|ارائه/i),
+                        has_reaction:re(/reactions|reaction|reaktion/i),
+                        has_raising_hand:re(/raise hand|hand heben|دست/i),
+                        has_chat:re(/chat|چت/i),
+                        ask_to_join:re(/Ask to join|Teilnahme erbitten/i),
+                        join_now:re(/Join now|Jetzt teilnehmen/i),
+                        waiting_to_be_admitted:body.includes('asking to join')||body.includes('let you in')||body.includes('waiting for someone')||body.includes('bitte warten'),
+                        admission_rejected:body.includes('not allowed')||body.includes('you cannot join')||body.includes('could not join'),
+                        participant_button_number_strings:counts.slice(0,4),
+                        button_total:buttons.length
+                      }
+                    });
+                    console.log('LIVE_MEET_PAGE_FLAGS',i,JSON.stringify(result));
+                  }
+                }
+                console.log('MATCHED_MEET_TABS',i);
+              }catch(e){console.log('LIVE_MEET_DOM_DIAG_ERROR',e.name)}
+              clearTimeout(timer);process.exit(0);
+            })();
+            """
+            p=subprocess.run(["docker","exec","beonmeet-worker-five","node","-e",js],capture_output=True,text=True,timeout=26)
+            for line in p.stdout.splitlines():
+                if line.startswith(("LIVE_MEET_PAGE_FLAGS","MATCHED_MEET_TABS","LIVE_MEET_DOM_DIAG_ERROR")):print(line[:1000])
+            print("LIVE_MEET_DOM_DIAG_EXIT",p.returncode)
             PY
