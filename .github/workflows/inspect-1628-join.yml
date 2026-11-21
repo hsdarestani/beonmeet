@@ -22,17 +22,45 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import subprocess,json
-            p=subprocess.run(["docker","logs","--since","2026-11-21T12:57:00Z","--until","2026-11-21T13:05:30Z","beonmeet-worker-five"],capture_output=True,text=True,timeout=25)
-            msgs=[]
-            for line in (p.stdout+"\n"+p.stderr).splitlines():
-                if not line.startswith("[2026-11-21T"):continue
-                msg=line.split("] ",4)[-1].split(" {",1)[0].strip()
-                if "http" not in msg and "@" not in msg and len(msg)<170:msgs.append([line[1:24],msg])
-            print("WORKER_MESSAGES",json.dumps(msgs[-100:]))
-            code=subprocess.run(["docker","exec","beonmeet-worker-five","cat","/usr/src/app/dist/bots/GoogleMeetBot.js"],capture_output=True,text=True,timeout=20).stdout
-            i=code.find("let waitTimeout;")
-            if i<0:raise RuntimeError("Join loop not found")
-            print("JOIN_LOOP_SOURCE",code[i:i+9000])
-            print("JOIN_DIAG_COMPLETE")
+            import subprocess,json,re,urllib.parse,collections
+            p=subprocess.run(["docker","logs","--since","2026-11-21T12:57:00Z","--until","2026-11-21T13:13:00Z","beonmeet-worker-five"],capture_output=True,text=True,timeout=27)
+            lines=(p.stdout+"\n"+p.stderr).splitlines()
+            labels=["Google Meet Bot was redirected away from the meeting while waiting for admission","Meet lobby state unconfirmed after join click","Can't update the bot status","Cant finish wait at the lobby check","Closing the browser on error"]
+            summaries=[]
+            for idx,line in enumerate(lines):
+                if not any(label.lower() in line.lower() for label in labels):continue
+                when=line[1:24] if line.startswith("[2026-") else "unknown"
+                kind=next((name for name in labels if name.lower() in line.lower()),"other")
+                # Logger data is appended on same line or a following JSON line.
+                raw=line.split(" {",1)[-1] if " {" in line else ""
+                if not raw.startswith("{"):
+                    if idx+1<len(lines) and lines[idx+1].lstrip().startswith("{"):raw=lines[idx+1].strip()
+                data={}
+                try:data=json.loads(raw)
+                except Exception:pass
+                url=str(data.get("currentUrl") or data.get("url") or "")
+                parsed=urllib.parse.urlparse(url)
+                host=parsed.hostname or ""
+                if host.endswith("accounts.google.com"):kind_url="google_login"
+                elif host.endswith("meet.google.com"):kind_url="google_meet"
+                elif host.endswith("google.com"):kind_url="google_other"
+                elif url.startswith("chrome-error:"):kind_url="chrome_error"
+                elif url.startswith("about:"):kind_url="about_blank"
+                elif url.startswith("data:"):kind_url="data"
+                elif url.startswith("https://"):kind_url="external_https"
+                elif url:kind_url="other_protocol"
+                else:kind_url="missing_in_logs"
+                body=str(data.get("bodyText") or "")
+                flags={key:word in body.lower() for key,word in (
+                    ("sign_in","sign in"),("couldnt_join","couldn't join"),("cant_join","can't join"),
+                    ("something_wrong","something went wrong"),("request","request"),("meeting","meeting"),
+                    ("error","error"),("not_found","not found"),("ask_to_join","ask to join"),
+                    ("try_again","try again"),("code","code"),("account","account"),
+                    ("access_denied","access denied"),("service","service unavailable"))}
+                summaries.append({"when":when,"event":kind[:68],"redirect_category":kind_url,"path_kind":("meeting" if parsed.path.startswith("/") and re.match(r"/[a-z]{3}-[a-z]{4}-[a-z]{3}",parsed.path) else ("auth" if "auth" in parsed.path or "signin" in parsed.path else ("other" if parsed.path else "none"))),"body_len":len(body),"flags":{k:v for k,v in flags.items() if v},"fields":sorted(data.keys())[:14]})
+            print("REDIRECT_DIAGNOSTIC",json.dumps(summaries[-30:]))
+            for line in lines[-130:]:
+                if line.startswith("[2026-11-21T") and any(x in line for x in ("Retry count", "Success clicked using","Google Meet Bot was redirected","Recording started","Meeting job permanently failed","Closing the browser on error")):
+                    print("LAST_KNOWN_PHASE",line[1:24],next((x for x in ("Retry count", "Success clicked using","Google Meet Bot was redirected","Recording started","Meeting job permanently failed","Closing the browser on error") if x in line),"other"))
+            print("REDIRECT_DIAGNOSTIC_COMPLETE")
             PY
