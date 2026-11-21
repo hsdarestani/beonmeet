@@ -56,15 +56,24 @@ jobs:
             docker run --rm --network none --memory=300m --cpus=.3 -v "$stage/GoogleMeetBot.patched.js:/tmp/worker.js:ro" --entrypoint node "$worker_image" --check /tmp/worker.js
             echo SOURCE_AND_COMPILED_NODE_SYNTAX_PASS
             python3 - <<'PY'
-            import json,subprocess,urllib.request
+            import json,subprocess,urllib.request,time
             with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=8) as r:h=json.load(r)
             assert h.get("ok") and int(h.get("max_concurrent_meetings") or 0)==5
             assert not h.get("autoscaler_enabled")
             for k in ("free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs"):
                 assert int(h.get(k) or 0)==0,k+" busy"
-            for port in (9124,9126):
-                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=8) as r:v=json.load(r)
-                assert int((v.get("data") or v).get("runningJobs") or 0)==0,"recorder active"
+            # No in-flight customer meeting is ever interrupted. Wait for old
+            # unsuccessful join attempts to terminate naturally before rollout.
+            for attempt in range(30):
+                busy=[]
+                for port in (9124,9126):
+                    with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=8) as r:v=json.load(r)
+                    busy.append(int((v.get("data") or v).get("runningJobs") or 0))
+                if busy==[0,0]:
+                    break
+                if attempt==29:
+                    raise AssertionError("Recorder still active; no changes applied")
+                time.sleep(8)
             for name in ("camcam-shared-api-1","camcam-shared-pet-1","camcam-shared-archive-1","camcam-shared-petarchive-1"):
                 assert subprocess.check_output(["docker","inspect","--format","{{.State.Health.Status}}",name],text=True).strip()=="healthy",name
             print("SHARED_VPS_IDLE_AND_CAMCAM_HEALTH_PASS")
