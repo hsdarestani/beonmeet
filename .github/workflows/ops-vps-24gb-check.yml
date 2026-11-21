@@ -1,0 +1,46 @@
+name: BeOnMeet VPS 24GB upgrade verification (read only)
+on:
+  push:
+    branches: [ops/check-24gb-vps-20261121]
+    paths: [.github/workflows/ops-vps-24gb-check.yml]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - name: Read physical RAM, CPU and BeOnMeet health on ParsVDS VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          timeout: 20s
+          command_timeout: 90s
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST;exit 1;; esac
+            python3 - <<'PY'
+            import json,os,subprocess,urllib.request
+            from pathlib import Path
+            m={}
+            for l in Path('/proc/meminfo').read_text().splitlines():
+                if l.startswith(('MemTotal:','MemAvailable:','SwapTotal:','SwapFree:')):
+                    k,v=l.split(':',1); m[k]=int(v.split()[0])
+            print('UPGRADE_RAM_TOTAL_GIB',round(m['MemTotal']/1024/1024,2))
+            print('UPGRADE_RAM_TOTAL_MB',round(m['MemTotal']/1024))
+            print('UPGRADE_RAM_AVAILABLE_GIB',round(m['MemAvailable']/1024/1024,2))
+            print('UPGRADE_RAM_IS_24_GIB_CLASS',m['MemTotal']>=22*1024*1024)
+            print('UPGRADE_VCPU_COUNT',os.cpu_count())
+            print('UPGRADE_MEM_SWAP_GIB',round(m.get('SwapTotal',0)/1024/1024,2))
+            print('UPGRADE_LOAD_1_5_15',Path('/proc/loadavg').read_text().split()[:3])
+            print('UPGRADE_DF_ROOT',subprocess.check_output(['df','-BG','--output=size,avail','/'],text=True).splitlines()[-1].strip())
+            print('UPGRADE_CONTROLLER_ACTIVE',subprocess.run(['systemctl','is-active','beonmeet-controller'],capture_output=True,text=True,timeout=5).stdout.strip())
+            try:
+                with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=7) as r:d=json.load(r)
+                print('UPGRADE_BEONMEET_HEALTH',json.dumps({k:d.get(k) for k in ('ok','free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs','max_concurrent_meetings')}))
+            except Exception as e: print('UPGRADE_BEONMEET_HEALTH_ERROR',type(e).__name__)
+            print('UPGRADE_READ_ONLY_CHECK_COMPLETE')
+            PY
