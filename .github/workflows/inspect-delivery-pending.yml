@@ -26,27 +26,20 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,urllib.request,datetime,subprocess
+            import json,datetime,urllib.request,re
             from pathlib import Path
             print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            for name,port,uri in (("controller",8109,"/health"),("worker_five",9126,"/capacity"),("worker_single",9124,"/capacity")):
-                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+uri,timeout=5) as r:d=json.load(r)
-                d=d.get("data",d)
-                keys=("ok","pending_delivery_jobs","active_delivery_jobs","free_queue","premium_queue","runningJobs","availableSlots","maxConcurrentJobs")
-                print("LIVE_STATUS",name,json.dumps({k:d.get(k) for k in keys if k in d}))
             state=json.loads(Path("data/state.json").read_text())
-            for x in (state.get("pending_deliveries") or {}).values():
-                if not isinstance(x,dict):continue
-                p=Path(str(x.get("file_path") or x.get("source_path") or ""))
-                print("RECOVERY_STAGE",json.dumps({"video_delivered":bool(x.get("video_delivered")),"audio_delivered":bool(x.get("audio_delivered")),
-                    "transcript_delivered":bool(x.get("transcript_delivered")),
-                    "file_exists":p.is_file(),"attempts":int(x.get("attempts") or x.get("retry_count") or 0)}))
-            for container,pathname in (
-                ("beonmeet-worker-five","/usr/src/app/dist/middleware/disk-uploader.js"),
-                ("beonmeet-worker-five","/usr/src/app/dist/bots/GoogleMeetBot.js")):
-                t=subprocess.run(["docker","exec",container,"grep","-c",
-                    "chmod(instance.folderPath(), 0o2770)" if "uploader" in pathname else "const recordingQuality =",pathname],
-                    capture_output=True,text=True,timeout=8)
-                print("INSTALLED_RECORDER_PATCH",("permissions" if "uploader" in pathname else "quality"),t.returncode==0)
-            print("POST_RELEASE_RUNTIME_AUDIT_COMPLETE")
+            pending=state.get("pending_deliveries") or {}
+            print("PENDING_COUNT",len(pending))
+            for p in list(pending.values())[-5:]:
+                if not isinstance(p,dict):continue
+                s=str(p.get("last_error") or "")
+                signals=[x for x in ("Permission denied","EACCES","No such file","ffmpeg","Command","transcription","audio","No space","CUDA","MemoryError","HTTPException","RuntimeError","OSError") if x.lower() in s.lower()]
+                print("PENDING_DELIVERY_STAGE",json.dumps({"attempts":int(p.get("attempts") or 0),
+                    "video":bool(p.get("video_delivered")),"audio":bool(p.get("audio_delivered")),
+                    "transcript":bool(p.get("transcript_delivered")),"last_error_signals":signals}))
+            with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=5) as r:h=json.load(r)
+            print("LIVE_DELIVERY_STATUS",json.dumps({k:h.get(k) for k in ("ok","active_delivery_jobs","pending_delivery_jobs","transcription_concurrency")}))
+            print("PENDING_RECOVERY_POST_RELEASE_AUDIT_DONE")
             PY
