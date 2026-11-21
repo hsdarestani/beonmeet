@@ -46,15 +46,35 @@ jobs:
             grep -q 'if remaining > 0:' "$stage/main.py"
             grep -q 'join_progress_loop' "$stage/main.py"
             python3 - <<'PY'
-            import json,subprocess,urllib.request
+            import json,subprocess,urllib.request,time
+            from pathlib import Path
             with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=8) as r:h=json.load(r)
             assert h.get("ok") and int(h.get("max_concurrent_meetings") or 0)==5
             assert not h.get("autoscaler_enabled")
-            for k in ("free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs"):
+            for k in ("free_queue","premium_queue","active_delivery_jobs"):
                 assert int(h.get(k) or 0)==0,k+" not idle"
-            for p in (9124,9126):
-                with urllib.request.urlopen("http://127.0.0.1:"+str(p)+"/capacity",timeout=8) as r:d=json.load(r)
-                assert int((d.get("data") or d).get("runningJobs") or 0)==0,"Recorder active"
+            # Some Premium video files have already reached Telegram, but the
+            # separate MP3/transcript still require durable recovery. Preserve
+            # their on-disk source and state rather than silently deleting them.
+            if int(h.get("pending_delivery_jobs") or 0):
+                st=Path("/opt/beonmeet/data/state.json")
+                assert st.is_file(), "Pending delivery without durable state file"
+                saved=json.loads(st.read_text())
+                pending=list((saved.get("pending_deliveries") or {}).values())
+                assert len(pending)==int(h["pending_delivery_jobs"]),"Pending state/health mismatch"
+                for item in pending:
+                    assert isinstance(item,dict) and item.get("video_delivered"),"Undelivered video still pending"
+                    p=Path(str(item.get("file_path") or item.get("source_path") or ""))
+                    assert p.is_file() and p.stat().st_size>0,"Pending recovery source missing"
+                print("PREVIOUS_VIDEO_DELIVERIES_DURABLY_PRESERVED",len(pending))
+            for attempt in range(27):
+                busy=[]
+                for p in (9124,9126):
+                    with urllib.request.urlopen("http://127.0.0.1:"+str(p)+"/capacity",timeout=8) as r:d=json.load(r)
+                    busy.append(int((d.get("data") or d).get("runningJobs") or 0))
+                if busy==[0,0]:break
+                if attempt==26:raise AssertionError("Recorder still active; no service changes")
+                time.sleep(8)
             for name in ("camcam-shared-api-1","camcam-shared-pet-1","camcam-shared-archive-1","camcam-shared-petarchive-1"):
                 assert subprocess.check_output(["docker","inspect","--format","{{.State.Health.Status}}",name],text=True).strip()=="healthy"
             print("MINUTE_CREDIT_RELEASE_PRECHECK_PASS")
