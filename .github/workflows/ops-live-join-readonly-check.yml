@@ -173,3 +173,5 @@ jobs:
             print('CAPTURE_ENV_VALUES',subprocess.run(['docker','exec','beonmeet-worker-five','sh','-c','printf "%s" "${BEONMEET_CAPTURE_QUALITY:-UNSET}"'],text=True,capture_output=True,timeout=6).stdout.strip()[:32])
             PY
             echo LIVE_BEONMEET_LOGIN_READ_ONLY_SMOKE_PASS
+
+# Recovery rollout observation: read-only service and queue snapshot.
