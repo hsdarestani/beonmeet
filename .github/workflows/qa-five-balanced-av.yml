@@ -72,6 +72,7 @@ jobs:
             release=70c9a51bb0818b1fb807e1fca4270ce4565e2ce6
             git merge-base --is-ancestor "$release" FETCH_HEAD
             git show "$release:tests/five_sustained_av_smoke.js" > "$stage/qa.js"
+            chmod 0644 "$stage/qa.js"
             docker cp "$stage/qa.js" "$worker:$dest"
             docker exec "$worker" node --check "$dest"
             connected=0
