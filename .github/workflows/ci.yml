@@ -45,6 +45,7 @@ jobs:
           python3 tests/stale_join_status_lifecycle_test.py
           python3 tests/modern_incall_proof_test.py
           python3 tests/shared_chrome_admission_gate_test.py
+          python3 tests/five_isolated_workers_dispatch_test.py
           python3 tests/secure_chrome_login_gateway_test.py
           python3 -m py_compile patches/patch_low_resource_compiled_recorder.py
           bash -n scripts/activate_five_on_shared_vps.sh
