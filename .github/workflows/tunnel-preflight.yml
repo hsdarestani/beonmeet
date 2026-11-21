@@ -1,0 +1,51 @@
+name: Preflight restricted Termux SSH browser tunnel
+on:
+  push:
+    branches: [ops/restricted-termux-tunnel-20261121]
+    paths: [.github/workflows/tunnel-preflight.yml]
+permissions:
+  contents: read
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Read-only inspect SSH forwarding policy and private noVNC port
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 3m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1;; esac
+            test "$(id -u)" = 0
+            test -x /usr/sbin/sshd
+            echo SSHD_READONLY_PRECHECK
+            /usr/sbin/sshd -T -C user=root,host=beonmeet.smarbiz.sbs,addr=127.0.0.1 | grep -Ei '^(pubkeyauthentication|allowtcpforwarding|permitopen|permitlisten|disableforwarding|authorizedkeysfile|allowusers|allowgroups|passwordauthentication|kbdinteractiveauthentication|authenticationmethods|permitrootlogin|forcecommand|permittty) ' || true
+            echo SSHD_CONFIG_INCLUDE
+            grep -Ei '^\s*Include\s+|^\s*Match\s+' /etc/ssh/sshd_config | sed -n '1,20p' || true
+            echo TUNNEL_USER_ALREADY_EXISTS
+            if getent passwd beonmeet-tunnel >/dev/null;then echo yes;else echo no;fi
+            echo BROWSER_LOOPBACK_CHECK
+            python3 - <<'PY'
+            import socket,urllib.request,subprocess
+            for port in (6081,6080,9011):
+                s=socket.socket()
+                s.settimeout(2)
+                try:
+                    s.connect(("127.0.0.1",port))
+                    print("LOOPBACK_TCP_LISTENING",port,True)
+                except Exception as ex:print("LOOPBACK_TCP_LISTENING",port,False,type(ex).__name__)
+                finally:s.close()
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:6081/vnc.html",timeout=5) as r:
+                    print("VNC_LOOPBACK_HTTP",r.status)
+            except Exception as e:print("VNC_LOOPBACK_HTTP_ERROR",type(e).__name__)
+            for name in ("useradd","sshd","systemctl","ss"):
+                p=subprocess.run(["sh","-c","command -v "+name],capture_output=True,text=True)
+                print("TOOL_AVAILABLE",name,p.returncode==0)
+            PY
+            echo SSH_TUNNEL_PREFLIGHT_COMPLETE
