@@ -970,15 +970,24 @@ async def join_progress_loop() -> None:
                     continue
                 if age_seconds < 0:
                     continue
-                key = "join_slow_notified_at" if age_seconds >= 90 else (
+                # Anonymous guests and third-party note-taking bots may be
+                # denied by Google Meet before the host ever sees an Admit
+                # prompt. Do not leave users thinking the recorder is merely
+                # waiting for host approval indefinitely: offer safe, actionable
+                # guidance after three minutes without a real admission event.
+                key = (
+                    "join_access_notice_at" if age_seconds >= 180 else
+                    "join_slow_notified_at" if age_seconds >= 90 else
                     "join_connecting_notified_at" if age_seconds >= 12 else ""
                 )
                 if not key or launched.get(key):
                     continue
-                await tg_text(
-                    chat_id,
-                    t(chat_id, "join_still_unconfirmed" if key == "join_slow_notified_at" else "join_connecting"),
-                )
+                message_key = {
+                    "join_connecting_notified_at": "join_connecting",
+                    "join_slow_notified_at": "join_still_unconfirmed",
+                    "join_access_notice_at": "join_guest_access_possible",
+                }[key]
+                await tg_text(chat_id, t(chat_id, message_key))
                 # The event may be removed by a successful callback while we
                 # awaited Telegram: do not resurrect it.
                 current = state.setdefault("launched_events", {}).get(event_id)
