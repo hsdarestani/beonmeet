@@ -55,7 +55,7 @@ jobs:
                 p=subprocess.run(['docker','inspect','-f','{{.State.Health.Status}}',name],capture_output=True,text=True,timeout=5)
                 print('CAMCAM_HEALTH',name,p.stdout.strip())
                 assert p.stdout.strip()=='healthy'
-            for origin,cmd in [('controller',['journalctl','-u','beonmeet-controller','--since','20 minutes ago','--no-pager','-o','cat']),('recorder',['docker','logs','--since','20m',worker])]:
+            for origin,cmd in [('controller',['journalctl','-u','beonmeet-controller','--since','2026-11-21 16:58:00 UTC','--no-pager','-o','cat']),('recorder',['docker','logs','--since','2026-11-21T16:58:00Z',worker])]:
                 p=subprocess.run(cmd,capture_output=True,text=True,timeout=12)
                 raw=(p.stdout+'\n'+p.stderr)[-200000:]
                 patterns={'target_crashed':r'target crashed',
