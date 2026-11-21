@@ -26,42 +26,54 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import subprocess,datetime,collections,json
+            import subprocess,datetime,collections,json,re
+            from pathlib import Path
             def run(args):
-                p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=42)
-                return p.stdout
-            now=datetime.datetime.now(datetime.timezone.utc).isoformat()
-            print("AUDIT_UTC",now)
-            raw=run(["docker","logs","--since","2026-11-21T10:39:00Z","beonmeet-worker-five"])
-            names={}
-            events=[]
+                try:
+                    p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=30)
+                    return p.stdout
+                except Exception:return ""
+            print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
+            for port in ("9124","9126"):
+                import urllib.request
+                try:
+                    with urllib.request.urlopen("http://127.0.0.1:"+port+"/capacity",timeout=4) as r: dat=json.load(r)
+                    print("WORKER_CAPACITY",port,json.dumps(dat.get("data",dat),sort_keys=True))
+                except Exception as e:print("WORKER_CAPACITY_ERROR",port,type(e).__name__)
+            p=Path("data/state.json")
+            if p.is_file():
+                try:
+                    st=json.loads(p.read_text())
+                    statuses=collections.Counter(str(v.get("status","unknown")) for v in st.get("launched_events",{}).values() if isinstance(v,dict))
+                    print("LAUNCHED_STATUS_COUNTS",json.dumps(dict(statuses),sort_keys=True))
+                    for v in sorted(st.get("launched_events",{}).values(),key=lambda x:str(x.get("launched_at","")),reverse=True)[:9]:
+                        print("LAUNCHED_EVENT",json.dumps({"status":v.get("status"),"launched_at":v.get("launched_at"),
+                                "recording_started":bool(v.get("recording_started_at")),"waiting_admission":bool(v.get("waiting_since"))}))
+                    print("JOIN_QUEUE_COUNT",len(st.get("join_queue") or []))
+                except Exception as e:print("STATE_READ_ERROR",type(e).__name__)
+            raw=run(["docker","logs","--since","2026-11-21T10:40:00Z","beonmeet-worker-five"])
+            ids={};lines=[]
             for line in raw.splitlines():
                 if not line.startswith("[2026-11-21T"):continue
                 at=line[1:24]
-                if "[correlationId: " in line:
-                    ident=line.split("[correlationId: ",1)[1].split("]",1)[0]
-                    if ident not in names:names[ident]="job"+str(len(names)+1)
-                    job=names[ident]
-                else:job="shared"
-                message=line.split("] ",4)[-1].split(" {",1)[0].strip()
-                if len(message)>130 or "http://" in message or "https://" in message or "@" in message:
-                    message="[REDACTED_MESSAGE]"
-                key=message.lower()
-                if any(s in key for s in ("meeting","join","chrome","page","record","attempt","error","fail","retry","wait","input","button","enter","admit","start","launch","playwright","session","browser","modal","profile","selector")):
-                    err_type=""
-                    for code in ("TimeoutError","TargetClosedError","EACCES","ECONNREFUSED","ENOSPC","NotFoundError","ERR_NAME_NOT_RESOLVED","ERR_CONNECTION"):
-                        if code in line:err_type=" "+code
-                    events.append([at,job,message+err_type])
-            print("WORKER_JOBS",len(names))
-            print("WORKER_EVENTS",json.dumps(events[-100:],ensure_ascii=True))
-            ctl=run(["journalctl","-u","beonmeet-controller","--since","2026-11-21 10:38:00 UTC","--no-pager","-o","short-iso"])
-            for line in ctl.splitlines()[-80:]:
-                at=line[:25]
-                for endpoint in ("/internal/recording-started","/internal/waiting-for-admission","/internal/recording-ready","/internal/recording-upload"):
-                    if endpoint in line:
-                        code="200" if '" 200 ' in line else ("4xx/5xx" if '" 4' in line or '" 5' in line else "unknown")
-                        print("CONTROLLER_CALLBACK",at,endpoint,code)
-                for reason in ("meeting dispatch error","meeting dispatch rejected","telegram loop error","queue loop error","delivery error"):
-                    if reason in line.lower():print("CONTROLLER_ERROR",at,reason)
-            print("JOIN_TIMELINE_READ_ONLY_DONE")
+                key=line.split("[correlationId: ",1)[1].split("]",1)[0] if "[correlationId: " in line else "shared"
+                if key not in ids:ids[key]="job"+str(len(ids)+1)
+                msg=line.split("] ",4)[-1].split(" {",1)[0].strip()
+                if not any(t in msg.lower() for t in ("launch","retry","failed","error","join","pre-join","record","waiting","enter","click","browser","connected","disconnected","login","concurrent","timeout","ask to","no button","page","close","processing")):continue
+                details=[]
+                for code in ("EACCES","ECONNREFUSED","ETIMEDOUT","TimeoutError","TargetClosedError","ProtocolError","NotFoundError","Error: Target page","Browser has been closed","Navigation failed","net::ERR_","chrome is unreachable"):
+                    if code in line:details.append(code)
+                if len(msg)>135 or "http" in msg or "@" in msg:msg="[redacted]"
+                lines.append([at,ids[key],msg,details])
+            print("WORKER_EVENTS_LAST",json.dumps(lines[-95:]))
+            # Correlate without exposing user id or meeting content.
+            print("WORKER_RUNS",len(ids)-int("shared" in ids))
+            raw=run(["docker","exec","beonmeet-chrome-single","sh","-c","curl -fsS --max-time 3 http://127.0.0.1:9222/json/list || true"])
+            try:
+                tabs=json.loads(raw)
+                print("CHROME_DEBUG_TABS",json.dumps({"total":len(tabs),"meet_tabs":sum("meet.google.com" in str(x.get("url","")) for x in tabs),
+                   "sign_in_tabs":sum("accounts.google.com" in str(x.get("url","")) for x in tabs),
+                   "error_tabs":sum("chrome-error" in str(x.get("url","")) for x in tabs)}))
+            except Exception as e:print("CHROME_DEBUG_TABS_UNAVAILABLE",type(e).__name__)
+            print("RECORDER_STATE_INSPECTION_DONE")
             PY
