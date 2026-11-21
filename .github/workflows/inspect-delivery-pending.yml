@@ -26,23 +26,17 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,os,subprocess,stat
+            import os,json,subprocess
             from pathlib import Path
-            state=json.loads(Path("data/state.json").read_text())
-            for x in list((state.get("pending_deliveries") or {}).values())[-5:]:
-                if not isinstance(x,dict):continue
-                v=str(x.get("file_path") or x.get("source_path") or x.get("raw_path") or "")
-                p=Path(v) if v else None
-                if not p or not p.is_file():continue
-                print("MEDIA_OWNER_UID",p.stat().st_uid,"MEDIA_OWNER_GID",p.stat().st_gid)
-                for label,part in (("recording_root",Path("/recordings")),("source_parent",p.parent)):
-                    st=part.stat()
-                    probe=subprocess.run(["runuser","-u","beonmeet","--","test","-w",str(part)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=6)
-                    print("DIR_PERMISSIONS",label,{"mode":oct(stat.S_IMODE(st.st_mode)),"uid":st.st_uid,"gid":st.st_gid,"controller_can_write":probe.returncode==0})
-                out=p.with_suffix(".mp3")
-                print("DERIVED_MP3_EXISTS",out.exists())
-                if out.exists():
-                    st=out.stat()
-                    print("DERIVED_MP3_META",{"bytes":st.st_size,"mode":oct(stat.S_IMODE(st.st_mode)),"uid":st.st_uid,"gid":st.st_gid})
-            print("PENDING_OUTPUT_DIRECTORY_PERMISSIONS_CHECK_DONE")
+            for name in ("setfacl","getfacl"):
+                p=subprocess.run(["sh","-c","command -v "+name],capture_output=True,text=True)
+                print("ACL_TOOL",name,"installed",p.returncode==0)
+            root=Path("/dev/shm/beonmeet")
+            print("RECORDING_ROOT_MODE",oct(root.stat().st_mode&0o7777))
+            children=list(root.iterdir()) if root.exists() else []
+            dirs=[p for p in children if p.is_dir()]
+            print("DIRECT_SUBDIRS_COUNT",len(dirs))
+            group_missing=sum(1 for p in dirs if not(p.stat().st_mode&0o020))
+            print("DIRECT_SUBDIRS_GROUP_NOT_WRITABLE",group_missing)
+            print("ACL_PERMISSIONS_AUDIT_DONE")
             PY
