@@ -97,6 +97,11 @@ FREE_WORKER_URLS = _worker_urls("FREE_WORKER_URLS", FREE_MEETING_BOT_URL)
 PREMIUM_WORKER_URLS = _worker_urls("PREMIUM_WORKER_URLS", PREMIUM_MEETING_BOT_URL)
 FREE_MEETING_SLOTS = int(os.environ.get("FREE_MEETING_SLOTS", "5"))
 PREMIUM_MEETING_SLOTS = int(os.environ.get("PREMIUM_MEETING_SLOTS", "3"))
+# One fragile Chrome CDP instance currently serves five advertised slots.
+# Until each production slot has its own verified isolated browser, serialize
+# joining into a single Chrome worker. Separate worker URLs can each use one.
+# Zero explicitly disables this guard after independent-browser E2E QA.
+SHARED_CHROME_MAX_ACTIVE = max(0, min(16, int(os.environ.get("SHARED_CHROME_MAX_ACTIVE", "1"))))
 INTERNAL_SECRET = os.environ["INTERNAL_SECRET"]
 RECORDING_ROOT = Path(os.environ.get("RECORDING_TMP_DIR", "/recordings")).resolve()
 DOWNLOAD_ROOT = DATA_DIR / "recording-downloads"
@@ -129,6 +134,9 @@ SCOPES = LEGACY_SCOPES
 
 state_lock = asyncio.Lock()
 queue_mutation_lock = asyncio.Lock()
+# Distinct from queue_mutation_lock: direct /now and queued dispatch must
+# never enter the *same* Chrome concurrently before isolated pools are ready.
+shared_chrome_dispatch_lock = asyncio.Lock()
 worker_health_cache: dict[str, bool] = {}
 remote_worker_cache: dict[str, dict[str, Any]] = {}
 # Runtime diagnostics are intentionally kept out of the durable OAuth/meeting state.
@@ -833,6 +841,18 @@ async def _dispatch_meeting(
     meet_url: str,
     premium: bool,
 ) -> tuple[bool, bool, str]:
+    # All entrypoints use this per-process lock. It prevents competing /now
+    # and queue dispatches from both observing a free shared Chrome slot.
+    async with shared_chrome_dispatch_lock:
+        return await _dispatch_meeting_serialized(event, req, meet_url, premium)
+
+
+async def _dispatch_meeting_serialized(
+    event: dict[str, Any],
+    req: dict[str, Any],
+    meet_url: str,
+    premium: bool,
+) -> tuple[bool, bool, str]:
     event_id = event.get("id") or str(uuid.uuid4())
     chat_id = str(req["chat_id"])
     payload = {
@@ -863,6 +883,26 @@ async def _dispatch_meeting(
     saw_busy = False
     async with httpx.AsyncClient(timeout=30.0) as client:
         for pool_name, base_url in targets:
+            # An HTTP 202 only means the worker accepted the job. The shared
+            # Chrome session crashed in a real Trusted test while an Open
+            # recording attempt was running. Until browser isolation is
+            # verified, put the next job in the normal durable queue.
+            if SHARED_CHROME_MAX_ACTIVE:
+                try:
+                    capacity_response = await client.get(f"{base_url}/capacity", timeout=6.0)
+                    capacity_response.raise_for_status()
+                    capacity_payload = capacity_response.json()
+                    capacity = capacity_payload.get("data") or capacity_payload
+                    currently_running = int(capacity.get("runningJobs") or 0)
+                    if currently_running >= SHARED_CHROME_MAX_ACTIVE:
+                        saw_busy = True
+                        continue
+                except Exception as exc:
+                    # Unknown capacity is not an invitation to overload
+                    # Chrome; preserve the request in the retryable queue.
+                    print(f"meeting capacity check error ({pool_name}):", type(exc).__name__, flush=True)
+                    saw_busy = True
+                    continue
             try:
                 response = await client.post(f"{base_url}/google/join", json=payload)
             except Exception as exc:
