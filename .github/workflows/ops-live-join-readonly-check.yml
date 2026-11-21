@@ -1,0 +1,88 @@
+name: Live BeOnMeet join/admission safety verification
+on:
+  push:
+    branches: [ops/live-join-readonly-check-20261121]
+    paths: [.github/workflows/ops-live-join-readonly-check.yml]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Inspect running controller and Google Meet worker (read-only)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 3m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1;; esac
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,urllib.request,subprocess,re
+            from pathlib import Path
+            def get(url):
+                with urllib.request.urlopen(url,timeout=8) as r:return json.load(r)
+            h=get('http://127.0.0.1:8109/health')
+            assert h.get('ok') is True, 'controller health failed'
+            print('CONTROLLER_HEALTH_OK',True)
+            print('CONTROLLER_QUEUE_COUNTS',{key:int(h.get(key) or 0) for key in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs')})
+            for port in (9124,9126):
+                c=get(f'http://127.0.0.1:{port}/capacity')
+                d=c.get('data') or c
+                print('WORKER_CAPACITY',port,{k:d.get(k) for k in ('runningJobs','maxConcurrentJobs','availableSlots')})
+            live=Path('app/main.py').read_text(encoding='utf8')
+            checks={'controller_shared_chrome_guard':'SHARED_CHROME_MAX_ACTIVE' in live and '_dispatch_meeting_serialized' in live,
+                    'waiting_callback':'/internal/waiting-for-admission' in live,
+                    'recording_started_callback':'/internal/recording-started' in live,
+                    'progress_loop':'async def join_progress_loop' in live}
+            worker='beonmeet-worker-five'
+            found=subprocess.check_output(['docker','inspect','-f','{{range .Mounts}}{{if eq .Destination "/usr/src/app/dist/bots/GoogleMeetBot.js"}}{{.Source}}{{end}}{{end}}',worker],text=True).strip()
+            assert found.startswith('/opt/beonmeet/'), 'worker overlay path not recognized'
+            overlay=Path(found).read_text(encoding='utf8')
+            checks.update({'trusted_join_playwright_patch':'GOOGLE_MEET_TRUSTED_JOIN_PATCH' in overlay,
+                           'strict_incall_proof_patch':'BEONMEET_MODERN_IN_CALL_PROOF_V1' in overlay})
+            print('JOIN_CODE_MARKERS',json.dumps(checks))
+            assert all(checks.values()), 'missing live join fix'
+            service=subprocess.run(['systemctl','is-active','beonmeet-controller'],text=True,capture_output=True,timeout=5)
+            print('CONTROLLER_SYSTEMD_ACTIVE',service.stdout.strip()=='active')
+            assert service.stdout.strip()=='active'
+            for name in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                p=subprocess.run(['docker','inspect','-f','{{.State.Health.Status}}',name],capture_output=True,text=True,timeout=5)
+                print('CAMCAM_HEALTH',name,p.stdout.strip())
+                assert p.stdout.strip()=='healthy'
+            for origin,cmd in [('controller',['journalctl','-u','beonmeet-controller','--since','20 minutes ago','--no-pager','-o','cat']),('recorder',['docker','logs','--since','20m',worker])]:
+                p=subprocess.run(cmd,capture_output=True,text=True,timeout=12)
+                raw=(p.stdout+'\n'+p.stderr)[-200000:]
+                patterns={'target_crashed':r'target crashed',
+                          'cdp_disconnect':r'ECONNREFUSED|WebSocket.*closed',
+                          'join_timeout':r'prejoin.*timeout|waiting.*timeout',
+                          'callback_failure':r'(recording-started|waiting-for-admission).*?(40[013]|50[0123])',
+                          'uncaught':r'unhandledrejection|uncaughtexception'}
+                print('RECENT_ERROR_COUNTS',origin,{k:len(re.findall(v,raw,re.I)) for k,v in patterns.items()})
+            print('READONLY_JOIN_RUNTIME_VERIFICATION_PASS')
+            PY
+            docker exec beonmeet-worker-five node -e '
+              (async()=>{
+                let timer=setTimeout(()=>process.exit(19),15500);
+                try{
+                  const {chromium}=require("playwright-extra");
+                  const browser=await chromium.connectOverCDP(process.env.GOOGLE_CHROME_CDP_URL,{timeout:10000});
+                  const contexts=browser.contexts();
+                  if(!contexts.length)process.exit(5);
+                  const cookies=await contexts[0].cookies("https://accounts.google.com");
+                  const names=new Set(cookies.map(c=>c.name));
+                  const authenticated=names.has("SID")&&names.has("SAPISID");
+                  console.log("GOOGLE_CHROME_AUTH_COOKIE_MARKERS",authenticated);
+                  console.log("CHROME_CONTEXTS",contexts.length);
+                  console.log("MEET_OPEN_TABS",contexts.flatMap(c=>c.pages()).filter(p=>p.url().startsWith("https://meet.google.com/")).length);
+                  clearTimeout(timer);
+                  process.exit(authenticated?0:6);
+                }catch(e){console.log("GOOGLE_CHROME_READ_ONLY_CHECK_FAILED",e.name);clearTimeout(timer);process.exit(7);}
+              })();'
+            curl -fsS --max-time 8 https://beonmeet.smarbiz.sbs/health >/dev/null
+            echo LIVE_BEONMEET_LOGIN_READ_ONLY_SMOKE_PASS
