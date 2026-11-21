@@ -1,0 +1,114 @@
+name: One-time BeOnMeet controller recording path repair
+
+on:
+  push:
+    branches: [ops/fix-controller-recordings-path-20261121]
+    paths:
+      - .github/workflows/repair-controller-recordings-path-once.yml
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Safely fix controller path to shared recorder files
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 5m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST; exit 1 ;; esac
+            test "$(id -u)" = 0
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 60 9
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,os,subprocess,urllib.request
+            from pathlib import Path
+            root=Path("/dev/shm/beonmeet")
+            link=Path("/recordings")
+            assert root.is_dir() and not root.is_symlink()
+            st=root.stat()
+            assert (st.st_uid,st.st_gid,st.st_mode & 0o7777)==(1001,987,0o2770),"Recordings ownership or mode unexpected"
+            assert not link.exists() and not link.is_symlink(),"Target /recordings already exists; inspect, do not overwrite"
+            pid=subprocess.check_output(["systemctl","show","-p","MainPID","--value","beonmeet-controller"],text=True).strip()
+            data=dict(x.split(b"=",1) for x in Path("/proc/"+pid+"/environ").read_bytes().split(b"\\x00") if b"=" in x)
+            assert data.get(b"RECORDING_TMP_DIR",b"/recordings")==b"/recordings","Unexpected controller recording root"
+            assert subprocess.check_output(["systemctl","show","-p","User","--value","beonmeet-controller"],text=True).strip()=="beonmeet"
+            with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=8) as resp: health=json.load(resp)
+            assert health.get("ok") is True
+            for key in ("free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs"):
+                assert int(health.get(key) or 0)==0,"Controller busy "+key
+            for port in (9124,9126):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=8) as resp: data=json.load(resp)
+                assert int((data.get("data") or data).get("runningJobs") or 0)==0,"Worker busy"
+            for name in ("beonmeet-worker-five","beonmeet-worker-single"):
+                conf=json.loads(subprocess.check_output(["docker","inspect",name],text=True))[0]
+                mounts=[m for m in conf.get("Mounts",[]) if m.get("Destination")=="/recordings"]
+                assert len(mounts)==1 and mounts[0].get("Source")==str(root) and mounts[0].get("RW"),"Unexpected recorder volume"
+                assert conf["State"]["Running"],"Recorder not running"
+            for name in ("camcam-shared-api-1","camcam-shared-pet-1","camcam-shared-archive-1","camcam-shared-petarchive-1"):
+                assert subprocess.check_output(["docker","inspect","--format","{{.State.Health.Status}}",name],text=True).strip()=="healthy","CamCam precheck failed"
+            print("PRECHECK_SHARED_HOST_IDLE_CORRECT")
+            PY
+            stamp=$(date -u +%Y%m%dT%H%M%SZ)
+            backup="/opt/beonmeet/.recording-path-repair-backup-$stamp"
+            mkdir -m 700 "$backup"
+            cp -p .env "$backup/controller-env.before"
+            cp -p app/main.py "$backup/controller-code.before"
+            if [ -s data/state.json ]; then cp -p data/state.json "$backup/state.before"; fi
+            python3 - "$backup" <<'PY'
+            import sqlite3,sys,os
+            from pathlib import Path
+            db=Path("/opt/beonmeet/data/beonmeet.db")
+            if db.exists():
+                src=sqlite3.connect("file:"+str(db)+"?mode=ro",uri=True)
+                dest=sqlite3.connect(str(Path(sys.argv[1])/"beonmeet-db.before"))
+                src.backup(dest)
+                dest.close();src.close()
+                os.chmod(str(Path(sys.argv[1])/"beonmeet-db.before"),0o600)
+            print("BACKUPS_CREATED")
+            PY
+            changed=0
+            completed=0
+            rollback() {
+              if [ "$changed" = 1 ] && [ "$completed" = 0 ]; then
+                echo ROLLBACK_CONTROLLER_RECORDINGS_PATH
+                if [ -L /recordings ] && [ "$(readlink /recordings)" = /dev/shm/beonmeet ]; then rm /recordings; fi
+                systemctl restart beonmeet-controller || true
+              fi
+            }
+            trap rollback EXIT
+            ln -s /dev/shm/beonmeet /recordings
+            changed=1
+            test "$(readlink -f /recordings)" = /dev/shm/beonmeet
+            runuser -u beonmeet -- test -w /recordings
+            probe=".controller-volume-probe-$stamp"
+            docker exec beonmeet-worker-five sh -c "printf 'verified' > /recordings/$probe"
+            test "$(runuser -u beonmeet -- cat "/recordings/$probe")" = verified
+            docker exec beonmeet-worker-five rm "/recordings/$probe"
+            echo CONTROLLER_WORKER_SHARED_FILE_READ_PROOF
+            systemctl restart beonmeet-controller
+            ready=0
+            for i in $(seq 1 25); do
+              if curl -fsS --max-time 3 http://127.0.0.1:8109/health >/dev/null; then ready=1; break; fi
+              sleep 2
+            done
+            test "$ready" = 1 || { echo CONTROLLER_HEALTH_FAILED; exit 1; }
+            test "$(readlink -f /recordings)" = /dev/shm/beonmeet
+            curl -fsS --max-time 8 https://beonmeet.smarbiz.sbs/health >/dev/null
+            for name in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1; do
+              test "$(docker inspect -f '{{.State.Health.Status}}' "$name")" = healthy
+            done
+            completed=1
+            trap - EXIT
+            echo RECORDINGS_CONTROLLER_PATH_FIXED_LIVE
+            echo CONTROLLER_HEALTHY_CAMCAM_UNCHANGED
