@@ -26,22 +26,22 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import os,json,subprocess,re
+            import subprocess,json,os,shutil
             from pathlib import Path
-            x=json.loads(Path("data/state.json").read_text())
-            a=list((x.get("pending_deliveries") or {}).values())
-            for p in a:
-                if not isinstance(p,dict):continue
-                s=str(p.get("last_error") or "")
-                tr=s.split("transcript=",1)[-1]
-                signatures=("RuntimeError","OSError","FileNotFoundError","MemoryError","Whisper","model","Download","HuggingFace","Connection","HTTP","401","403","429","500","503","Timeout","CTranslate2","int8","CPU","thread","corrupt","allocator","OpenMP","ct2","out of memory","Killed","permission denied","EACCES","not found","missing","unavailable","HTTPSConnectionPool")
-                print("TRANSCRIPT_ERROR_FINGERPRINT",json.dumps({"type_prefix":tr.split("(",1)[0][:90],"markers":[t for t in signatures if t.lower() in tr.lower()],"chars":len(tr),"attempts":p.get("attempts"),"audio_delivered":p.get("audio_delivered")}))
-            modelroot=Path("/opt/beonmeet/data/whisper-models")
-            print("WHISPER_CACHE_EXISTS",modelroot.is_dir())
-            if modelroot.is_dir():
-                print("WHISPER_CACHE_TOPLEVEL_ENTRIES",len(list(modelroot.iterdir())))
-                print("WHISPER_CACHE_TOTAL_MB",round(sum(p.stat().st_size for p in modelroot.rglob("*") if p.is_file())/1048576,1))
-            p=subprocess.run(["systemctl","show","beonmeet-controller","-p","MemoryCurrent","-p","CPUUsageNSec"],capture_output=True,text=True)
-            print("CONTROLLER_RESOURCES",p.stdout.strip().replace("\n"," | "))
-            print("TRANSCRIPT_ERROR_FINGERPRINT_DONE")
+            def cmd(a,timeout=20):
+                p=subprocess.run(a,capture_output=True,text=True,timeout=timeout)
+                return p.returncode,p.stdout.strip(),p.stderr.strip()
+            status,out,_=cmd(["systemctl","show","-p","ExecStart","--value","beonmeet-controller"])
+            print("SERVICE_ENTRY_INTERPRETER_KIND","venv" if "/.venv/" in out else ("system" if "/usr/bin/python" in out else "unknown"))
+            for py in ("/opt/beonmeet/.venv/bin/python","/usr/bin/python3"):
+                if not Path(py).exists():continue
+                c,stdout,stderr=cmd([py,"-c","import importlib.util; print('faster_whisper',bool(importlib.util.find_spec('faster_whisper')));print('av',bool(importlib.util.find_spec('av'))); print('ctranslate2',bool(importlib.util.find_spec('ctranslate2')))"])
+                print("PY_ENV",("venv" if "/.venv/" in py else "system"),"exit",c,stdout.replace("\n",";"))
+            print("PY_PIP_VERSION",cmd(["/opt/beonmeet/.venv/bin/python","-m","pip","--version"])[0])
+            c,out,err=cmd(["df","-h","/opt/beonmeet"])
+            print("HOST_DISK",out.splitlines()[-1].split()[1:5] if c==0 else "unavailable")
+            conf=Path("/opt/beonmeet/.env").read_text()
+            keys={line.split("=",1)[0].strip():line.split("=",1)[1].strip() for line in conf.splitlines() if "=" in line and not line.lstrip().startswith("#")}
+            print("TRANSCRIPTION_SETTINGS",json.dumps({k:keys.get(k,"[DEFAULT]") for k in ("WHISPER_MODEL","RECOVERY_WHISPER_MODEL","WHISPER_CPU_THREADS","TRANSCRIPTION_CONCURRENCY")}))
+            print("WHISPER_RUNTIME_READONLY_AUDIT_COMPLETE")
             PY
