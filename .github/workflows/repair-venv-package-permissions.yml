@@ -49,7 +49,7 @@ jobs:
                     elif item.is_file() and mode in (0o600,0o700):
                         changed.append((str(item),mode,0o644 if mode==0o600 else 0o755))
             assert 0<len(changed)<50000,"Unexpected count of restricted site-package files"
-            backup=Path("/opt/beonmeet/.whisper-permissions-backup-20261121-v2.json")
+            backup=Path("/opt/beonmeet/.whisper-permissions-backup-20261121-v3.json")
             assert not backup.exists(),"Prior permissions repair already ran"
             backup.write_text(json.dumps({"modified_at":datetime.now(timezone.utc).isoformat(),
                 "entries":[[str(Path(p).relative_to(root)),old] for p,old,_ in changed]}))
@@ -66,7 +66,10 @@ jobs:
                     capture_output=True,text=True,timeout=30)
                 if user.returncode!=0:
                     last=user.stderr.strip().splitlines()[-1] if user.stderr else "unknown"
+                    import re
+                    redacted=re.sub(r"/[^ ,:\\x27\\x22)]+","[PATH]",last)
                     print("SERVICE_IMPORT_FAILURE_CLASS",last.split(":",1)[0][:85])
+                    print("SERVICE_IMPORT_FAILURE_SUMMARY",redacted[:230])
                 assert user.returncode==0, "Nonroot Whisper import failed, reverting"
                 assert "SERVICE_WHISPER_IMPORT_PASS" in user.stdout
                 print("NONROOT_SERVICE_IMPORTS_VERIFIED")
