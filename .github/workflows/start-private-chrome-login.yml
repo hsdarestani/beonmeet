@@ -33,7 +33,8 @@ jobs:
             chmod 0700 "$dest"
             stage=$(mktemp -d /opt/beonmeet/.private-chrome-login-stage.XXXXXXXX)
             trap 'rm -rf "$stage"' EXIT
-            git show "$release:scripts/secure_chrome_login_gateway.py" > "$stage/manager.py"
+            git fetch -q origin ops/start-private-chrome-google-login-20261121
+            git show 7c2b845903f137fcf44351d74ab9cf97c7751296:scripts/secure_chrome_login_gateway.py > "$stage/manager.py"
             python3 -m py_compile "$stage/manager.py"
             cmp -s "$stage/manager.py" "$dest/manager.py" || install -m 600 "$stage/manager.py" "$dest/manager.py"
             python3 "$dest/manager.py" setup
