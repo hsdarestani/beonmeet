@@ -53,12 +53,15 @@ jobs:
             dest=/tmp/beonmeet-five-balanced-qa.js
             out=/tmp/beonmeet-five-balanced-20261121
             abort=/tmp/beonmeet-five-sustained-abort-20261119
+            # Remove only the exact stale QA script left root-owned by a prior
+            # failed docker-cp run; never inspect or remove any customer files.
+            docker exec -u 0 "$worker" rm -f "$dest"
             docker exec "$worker" test ! -e "$dest"
             docker exec "$worker" test ! -e "$out"
             docker exec "$worker" test ! -e "$abort"
             stage=$(mktemp -d /opt/beonmeet/.stage-five-balanced.XXXXXXXX)
             cleanup() {
-              docker exec "$worker" rm -f "$dest" "$abort" >/dev/null 2>&1 || true
+              docker exec -u 0 "$worker" rm -f "$dest" "$abort" >/dev/null 2>&1 || true
               docker exec "$worker" rm -rf "$out" >/dev/null 2>&1 || true
               docker rm -f "$qa" >/dev/null 2>&1 || true
               rm -rf "$stage"
