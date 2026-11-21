@@ -122,7 +122,14 @@ jobs:
             trap rollback EXIT
             updated=1
             cp -p "$stage/env" .env
+            chmod --reference="$backup/.env" .env
+            chown --reference="$backup/.env" .env
             cp -p "$stage/main.py" app/main.py
+            chmod --reference="$backup/main.py" app/main.py
+            chown --reference="$backup/main.py" app/main.py
+            service_user=$(systemctl show -p User --value beonmeet-controller)
+            if [ -n "$service_user" ]; then runuser -u "$service_user" -- test -r /opt/beonmeet/app/main.py; fi
+            echo PYTHON_CONTROLLER_FILE_PERMISSIONS_PRESERVED
             systemctl restart beonmeet-controller
             ready=0
             for i in $(seq 1 30); do
