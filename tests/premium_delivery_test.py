@@ -128,5 +128,5 @@ assert 'if attempts >= PENDING_DELIVERY_MAX_ATTEMPTS:' in MAIN
 assert '"recovery_exhausted_notified"' in MAIN
 assert "if not video_already_delivered:" in MAIN
 assert 'pending_state["video_delivered"] = True' in MAIN
-assert I18N.count('"delivery_recovery_exhausted"') == 3
+assert (ROOT / "app" / "i18n.py").read_text(encoding="utf-8").count('"delivery_recovery_exhausted"') == 3
 print("PREMIUM_PENDING_RETRY_AFTER_INFRA_REPAIR_TEST_PASS")
