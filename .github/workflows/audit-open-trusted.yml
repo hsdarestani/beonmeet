@@ -22,52 +22,15 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import subprocess,json,datetime
-            print("ADMISSION_DOM_CHECK_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            js=r"""
-            (async()=>{
-              let timer=setTimeout(()=>process.exit(19),16000);
-              try {
-                const {chromium}=require('playwright-extra');
-                const b=await chromium.connectOverCDP(process.env.GOOGLE_CHROME_CDP_URL,{timeout:9500});
-                let i=0;
-                for(const ctx of b.contexts()) {
-                  for(const page of ctx.pages()){
-                    if(!page.url().startsWith('https://meet.google.com/'))continue;
-                    i++;
-                    const result=await page.evaluate(()=>{
-                      const buttons=Array.from(document.querySelectorAll('button'));
-                      const labels=buttons.map(b=>String(b.getAttribute('aria-label')||b.innerText||''));
-                      const body=(document.body?.innerText||'').toLowerCase();
-                      const re=(pattern)=>labels.some(x=>pattern.test(x));
-                      const counts=labels.filter(x=>/People|Personen|participant|Teilnehmer|افراد|شرکت‌کننده/i.test(x)).map(x=>x.replace(/[^\d]/g,'').slice(0,3)).filter(x=>!!x);
-                      return {
-                        has_leave_button:re(/Leave call|Anruf verlassen|تماس را ترک|Exit meeting/i),
-                        has_people_button:re(/People|Personen|participants|Teilnehmer|افراد/i),
-                        has_mic_toggle:re(/microphone|microfon|mikrofon|میکروفون/i),
-                        has_camera_toggle:re(/camera|kamera|دوربین/i),
-                        has_present_button:re(/present now|present screen|jetzt präsentieren|ارائه/i),
-                        has_reaction:re(/reactions|reaction|reaktion/i),
-                        has_raising_hand:re(/raise hand|hand heben|دست/i),
-                        has_chat:re(/chat|چت/i),
-                        ask_to_join:re(/Ask to join|Teilnahme erbitten/i),
-                        join_now:re(/Join now|Jetzt teilnehmen/i),
-                        waiting_to_be_admitted:body.includes('asking to join')||body.includes('let you in')||body.includes('waiting for someone')||body.includes('bitte warten'),
-                        admission_rejected:body.includes('not allowed')||body.includes('you cannot join')||body.includes('could not join'),
-                        participant_button_number_strings:counts.slice(0,4),
-                        button_total:buttons.length
-                      }
-                    });
-                    console.log('LIVE_MEET_PAGE_FLAGS',i,JSON.stringify(result));
-                  }
-                }
-                console.log('MATCHED_MEET_TABS',i);
-              }catch(e){console.log('LIVE_MEET_DOM_DIAG_ERROR',e.name)}
-              clearTimeout(timer);process.exit(0);
-            })();
-            """
-            p=subprocess.run(["docker","exec","beonmeet-worker-five","node","-e",js],capture_output=True,text=True,timeout=26)
-            for line in p.stdout.splitlines():
-                if line.startswith(("LIVE_MEET_PAGE_FLAGS","MATCHED_MEET_TABS","LIVE_MEET_DOM_DIAG_ERROR")):print(line[:1000])
-            print("LIVE_MEET_DOM_DIAG_EXIT",p.returncode)
+            import subprocess
+            p=subprocess.run(["docker","exec","beonmeet-worker-five","cat","/usr/src/app/dist/bots/GoogleMeetBot.js"],capture_output=True,text=True,timeout=20)
+            s=p.stdout
+            for n,k in (("PARTICIPANT_DETECTION","const participantCountDetected ="),("BROWSER_JOIN_CONFIRM","if (participantCountDetected)"),("PROMISE_RETURN","await waitAtLobbyPromise"),("RECORDING_START","recordingStarted"),("RECORDING_STARTED_NOTICE","notifyBeOnMeetRecordingStarted")):
+                i=s.find(k)
+                print("SOURCE_ANCHOR",n,i)
+                if i>=0:
+                    print("SOURCE_FRAGMENT_BEGIN",n)
+                    print(s[max(0,i-120):i+5300])
+                    print("SOURCE_FRAGMENT_END",n)
+            print("SOURCE_PARTICIPANT_DIAGNOSTIC_COMPLETE")
             PY
