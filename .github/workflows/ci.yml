@@ -39,6 +39,7 @@ jobs:
           node --check tests/five_sustained_av_smoke.js
           python3 tests/low_resource_capture_patch_test.py
           python3 tests/capture_quality_profile_test.py
+          python3 tests/turbo_transcription_config_test.py
           python3 tests/uploader_folder_permissions_test.py
           python3 tests/trusted_meet_join_overlay_test.py
           python3 tests/guest_join_block_notice_test.py

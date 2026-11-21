@@ -5,8 +5,8 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
 
 required = [
-    'WHISPER_MODEL", "large-v3"',
-    'TRANSCRIPTION_CHUNK_SECONDS", "120"',
+    'WHISPER_MODEL", "large-v3-turbo"',
+    'TRANSCRIPTION_CHUNK_SECONDS", "360"',
     'language=None',
     '"64k"',
     'async def send_audio_to_recipients',
