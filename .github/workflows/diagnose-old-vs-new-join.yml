@@ -1,0 +1,94 @@
+name: Read-only compare original BeOnMeet profile against new recorder
+on:
+  push:
+    branches: [ops/read-only-historical-join-regression-20261121]
+    paths: [.github/workflows/diagnose-old-vs-new-join.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - name: Read-only Chrome profile and historical join diagnostics
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: \${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 5m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import subprocess,datetime,json,urllib.request,collections
+            print("REGRESSION_AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
+            for port in (8109,9124,9126):
+                try:
+                    with urllib.request.urlopen("http://127.0.0.1:"+str(port)+("/health" if port==8109 else "/capacity"),timeout=7) as resp:d=json.load(resp)
+                    d=d.get("data",d)
+                    ks=("ok","max_concurrent_meetings","free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs","runningJobs","availableSlots")
+                    print("SERVICE_HEALTH",port,json.dumps({k:d.get(k) for k in ks if k in d}))
+                except Exception as exc:print("SERVICE_HEALTH_ERROR",port,type(exc).__name__)
+            for name in ("beonmeet-chrome-single","beonmeet-worker-single","beonmeet-worker-five"):
+                p=subprocess.run(["docker","inspect","--format","{{json .State}}",name],capture_output=True,text=True,timeout=8)
+                if p.returncode!=0:continue
+                state=json.loads(p.stdout)
+                print("RUNTIME_CONTAINER",name,json.dumps({k:state.get(k) for k in ("Status","Running","OOMKilled","StartedAt")}))
+                p=subprocess.run(["docker","inspect","-f","{{json .Mounts}}",name],capture_output=True,text=True,timeout=8)
+                if p.returncode==0:print("MOUNT_TYPES_DESTINATIONS",name,[(x.get("Type"),x.get("Destination")) for x in json.loads(p.stdout)])
+            for name in ("beonmeet-worker-single","beonmeet-worker-five"):
+                p=subprocess.run(["docker","exec",name,"sh","-c","grep -q 'GOOGLE_MEET_TRUSTED_JOIN_PATCH' /usr/src/app/dist/bots/GoogleMeetBot.js"],capture_output=True,text=True,timeout=9)
+                print("TRUSTED_JOIN_PATCH_PRESENT",name,p.returncode==0)
+            # Do not output any cookie value or account identifier.
+            js=r"""
+            (async()=>{
+              try{
+                const {chromium}=require('playwright-extra');
+                const timer=setTimeout(()=>process.exit(19),14000);
+                const b=await chromium.connectOverCDP(process.env.GOOGLE_CHROME_CDP_URL,{timeout:10000});
+                const cs=b.contexts();let names=new Set();
+                for(const ctx of cs){
+                  for(const cookie of await ctx.cookies(['https://accounts.google.com','https://meet.google.com'])){
+                    if(cookie.domain.includes('google.com'))names.add(cookie.name);
+                  }
+                }
+                const keys=['SID','HSID','SSID','APISID','SAPISID','LSID','__Secure-1PSID','__Secure-3PSID'];
+                console.log('GOOGLE_AUTH_COOKIE_PRESENCE',JSON.stringify(Object.fromEntries(keys.map(k=>[k,names.has(k)]))));
+                console.log('CHROME_CONTEXTS',cs.length);
+                console.log('CHROME_TABS',cs.reduce((v,c)=>v+c.pages().length,0));
+                clearTimeout(timer);process.exit(0);
+              }catch(e){console.log('CHROME_PROFILE_CHECK_ERROR',e.name);process.exit(4)}
+            })();
+            """
+            p=subprocess.run(["docker","exec","beonmeet-worker-five","node","-e",js],capture_output=True,text=True,timeout=23)
+            print("GOOGLE_AUTH_READONLY_EXIT",p.returncode)
+            for line in p.stdout.splitlines():
+                if line.startswith(("GOOGLE_AUTH_COOKIE_","CHROME_CONTEXTS","CHROME_TABS","CHROME_PROFILE_CHECK_ERROR")):print(line[:300])
+            markers={
+              "guest_prejoin":"Guest pre-join detected",
+              "prejoin_ready":"Google Meet pre-join controls are ready",
+              "click":"Success clicked using",
+              "redirect":"Google Meet Bot was redirected away",
+              "begin_recording":"Begin recording",
+              "recording_started":"Recording started",
+              "completed":"Meeting job completed",
+              "waiting_for_host":"waiting for the host to admit",
+              "timeout":"TimeoutError",
+              "retry":"Retry count",
+              "failed":"Meeting job permanently failed"
+            }
+            for name in ("beonmeet-worker-single","beonmeet-worker-five"):
+                p=subprocess.run(["docker","logs","--since","2026-11-20T00:00:00Z",name],capture_output=True,text=True,timeout=20)
+                events=[]
+                for line in (p.stdout+"\n"+p.stderr).splitlines():
+                    if not line.startswith('[2026-11-'):continue
+                    message=line.split('] ',4)[-1].split(' {',1)[0]
+                    hits=[k for k,v in markers.items() if v.lower() in message.lower()]
+                    if hits:events.append([line[1:24],hits])
+                print("WORKER_HISTORICAL_COUNTS",name,json.dumps(dict(collections.Counter(k for _,hits in events for k in hits))))
+                print("WORKER_LAST_EVENTS",name,json.dumps(events[-38:]))
+                print("WORKER_RECORDING_EVENTS",name,json.dumps([e for e in events if any(k in e[1] for k in ("begin_recording","recording_started","completed"))][-20:]))
+            print("REGRESSION_AUDIT_COMPLETE")
+            PY
