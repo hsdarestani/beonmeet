@@ -85,4 +85,46 @@ jobs:
                 }catch(e){console.log("GOOGLE_CHROME_READ_ONLY_CHECK_FAILED",e.name);clearTimeout(timer);process.exit(7);}
               })();'
             curl -fsS --max-time 8 https://beonmeet.smarbiz.sbs/health >/dev/null
+            python3 - <<'PY'
+            import subprocess,re,json,datetime
+            from pathlib import Path
+            now=datetime.datetime.now(datetime.timezone.utc)
+            print("JOIN_TRIAGE_TIME_UTC",now.isoformat())
+            terms=re.compile(r'join|leave|left|inactiv|alone|participant|meeting.*end|end.*meeting|record|capture|duration|timeout|error|fail|disconnect|admission|page.*clos|browser|websocket|session|stop|terminate|mute',re.I)
+            def redact(s):
+                s=re.sub(r'https?://[^\\s]+','[URL]',s)
+                s=re.sub(r'(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}','[EMAIL]',s)
+                s=re.sub(r'(?i)(bearer|token|secret|password|authorization)[=: ]+[^,} \\t]+',r'\\1=[REDACTED]',s)
+                s=re.sub(r'(?<![a-z0-9])[0-9]{7,}(?![a-z0-9])','[ID]',s)
+                s=re.sub(r'(?i)(userId|chat_id|eventId|botId|meetingId|calendarId|meetingCode)["\\s:=-]+[^,} ]+',r'\\1=[REDACTED]',s)
+                return s[:420]
+            sources=[('recorder', ['docker','logs','--since','40m','beonmeet-worker-five']),
+                     ('controller',['journalctl','-u','beonmeet-controller','--since','40 minutes ago','--no-pager','-o','short-iso'])]
+            for name,cmd in sources:
+                p=subprocess.run(cmd,capture_output=True,text=True,timeout=15)
+                lines=(p.stdout+'\\n'+p.stderr).splitlines()
+                relevant=[redact(l) for l in lines if terms.search(l)]
+                print("JOIN_TRIAGE_LOG",name,"total_lines",len(lines),"relevant_lines",len(relevant),"return_code",p.returncode)
+                for line in relevant[-85:]:print("EVENT",name,line)
+            for base in ('/opt/beonmeet/data/state.json','/opt/beonmeet/controller_state/state.json'):
+                fp=Path(base)
+                if not fp.is_file():continue
+                try:
+                    st=json.loads(fp.read_text())
+                    launched=st.get('launched_events') or {}
+                    recent=sorted((v for v in launched.values() if isinstance(v,dict)),key=lambda x:x.get('launched_at',''),reverse=True)[:8]
+                    for i,v in enumerate(recent):
+                        print("LAST_LAUNCH",i,{k:v.get(k) for k in ('status','launched_at','recording_started_at','waiting_since','error') if k in v})
+                    print("LAUNCHED_COUNT",len(launched))
+                except Exception as e:print("STATE_SUMMARY_ERROR",type(e).__name__)
+                break
+            p=subprocess.run(['docker','inspect','beonmeet-worker-five'],capture_output=True,text=True,timeout=7)
+            if p.returncode==0:
+                x=json.loads(p.stdout)[0]
+                env=x.get('Config',{}).get('Env') or []
+                for prefix in ('LONE_PARTICIPANT_EXIT_DELAY_SECONDS=','MEETING_INACTIVITY_MINUTES=','INACTIVITY_DETECTION_START_DELAY_MINUTES=','JOIN_WAIT_TIME_MINUTES=','MAX_RECORDING_DURATION_MINUTES='):
+                    vals=[v for v in env if v.startswith(prefix)]
+                    print("WORKER_DURATION_SETTING",vals[0] if vals else prefix+'<unset>')
+            print("JOIN_TRIAGE_READ_ONLY_COMPLETE")
+            PY
             echo LIVE_BEONMEET_LOGIN_READ_ONLY_SMOKE_PASS
