@@ -27,7 +27,7 @@ OLD = '''                for (const track of stream.getVideoTracks()) {
 
 NEW = '''                // The five-slot trial on a shared VPS uses a moderate profile.
                 // High requires real 5-room capacity QA on a stronger server.
-                const qualityName = String(process.env.BEONMEET_CAPTURE_QUALITY || 'balanced').toLowerCase();
+                const qualityName = String(captureQuality || 'balanced').toLowerCase();
                 const recordingQuality = qualityName === 'high'
                     ? { width: 1280, height: 720, fps: 15, maxFps: 15, video: 1200000, audio: 96000 }
                     : qualityName === 'low'
@@ -51,10 +51,24 @@ NEW = '''                // The five-slot trial on a shared VPS uses a moderate 
                 });'''
 
 
+# These anchors belong to the pinned compiled GoogleMeetBot.js source.
+# Playwright evaluate executes in the browser, where Node process.env is absent.
+SIG_OLD = "await this.page.evaluate(async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, mimeTypes }) => {"
+SIG_NEW = SIG_OLD.replace("mimeTypes })", "mimeTypes, captureQuality })")
+ARGS_OLD = "            mimeTypes\n        });"
+ARGS_NEW = "            mimeTypes,\n            captureQuality: process.env.BEONMEET_CAPTURE_QUALITY || 'balanced'\n        });"
+
+
 def patched_source(source: str) -> str:
     if source.count(OLD) != 1 or "const recordingQuality =" in source:
         raise ValueError("Unknown/already-upgraded worker; refuse unsafe patch")
-    return source.replace(OLD, NEW, 1)
+    if source.count(SIG_OLD) != 1 or source.count(ARGS_OLD) != 1:
+        raise ValueError("Unsupported recorder evaluate signature; refuse unsafe patch")
+    output = source.replace(OLD, NEW, 1)
+    output = output.replace(SIG_OLD, SIG_NEW, 1)
+    output = output.replace(ARGS_OLD, ARGS_NEW, 1)
+    assert "String(process.env.BEONMEET_CAPTURE_QUALITY" not in output
+    return output
 
 
 if __name__ == "__main__":

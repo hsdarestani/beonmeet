@@ -14,11 +14,14 @@ def module(name,path):
 
 low=module("low_resource",ROOT/"patches/patch_low_resource_compiled_recorder.py")
 quality=module("capture_quality",ROOT/"patches/patch_capture_quality_profile.py")
-base=low.OLD_CODEC+"\n"+low.OLD_RECORDER+"\n"
+base=quality.SIG_OLD+"\n"+low.OLD_CODEC+"\n"+low.OLD_RECORDER+"\n"+quality.ARGS_OLD+"\n"
 prepared=low.patched_source(base)
 assert prepared.count(quality.OLD)==1, "Overlay must match deployed 360p patch"
 upgraded=quality.patched_source(prepared)
 assert "BEONMEET_CAPTURE_QUALITY" in upgraded
+assert "String(process.env.BEONMEET_CAPTURE_QUALITY" not in upgraded
+assert "String(captureQuality || 'balanced')" in upgraded
+assert "captureQuality: process.env.BEONMEET_CAPTURE_QUALITY" in upgraded
 assert "width: 854, height: 480" in upgraded
 assert "width: 1280, height: 720" in upgraded
 assert "width: 640, height: 360" in upgraded

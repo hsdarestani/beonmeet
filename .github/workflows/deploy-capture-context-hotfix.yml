@@ -1,0 +1,134 @@
+name: Guarded fix for BeOnMeet immediate Meet exit after recording starts
+on:
+  push:
+    branches: [ops/fix-capture-context-early-exit-20261121]
+    paths: [.github/workflows/deploy-capture-context-hotfix.yml]
+permissions:
+  contents: read
+jobs:
+  hotfix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify browser-context quality regression
+        run: |
+          python3 -m py_compile patches/patch_browser_quality_context.py
+          python3 tests/browser_quality_context_test.py
+      - name: Deploy exact compiled worker fix only when every recorder idle
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 17m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST;exit 1;; esac
+            test "$(id -u)" = 0
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 75 9
+            cd /opt/beonmeet
+            git fetch -q origin ops/fix-capture-context-early-exit-20261121
+            release=${{ github.sha }}
+            git cat-file -e "$release^{commit}"
+            git merge-base --is-ancestor "$release" FETCH_HEAD
+            stage=$(mktemp -d /opt/beonmeet/.browser-quality-stage.XXXXXXXX)
+            backup=$(mktemp -d /opt/beonmeet/.browser-quality-backup.XXXXXXXX)
+            cleanup_stage() { rm -rf "$stage"; }
+            trap cleanup_stage EXIT
+            git show "$release:patches/patch_browser_quality_context.py" > "$stage/patch.py"
+            python3 -m py_compile "$stage/patch.py"
+            worker=beonmeet-worker-five
+            overlay=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/usr/src/app/dist/bots/GoogleMeetBot.js"}}{{.Source}}{{end}}{{end}}' "$worker")
+            case "$overlay" in /opt/beonmeet/*) : ;; *) echo UNKNOWN_WORKER_SOURCE; exit 1;; esac
+            test -s "$overlay"
+            grep -q BEONMEET_MODERN_IN_CALL_PROOF_V1 "$overlay"
+            grep -q GOOGLE_MEET_TRUSTED_JOIN_PATCH "$overlay"
+            ! grep -q BEONMEET_BROWSER_QUALITY_ARG_V1 "$overlay"
+            python3 "$stage/patch.py" "$overlay" "$stage/GoogleMeetBot.fixed.js"
+            image=$(docker inspect -f '{{.Config.Image}}' "$worker")
+            docker run --rm --network none --cpus=.4 --memory=256m --entrypoint node -v "$stage/GoogleMeetBot.fixed.js:/tmp/fixed.js:ro" "$image" --check /tmp/fixed.js
+            echo CAPTURE_CONTEXT_PATCH_COMPILATION_PASS
+            python3 - <<'PY'
+            import json,subprocess,urllib.request,time
+            def idle():
+                with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=6) as r:h=json.load(r)
+                assert h.get('ok') is True
+                for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'):
+                    if int(h.get(k) or 0)>0:return False
+                for port in (9124,9126):
+                    with urllib.request.urlopen(f'http://127.0.0.1:{port}/capacity',timeout=6) as r:d=json.load(r)
+                    if int((d.get('data') or d).get('runningJobs') or 0)>0:return False
+                return True
+            for i in range(150):
+                if idle():break
+                if i==149:raise RuntimeError('Recording, queue or delivery active; abort without restart')
+                time.sleep(6)
+            for name in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',name],text=True).strip()=='healthy'
+            print('IDLE_BOTH_RECORDER_POOLS_AND_CAMCAM_GREEN')
+            PY
+            cp -p "$overlay" "$backup/GoogleMeetBot.before.js"
+            test -s "$backup/GoogleMeetBot.before.js"
+            changed=0
+            complete=0
+            rollback() {
+              if [ "$changed" = 1 ] && [ "$complete" = 0 ]; then
+                cat "$backup/GoogleMeetBot.before.js" > "$overlay"
+                docker restart --time 20 "$worker" >/dev/null || true
+                echo BROWSER_QUALITY_HOTFIX_ROLLED_BACK
+              fi
+              rm -rf "$stage"
+            }
+            trap rollback EXIT
+            python3 - <<'PY'
+            import json,urllib.request
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=5) as r:h=json.load(r)
+            for key in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'):
+                assert int(h.get(key) or 0)==0,'System no longer idle'
+            for port in (9124,9126):
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/capacity',timeout=5) as r:x=json.load(r)
+                assert int((x.get('data') or x).get('runningJobs') or 0)==0,'Recorder no longer idle'
+            print('IMMEDIATE_PRE_RESTART_IDLE_RECHECK_PASS')
+            PY
+            changed=1
+            cat "$stage/GoogleMeetBot.fixed.js" > "$overlay"
+            docker restart --time 20 "$worker" >/dev/null
+            ready=0
+            for i in $(seq 1 25);do
+              if curl -fsS --max-time 3 http://127.0.0.1:9126/capacity >/dev/null 2>&1;then ready=1;break;fi
+              sleep 2
+            done
+            test "$ready" = 1
+            cmp -s "$overlay" "$stage/GoogleMeetBot.fixed.js"
+            docker exec "$worker" node --check /usr/src/app/dist/bots/GoogleMeetBot.js
+            docker exec "$worker" grep -q BEONMEET_BROWSER_QUALITY_ARG_V1 /usr/src/app/dist/bots/GoogleMeetBot.js
+            docker exec "$worker" node -e '
+              (async()=>{
+                let timeout=setTimeout(()=>process.exit(4),15500);
+                try{
+                  const {chromium}=require("playwright-extra");
+                  const b=await chromium.connectOverCDP(process.env.GOOGLE_CHROME_CDP_URL,{timeout:10000});
+                  const ctx=b.contexts()[0];
+                  if(!ctx)process.exit(5);
+                  const cookies=await ctx.cookies("https://accounts.google.com");
+                  const keys=new Set(cookies.map(x=>x.name));
+                  if(!keys.has("SID")||!keys.has("SAPISID"))process.exit(6);
+                  clearTimeout(timeout);
+                  console.log("AUTHENTICATED_CHROME_PROFILE_UNCHANGED");
+                  process.exit(0);
+                }catch(e){clearTimeout(timeout);process.exit(7)}
+              })();'
+            curl -fsS --max-time 8 https://beonmeet.smarbiz.sbs/health >/dev/null
+            for name in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1;do
+              test "$(docker inspect -f '{{.State.Health.Status}}' "$name")" = healthy
+            done
+            complete=1
+            trap - EXIT
+            rm -rf "$stage"
+            echo MEET_BROWSER_QUALITY_CONTEXT_HOTFIX_PRODUCTION_SUCCESS
+            echo NO_RECORDING_IN_PROGRESS_WAS_INTERRUPTED
+            echo CAMCAM_UNCHANGED
