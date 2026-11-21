@@ -35,7 +35,7 @@ async function main() {
       received[index].bytes+=buf.length;
       received[index].chunks++;
     });
-    const res=await p.evaluate(async ({index, tone})=>{
+    const res=await p.evaluate(async ({index, tone, width, height, fps, videoBps, audioBps})=>{
       let canvas=document.createElement('canvas');
       canvas.width=width;canvas.height=height;document.body.appendChild(canvas);
       const g=canvas.getContext('2d',{alpha:false});
