@@ -1,0 +1,64 @@
+name: BeOnMeet five-real-recording architectural readiness (read only)
+on:
+  push:
+    branches: [qa/five-stream-480p-stress-20261121]
+    paths: [.github/workflows/ops-five-real-capacity-readonly.yml]
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Inspect actual production five-room capacity and isolation without changing services
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 5m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1;; esac
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,subprocess,urllib.request,os,re,shutil
+            from pathlib import Path
+            def run(argv):
+                r=subprocess.run(argv,capture_output=True,text=True,timeout=15)
+                return r.stdout.strip() if r.returncode==0 else f'ERROR_CODE_{r.returncode}'
+            def get(url):
+                with urllib.request.urlopen(url,timeout=6) as r:return json.load(r)
+            h=get('http://127.0.0.1:8109/health')
+            print('CAPACITY_CONTROLLER',json.dumps({k:h.get(k) for k in ('ok','max_concurrent_meetings','local_free_meeting_slots','local_premium_meeting_slots','free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs','autoscaler_enabled')},sort_keys=True))
+            print('CAPACITY_MEMORY',[(x.split(':')[0],round(int(x.split()[1])/1024)) for x in Path('/proc/meminfo').read_text().splitlines() if x.startswith(('MemTotal:','MemAvailable:','SwapFree:'))])
+            print('CAPACITY_CPU_COUNT',os.cpu_count())
+            print('CAPACITY_DISK_FREE_GIB',round(shutil.disk_usage('/').free/1024**3,2))
+            print('CAPACITY_LOADAVG',Path('/proc/loadavg').read_text().split()[:3])
+            keys=['SHARED_CHROME_MAX_ACTIVE','FREE_WORKER_URLS','PREMIUM_WORKER_URLS','FREE_MEETING_SLOTS','PREMIUM_MEETING_SLOTS','AUTOSCALE_ENABLED','BEONMEET_CAPTURE_QUALITY']
+            env={}
+            for l in Path('.env').read_text().splitlines():
+                if '=' not in l or l.lstrip().startswith('#'):continue
+                k,v=l.split('=',1)
+                if k in keys:env[k]=v
+            print('CAPACITY_CONFIG',json.dumps(env,sort_keys=True))
+            print('CAPACITY_SYSTEMD_CONFIG',run(['systemctl','is-active','beonmeet-controller']))
+            for port in (9124,9126):
+                print('CAPACITY_WORKER',port,json.dumps((get(f'http://127.0.0.1:{port}/capacity').get('data') or get(f'http://127.0.0.1:{port}/capacity')),sort_keys=True))
+            for name in ('beonmeet-chrome-single','beonmeet-worker-single','beonmeet-worker-five','camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                r=subprocess.run(['docker','inspect',name],capture_output=True,text=True,timeout=7)
+                if r.returncode:print('CAPACITY_CONTAINER',name,'NOT_FOUND');continue
+                x=json.loads(r.stdout)[0]
+                s=x.get('State') or {};hc=x.get('HostConfig') or {}
+                en=x.get('Config',{}).get('Env') or []
+                env_clean={k:v for l in en if '=' in l for k,v in [l.split('=',1)] if k in ('GOOGLE_CHROME_CDP_URL','MAX_CONCURRENT_MEETINGS','BEONMEET_CAPTURE_QUALITY','CHROME_WINDOW_SIZE')}
+                print('CAPACITY_CONTAINER',name,json.dumps({'running':s.get('Running'),'health':(s.get('Health') or {}).get('Status'),'memory_limit_mb':round(hc.get('Memory',0)/1024**2),'nano_cpus':hc.get('NanoCpus'),'cpushares':hc.get('CpuShares'),'shm_mb':round(hc.get('ShmSize',0)/1024**2),'network_mode':hc.get('NetworkMode'),'image':x.get('Config',{}).get('Image'),'env':env_clean},sort_keys=True))
+            print('CAPACITY_RESOURCE_STATS',run(['docker','stats','--no-stream','--format','{{.Name}} {{.CPUPerc}} {{.MemUsage}}','beonmeet-chrome-single','beonmeet-worker-single','beonmeet-worker-five']))
+            for name in ('beonmeet-worker-single','beonmeet-worker-five'):
+                source=run(['docker','inspect','-f','{{range .Mounts}}{{if eq .Destination "/usr/src/app/dist/bots/GoogleMeetBot.js"}}{{.Source}}{{end}}{{end}}',name])
+                if not source.startswith('/opt/beonmeet/'):continue
+                src=Path(source).read_text()
+                print('CAPACITY_WORKER_CODE_MARKERS',name,json.dumps({'modern_join':'BEONMEET_MODERN_IN_CALL_PROOF_V1' in src,'capture_env_fixed':'BEONMEET_BROWSER_QUALITY_ARG_V1' in src,'external_context_page_close':'External browser page closed in join finally' in src,'browser_capture_uses_process_env':'String(process.env.BEONMEET_CAPTURE_QUALITY' in src}))
+            print('CAPACITY_AUDIT_PASS')
+            PY
