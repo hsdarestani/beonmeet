@@ -1,0 +1,53 @@
+name: Read-only investigate private Chrome login gateway precheck
+on:
+  push:
+    branches: [ops/start-private-chrome-google-login-20261121]
+    paths: [.github/workflows/debug-private-login-preflight.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check only named safe prerequisites with no secret output
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 3m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import sys,importlib.util,os,subprocess
+            from pathlib import Path
+            src=Path("/opt/beonmeet/.temporary-google-login/manager.py")
+            print("SECURE_MANAGER_PRESENT",src.is_file())
+            spec=importlib.util.spec_from_file_location("secure_manager",src)
+            mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
+            for label,fn in [
+                ("HEALTH_AND_JOB_IDLE",mod.health),
+                ("BOT_CONFIG",mod.read_bot_config),
+                ("TELEGRAM_OWNER_ID",mod.owner_chat_id),
+            ]:
+                try:
+                    fn()
+                    print("GATEWAY_PREREQ",label,"PASS")
+                except Exception as e:
+                    print("GATEWAY_PREREQ",label,"FAIL",type(e).__name__)
+            p=mod.SITE
+            print("NGINX_SITE_EXISTS",p.is_file())
+            if p.is_file():
+                t=p.read_text()
+                print("NGINX_SITE_SERVERNAME_COUNT",t.count("server_name beonmeet.smarbiz.sbs;"))
+                print("NGINX_SITE_ANCHOR_COUNT",t.count("    location / {"))
+                print("NGINX_TEMP_LOGIN_MARKER_COUNT",t.count("BEONMEET_PRIVATE_LOGIN_BEGIN"))
+            print("NGINX_AUTH_STATE_EXISTS",mod.STATE.exists())
+            print("SYSTEMD_TIMER_EXISTS",subprocess.run(["systemctl","is-active","beonmeet-login-expiry.timer"],capture_output=True).returncode==0)
+            v=subprocess.run(["openssl","passwd","-6","-stdin"],input="testonly\n",text=True,capture_output=True,timeout=5)
+            print("OPENSSL_HASH_SUPPORT",v.returncode==0)
+            print("GATEWAY_PREFLIGHT_DIAGNOSTIC_COMPLETE")
+            PY
