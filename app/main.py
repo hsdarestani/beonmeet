@@ -2010,20 +2010,21 @@ def transcribe_audio_local(audio_path: Path) -> tuple[str, str]:
     from faster_whisper import WhisperModel
 
     if _whisper_model is None:
-        # large-v3 materially improves Persian and non-English accuracy. Keeping
-        # concurrency at one protects the 16-vCPU production host from CPU spikes.
-        model_name = os.environ.get("WHISPER_MODEL", "large-v3")
+        # Turbo is a multilingual 809M parameter model, a better accuracy/speed
+        # tradeoff than the small production model on a CPU-only shared VPS.
+        # Keep concurrency to one, and cap CPU threads to protect live capture.
+        model_name = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
         _whisper_model = WhisperModel(
             model_name,
             device="cpu",
             compute_type=os.environ.get("WHISPER_COMPUTE_TYPE", "int8"),
-            cpu_threads=max(1, min(int(os.environ.get("WHISPER_CPU_THREADS", "2")), os.cpu_count() or 2)),
+            cpu_threads=max(1, min(int(os.environ.get("WHISPER_CPU_THREADS", "1")), os.cpu_count() or 1)),
             num_workers=1,
             download_root=str(DATA_DIR / "whisper-models"),
         )
 
     duration = _audio_duration_seconds(audio_path)
-    chunk_seconds = max(45, int(os.environ.get("TRANSCRIPTION_CHUNK_SECONDS", "120")))
+    chunk_seconds = max(45, int(os.environ.get("TRANSCRIPTION_CHUNK_SECONDS", "360")))
     chunks: list[tuple[float, Path, bool]] = []
 
     if duration <= 0 or duration <= chunk_seconds * 1.25:
@@ -2073,9 +2074,9 @@ def transcribe_audio_local(audio_path: Path) -> tuple[str, str]:
                 str(chunk_path),
                 task="transcribe",
                 language=None,
-                beam_size=7,
-                best_of=5,
-                patience=1.2,
+                beam_size=4,
+                best_of=2,
+                patience=1.0,
                 temperature=0.0,
                 vad_filter=True,
                 vad_parameters={
@@ -2083,7 +2084,7 @@ def transcribe_audio_local(audio_path: Path) -> tuple[str, str]:
                     "speech_pad_ms": 350,
                     "min_speech_duration_ms": 200,
                 },
-                condition_on_previous_text=True,
+                condition_on_previous_text=False,
                 multilingual=True,
                 language_detection_threshold=0.45,
                 language_detection_segments=10,
@@ -3425,7 +3426,7 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                                         audio_path,
                                     )
                                 except Exception as primary_transcription_error:
-                                    # large-v3 can fail under CPU/RAM pressure or on a
+                                    # The selected primary STT model can fail under CPU/RAM
                                     # damaged tail in an abruptly ended WebM. Retry once
                                     # with the smaller recovery model before surfacing an
                                     # error to the user or leaving the stage pending.
