@@ -92,7 +92,6 @@ async def run():
     assert sum(FakeClient.active.values())==5,FakeClient.active
     assert len(state["launched_events"])==5
     assert all(item["status"]=="joining" for item in state["launched_events"].values())
-    assert all(target==name for target,_,name in []), "unreachable"
     print("FIVE_INDEPENDENT_ONE_SLOT_WORKERS_LAUNCH_5_OF_5_PASS")
 
     result=await dispatch(event(6),participant,url(6),True)
