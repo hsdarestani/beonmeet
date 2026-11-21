@@ -26,41 +26,42 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import datetime,subprocess,json,re,collections
+            import subprocess,json,re,datetime
+            def run(*a):
+                p=subprocess.run(a,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=30)
+                return p.stdout
             print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            r=subprocess.run(["docker","logs","--since","2026-11-21T11:17:30Z","beonmeet-worker-five"],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=25)
-            ids={}
-            for line in r.stdout.splitlines():
-                if not line.startswith("[2026-11-21T"):continue
-                stamp=line[1:24]
-                if "[correlationId: " in line:
-                    ident=line.split("[correlationId: ",1)[1].split("]",1)[0]
-                    if ident not in ids:ids[ident]="job"+str(len(ids)+1)
-                    job=ids[ident]
-                else:job="system"
-                message=line.split("] ",4)[-1].split(" {",1)[0].strip()
-                # Never print links, user identifiers, HTML, cookies or raw metadata.
-                message=re.sub(r"https?://[^\s\"']+","[URL]",message)
-                message=re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}","[EMAIL]",message)
-                message=re.sub(r"\b[a-z]{3}-[a-z]{4}-[a-z]{3}\b","[MEET]",message,flags=re.I)
-                message=re.sub(r"\b\d{5,}\b","[ID]",message)
-                message=re.sub(r"(?i)(token|cookie|authorization|password|secret)[=: ]+[^ ,;}]+","[SECRET]",message)
-                if len(message)>200:message=message[:200]+"[TRUNCATED]"
-                extra=[]
-                if " {" in line:
-                    try:
-                        data=json.loads(line.split(" {",1)[1].join(["{", ""]))
-                        for k in ("error","errorType","reason"):
-                            val=data.get(k)
-                            if isinstance(val,dict):
-                                name=str(val.get("name") or val.get("type") or "")
-                                detail=str(val.get("message") or "")
-                                types=[p for p in ("TimeoutError","TargetClosedError","ECONNREFUSED","ETIMEDOUT","EACCES","ERR_CONNECTION_RESET","ERR_NAME_NOT_RESOLVED","ERR_CERT","ERR_ABORTED","net::ERR_","No such file","Navigation timeout","protocol","Target closed") if p.lower() in detail.lower()]
-                                extra.append({"name":name[:48],"types":types})
-                            elif isinstance(val,str):
-                                types=[p for p in ("TimeoutError","TargetClosedError","ECONNREFUSED","ETIMEDOUT","EACCES","ERR_CONNECTION_RESET","ERR_NAME_NOT_RESOLVED","ERR_CERT","ERR_ABORTED","net::ERR_","No such file","Navigation timeout","protocol","Target closed") if p.lower() in val.lower()]
-                                extra.append({"key":k,"types":types,"type":val.split(":")[0][:42]})
-                    except Exception:pass
-                print("WORKER_MESSAGE",stamp,job,repr(message),json.dumps(extra))
-            print("LATEST_WORKER_MESSAGES_FINISHED")
+            raw=run("docker","exec","beonmeet-worker-five","cat","/usr/src/app/dist/bots/GoogleMeetBot.js")
+            for needle in ("Launching browser...", "Google Meet Bot is entering", "Waiting for Google Meet pre-join controls...", "this.page.goto(", "connectOverCDP", "CONTROLLER_WAITING_FOR_ADMISSION_URL"):
+                pos=raw.find(needle)
+                print("CODE_NEEDLE",needle,"POS",pos,"COUNT",raw.count(needle))
+                if pos>=0:
+                    start=max(0,pos-1200);end=min(len(raw),pos+800)
+                    snippet=raw[start:end]
+                    snippet=re.sub(r"https?://[^\\s\\\"']+","[URL]",snippet)
+                    print("CODE_CONTEXT",needle,repr(snippet[:2100]))
+            try:
+                live=run("docker","exec","beonmeet-chrome-single","sh","-c","curl -fsS --max-time 4 http://127.0.0.1:9222/json/list")
+                tabs=json.loads(live)
+                for tab in tabs:
+                    u=str(tab.get("url") or "")
+                    title=str(tab.get("title") or "")
+                    if "meet.google.com" in u:cls="MEET"
+                    elif "accounts.google.com" in u:cls="GOOGLE_ACCOUNT"
+                    else:cls="OTHER"
+                    if cls!="OTHER":
+                        print("CHROME_TAB",cls,"TITLE_CATEGORY",("SIGN_IN" if "sign in" in title.lower() or "sign-in" in title.lower() else "OTHER"))
+            except Exception as e:print("BROWSER_TABS_ERROR",type(e).__name__)
+            for name in ("beonmeet-worker-five","beonmeet-chrome-single"):
+                raw=run("docker","inspect","--format","{{json .State}}",name)
+                state=json.loads(raw)
+                print("CONTAINER",name,"UP",state.get("Running"),"OOM",state.get("OOMKilled"))
+            raw=run("docker","logs","--since","2026-11-21T11:18:00Z","beonmeet-worker-five")
+            for line in raw.splitlines()[-45:]:
+                if "{" in line:line=line.split(" {",1)[0]
+                if line.startswith("[2026-11-21T"):
+                    phrase=line.split("] ",4)[-1]
+                    if "http" not in phrase and "@" not in phrase and len(phrase)<145:
+                        print("NEW_WORKER_EVENT",line[1:24],phrase.strip()[:110])
+            print("STATIC_BROWSER_AND_RECENT_LOG_INSPECTION_DONE")
             PY
