@@ -1,0 +1,106 @@
+name: One-time controller-only guest-denial guidance release
+on:
+  push:
+    branches: [ops/deploy-google-guest-warning-20261121]
+    paths: [.github/workflows/deploy-guest-guidance-once.yml]
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Release only verified join-message changes while idle
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 5m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1;; esac
+            test "$(id -u)" = 0
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 35 9
+            cd /opt/beonmeet
+            old=f9cd67baa7b270116251adbd42719ff1cc8ef1f7
+            new=ac89cb25a70c3381e17810178ab2360f4ca1f5b7
+            git fetch -q origin main
+            git merge-base --is-ancestor "$new" FETCH_HEAD
+            stage=$(mktemp -d /opt/beonmeet/.guest-guidance-stage.XXXXXXXX)
+            for file in app/main.py app/i18n.py;do
+              git show "$old:$file" > "$stage/old-$(basename "$file")"
+              git show "$new:$file" > "$stage/$(basename "$file")"
+              cmp -s "$file" "$stage/old-$(basename "$file")" || { echo CONTROLLER_CODE_NOT_BASELINE;rm -rf "$stage";exit 1; }
+            done
+            python3 -m py_compile "$stage/main.py" "$stage/i18n.py"
+            grep -q '"join_access_notice_at" if age_seconds >= 180' "$stage/main.py"
+            python3 - <<'PY'
+            import json,subprocess,time,urllib.request
+            def idle():
+                with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=5) as res:h=json.load(res)
+                if not h.get("ok"):raise AssertionError("Controller unavailable")
+                for k in ("free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs"):
+                    if int(h.get(k) or 0):return False
+                for port in (9124,9126):
+                    with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=5) as res:d=json.load(res)
+                    if int((d.get("data")or d).get("runningJobs") or 0):return False
+                return True
+            for i in range(12):
+                if idle():break
+                if i==11:raise AssertionError("Active recordings or deliveries: refusing release")
+                time.sleep(7)
+            for name in ("camcam-shared-api-1","camcam-shared-pet-1","camcam-shared-archive-1","camcam-shared-petarchive-1"):
+                assert subprocess.check_output(["docker","inspect","--format","{{.State.Health.Status}}",name],text=True).strip()=="healthy",name
+            print("USER_JOBS_IDLE_AND_CAMCAM_GREEN")
+            PY
+            backup=$(mktemp -d /opt/beonmeet/.guest-guidance-backup.XXXXXXXX)
+            chmod 700 "$backup"
+            cp -p app/main.py "$backup/main.py"
+            cp -p app/i18n.py "$backup/i18n.py"
+            altered=0
+            complete=0
+            rollback(){
+              if [ "$altered" = 1 ] && [ "$complete" = 0 ];then
+                cp -p "$backup/main.py" app/main.py
+                cp -p "$backup/i18n.py" app/i18n.py
+                systemctl restart beonmeet-controller || true
+                echo CONTROLLER_ROLLED_BACK
+              fi
+              rm -rf "$stage"
+            }
+            trap rollback EXIT
+            python3 - <<'PY'
+            import json,urllib.request
+            with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=5) as res:h=json.load(res)
+            for k in ("free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs"):
+                assert int(h.get(k) or 0)==0,"Controller became busy"
+            for port in (9124,9126):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=5) as res:d=json.load(res)
+                assert int((d.get("data")or d).get("runningJobs") or 0)==0,"Recording became active"
+            print("IMMEDIATE_IDLE_RECHECK_PASS")
+            PY
+            altered=1
+            install -m 644 "$stage/main.py" app/main.py
+            install -m 644 "$stage/i18n.py" app/i18n.py
+            systemctl restart beonmeet-controller
+            ready=0
+            for i in $(seq 1 25);do
+              if curl -fsS --max-time 3 http://127.0.0.1:8109/health >/dev/null 2>&1;then ready=1;break;fi
+              sleep 2
+            done
+            test "$ready" = 1
+            cmp -s app/main.py "$stage/main.py"
+            cmp -s app/i18n.py "$stage/i18n.py"
+            curl -fsS --max-time 8 https://beonmeet.smarbiz.sbs/health >/dev/null
+            for name in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1;do
+              test "$(docker inspect -f '{{.State.Health.Status}}' "$name")" = healthy
+            done
+            complete=1
+            trap - EXIT
+            rm -rf "$stage"
+            echo GOOGLE_GUEST_DENIAL_GUIDANCE_DEPLOYED_CONTROLLER_ONLY
+            echo ALL_RECORDING_WORKERS_AND_CAMCAM_UNCHANGED
