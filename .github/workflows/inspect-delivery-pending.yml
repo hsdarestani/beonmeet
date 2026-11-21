@@ -26,20 +26,24 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,datetime,urllib.request,re
+            import json,datetime,subprocess
             from pathlib import Path
             print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
             state=json.loads(Path("data/state.json").read_text())
             pending=state.get("pending_deliveries") or {}
             print("PENDING_COUNT",len(pending))
-            for p in list(pending.values())[-5:]:
+            signatures=("RuntimeError","OSError","FileNotFoundError","MemoryError","Model","model","Whisper","whisper","NotImplementedError","CTranslate2","does not support","No such file","out of memory","RuntimeError","PermissionError","Killed","download","HTTPStatusError","CUDA","Allocation","KeyError","AssertionError","AttributeError","TypeError","ValueError","ConnectionError","traceback","ffmpeg","unknown")
+            for p in list(pending.values())[-4:]:
                 if not isinstance(p,dict):continue
-                s=str(p.get("last_error") or "")
-                signals=[x for x in ("Permission denied","EACCES","No such file","ffmpeg","Command","transcription","audio","No space","CUDA","MemoryError","HTTPException","RuntimeError","OSError") if x.lower() in s.lower()]
-                print("PENDING_DELIVERY_STAGE",json.dumps({"attempts":int(p.get("attempts") or 0),
-                    "video":bool(p.get("video_delivered")),"audio":bool(p.get("audio_delivered")),
-                    "transcript":bool(p.get("transcript_delivered")),"last_error_signals":signals}))
-            with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=5) as r:h=json.load(r)
-            print("LIVE_DELIVERY_STATUS",json.dumps({k:h.get(k) for k in ("ok","active_delivery_jobs","pending_delivery_jobs","transcription_concurrency")}))
-            print("PENDING_RECOVERY_POST_RELEASE_AUDIT_DONE")
+                msg=str(p.get("last_error") or "")
+                last=msg.split("transcript=",1)[1] if "transcript=" in msg else msg
+                found=[x for x in signatures if x.lower() in last.lower()]
+                print("TRANSCRIPT_ERROR_MARKERS",json.dumps({"attempts":int(p.get("attempts") or 0),
+                  "audio_delivered":bool(p.get("audio_delivered")),
+                  "transcript_delivered":bool(p.get("transcript_delivered")),"markers":sorted(set(found))}))
+            logs=subprocess.run(["journalctl","-u","beonmeet-controller","--since","2026-11-21 11:50:00 UTC","--no-pager","-o","cat"],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=25).stdout
+            n=sum("transcription error:" in line for line in logs.splitlines())
+            start=sum("primary transcription failed" in line for line in logs.splitlines())
+            print("TRANSCRIPTION_LOG_SUMMARY",json.dumps({"errors":n,"primary_failed":start}))
+            print("TRANSCRIPT_RECOVERY_ERROR_CLASS_AUDIT_DONE")
             PY
