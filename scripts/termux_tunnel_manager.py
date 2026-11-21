@@ -100,7 +100,7 @@ def verify_policy() -> None:
         "x11forwarding": "no",
         "allowagentforwarding": "no",
         "permittty": "no",
-        "permitunnel": "no",
+        "permittunnel": "no",
         "maxsessions": "0",
         "forcecommand": "/usr/sbin/nologin",
     }
