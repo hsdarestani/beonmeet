@@ -101,6 +101,7 @@ INTERNAL_SECRET = os.environ["INTERNAL_SECRET"]
 RECORDING_ROOT = Path(os.environ.get("RECORDING_TMP_DIR", "/recordings")).resolve()
 DOWNLOAD_ROOT = DATA_DIR / "recording-downloads"
 DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+PENDING_DELIVERY_MAX_ATTEMPTS = max(8, min(32, int(os.environ.get("PENDING_DELIVERY_MAX_ATTEMPTS", "16"))))
 FREE_DOWNLOAD_TTL_HOURS = max(
     1,
     int(os.environ.get("FREE_DOWNLOAD_TTL_HOURS", os.environ.get("DOWNLOAD_TTL_HOURS", "24"))),
@@ -3593,7 +3594,20 @@ async def delivery_recovery_loop() -> None:
 
                 pending = pending or {}
                 attempts = int(pending.get("attempts") or 0)
-                if attempts >= 8:
+                # A temporary encoding or directory-permission failure must not
+                # permanently strand a paid recording after only eight attempts.
+                # Keep the already-delivered video stage idempotent and resume
+                # just the missing audio/transcript from the preserved WebM.
+                if attempts >= PENDING_DELIVERY_MAX_ATTEMPTS:
+                    if not pending.get("recovery_exhausted_notified"):
+                        chat_id = str(pending.get("chat_id") or "")
+                        if chat_id:
+                            try:
+                                await tg_text(chat_id, t(chat_id, "delivery_recovery_exhausted"))
+                                pending["recovery_exhausted_notified"] = True
+                                await save_state()
+                            except Exception as notify_error:
+                                print("delivery recovery exhaustion notification failed:", type(notify_error).__name__, flush=True)
                     continue
 
                 event_id_for_retry = str(pending.get("event_id") or "").strip()
