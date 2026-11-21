@@ -1,0 +1,166 @@
+name: QA 5 isolated Chrome AV encoders on existing BeOnMeet VPS
+on:
+  push:
+    branches: [qa/five-isolated-chrome-browsers-20261121]
+    paths: [.github/workflows/qa-five-independent-chromes-20261121.yml]
+permissions:
+  contents: read
+jobs:
+  trial:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 13
+    steps:
+      - name: Five separate Chrome containers 480p VP8 Opus, guard live user sessions
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 11m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST;exit 1;; esac
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 45 9
+            cd /opt/beonmeet
+            TEMP=$(mktemp -d /opt/beonmeet/.qa-five-isolated.XXXXXXXX)
+            OUT=/tmp/beonmeet-five-sustained-20261121
+            ABORT=/tmp/beonmeet-five-sustained-abort-20261121
+            TEST_PREFIX=beonmeet-five-qa-chrome
+            PID=""
+            cleanup() {
+              if [ -n "$PID" ];then
+                docker exec beonmeet-worker-single touch "$ABORT" >/dev/null 2>&1 || true
+                kill "$PID" >/dev/null 2>&1 || true
+                wait "$PID" >/dev/null 2>&1 || true
+              fi
+              for j in 1 2 3 4 5;do docker rm -f "$TEST_PREFIX-$j" >/dev/null 2>&1 || true; done
+              docker exec beonmeet-worker-single rm -rf "$OUT" "$ABORT" >/dev/null 2>&1 || true
+              rm -rf "$TEMP"
+            }
+            trap cleanup EXIT
+            python3 - <<'PY'
+            import json,urllib.request,shutil,subprocess
+            def g(u):
+                with urllib.request.urlopen(u,timeout=6) as r:return json.load(r)
+            h=g('http://127.0.0.1:8109/health')
+            assert h.get('ok') and not h.get('autoscaler_enabled')
+            assert all(int(h.get(k) or 0)==0 for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs')), 'BUSY_LIVE_QUEUE_OR_DELIVERY_ABORT'
+            for port in (9124,9126):
+                d=g(f'http://127.0.0.1:{port}/capacity');d=d.get('data') or d
+                assert int(d.get('runningJobs') or 0)==0,'ACTIVE_REAL_RECORDING_ABORT'
+            mem=int(next(x.split()[1] for x in open('/proc/meminfo') if x.startswith('MemAvailable:')))
+            assert mem>2700000 and shutil.disk_usage('/').free>4*1024**3,'INSUFFICIENT_SAFE_HEADROOM_ABORT'
+            for s in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',s],text=True).strip()=='healthy'
+            print('FIVE_BROWSER_INITIAL_SAFETY_PASS',round(mem/1024),'MB')
+            PY
+            for j in 1 2 3 4 5;do
+              if docker ps -a --format '{{.Names}}' | grep -Fxq "$TEST_PREFIX-$j"; then
+                echo QA_CONTAINER_ALREADY_EXISTS
+                exit 1
+              fi
+            done
+            git fetch -q origin qa/five-isolated-chrome-browsers-20261121
+            git show "${{ github.sha }}:tests/five_isolated_chrome_av_smoke.js" > "$TEMP/stress.js"
+            docker exec -i beonmeet-worker-single node --check < "$TEMP/stress.js"
+            docker exec beonmeet-worker-single rm -rf "$OUT" "$ABORT"
+            for j in 1 2 3 4 5;do
+              docker run -d --name "$TEST_PREFIX-$j" --network beonmeet-single \
+                --memory=650m --memory-swap=740m --cpus=.38 --pids-limit=210 --shm-size=128m \
+                --tmpfs /tmp/chrome-profile:rw,size=180m,mode=0777 \
+                -e CHROME_WINDOW_SIZE=854,480 beonmeet-chrome-cdp:latest >/dev/null
+              mem=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+              if [ "$mem" -lt 1500000 ];then
+                echo QA_SAFETY_ABORT_CHROME_STARTUP_MEMORY
+                exit 1
+              fi
+            done
+            for j in 1 2 3 4 5;do
+              ready=0
+              for k in $(seq 1 20);do
+                if docker exec -e CDP_TEST_HOST="$TEST_PREFIX-$j" beonmeet-worker-single node -e 'fetch("http://"+process.env.CDP_TEST_HOST+":9223/json/version",{signal:AbortSignal.timeout(1500)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(2))' >/dev/null 2>&1;then ready=1;break;fi
+                sleep 1
+              done
+              test "$ready" = 1 || { echo "QA_CHROME_$j_NOT_READY";exit 1; }
+            done
+            echo FIVE_INDEPENDENT_CHROME_CDP_READY
+            docker exec -i -e QA_SECONDS=240 -e QA_WIDTH=854 -e QA_HEIGHT=480 -e QA_FPS=10 \
+              -e QA_VIDEO_BPS=650000 -e QA_AUDIO_BPS=96000 beonmeet-worker-single node - \
+              < "$TEMP/stress.js" > "$TEMP/stress.log" 2>&1 &
+            PID=$!
+            SAFETY_ABORT=0
+            for i in $(seq 1 28);do
+              if ! kill -0 "$PID" 2>/dev/null;then break;fi
+              available=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+              rootfree=$(df -Pk / | awk 'NR==2 {print $4}')
+              load=$(awk '{print $1}' /proc/loadavg)
+              echo "FIVE_BROWSER_HOST_SAMPLE $i available_mb=$((available/1024)) disk_mb=$((rootfree/1024)) load1=$load"
+              if [ "$available" -lt 1450000 ] || [ "$rootfree" -lt 2500000 ];then
+                echo QA_ABORT_LOW_HOST_HEADROOM
+                SAFETY_ABORT=1
+              fi
+              if ! python3 - <<'PY'
+            import json,urllib.request
+            def g(url):
+                with urllib.request.urlopen(url,timeout=5) as r:return json.load(r)
+            h=g('http://127.0.0.1:8109/health')
+            assert h.get('ok')
+            assert all(int(h.get(k) or 0)==0 for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'))
+            for port in (9124,9126):
+                d=g(f'http://127.0.0.1:{port}/capacity');d=d.get('data') or d
+                assert int(d.get('runningJobs') or 0)==0
+            PY
+              then echo QA_ABORT_CUSTOMER_WORK_APPEARED;SAFETY_ABORT=1;fi
+              for s in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1;do
+                health=$(docker inspect -f '{{.State.Health.Status}}' "$s" 2>/dev/null || echo missing)
+                if [ "$health" != healthy ];then echo QA_ABORT_CAMCAM_HEALTH;SAFETY_ABORT=1;fi
+              done
+              if [ $((i%4)) -eq 0 ];then
+                docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' \
+                  "$TEST_PREFIX-1" "$TEST_PREFIX-2" "$TEST_PREFIX-3" "$TEST_PREFIX-4" "$TEST_PREFIX-5" || true
+              fi
+              if [ "$SAFETY_ABORT" = 1 ];then
+                docker exec beonmeet-worker-single touch "$ABORT" || true
+                break
+              fi
+              sleep 10
+            done
+            STATUS=0
+            wait "$PID" || STATUS=$?
+            PID=""
+            cat "$TEMP/stress.log"
+            test "$SAFETY_ABORT" = 0 || { echo QA_FAILED_SAFETY_GUARD;exit 1; }
+            test "$STATUS" = 0 || { echo "QA_SCRIPT_EXIT_$STATUS";exit 1; }
+            grep -q QA_FIVE_ISOLATED_CHROME_AV_STREAMS_PASS "$TEMP/stress.log"
+            mkdir -p "$TEMP/outputs"
+            for j in 1 2 3 4 5;do
+              docker cp "beonmeet-worker-single:$OUT/stream-$j.webm" "$TEMP/outputs/stream-$j.webm"
+            done
+            QA_OUTPUT_DIR="$TEMP/outputs" python3 - <<'PY'
+            import os,json,subprocess,math,array
+            from pathlib import Path
+            folder=Path(os.environ['QA_OUTPUT_DIR'])
+            tones=(220,330,440,550,660)
+            for i,freq in enumerate(tones,1):
+                file=folder/f'stream-{i}.webm'
+                assert file.stat().st_size>500000,(i,file.stat().st_size)
+                meta=json.loads(subprocess.check_output(['ffprobe','-v','error','-show_streams','-of','json',str(file)],timeout=20))
+                kinds={s['codec_type'] for s in meta['streams']}
+                assert {'video','audio'}<=kinds,(i,kinds)
+                payload=subprocess.check_output(['ffmpeg','-nostdin','-loglevel','error','-ss','8','-i',str(file),'-t','2','-vn','-ar','8000','-ac','1','-f','s16le','pipe:1'],timeout=25)
+                samples=array.array('h');samples.frombytes(payload)
+                assert len(samples)>8000
+                def score(f):
+                    coeff=2*math.cos(2*math.pi*f/8000);a=b=0.0
+                    for s in samples:a,b=s+coeff*a-b,a
+                    return a*a+b*b-coeff*a*b
+                scores=[score(f) for f in tones]
+                dominant=tones[max(range(5),key=lambda k:scores[k])]
+                assert dominant==freq,(i,dominant)
+                print('FIVE_BROWSER_OUTPUT_VERIFIED',i,'bytes',file.stat().st_size,'tone',dominant,'codecs',[s['codec_name'] for s in meta['streams']])
+            print('FIVE_DISTINCT_AV_FILES_AND_AUDIO_ISOLATION_PASS')
+            PY
+            echo FIVE_INDEPENDENT_BROWSER_480P_AV_STRESS_PASS
