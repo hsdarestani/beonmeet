@@ -1109,20 +1109,34 @@ async def state_cleanup_loop() -> None:
                     completed.pop(key, None)
                     changed = True
 
-            # Finished/stale launch records have no purpose after two days.
+            # Accepted jobs can fail in the external recorder before any
+            # recording callback. The controller must not keep them "joining"
+            # indefinitely and silently block later Calendar attempts.
             launched_events = state.setdefault("launched_events", {})
             for event_id, launched in list(launched_events.items()):
+                status = str((launched or {}).get("status") or "joining")
                 raw = str(
-                    launched.get("recording_started_at")
-                    or launched.get("waiting_since")
-                    or launched.get("launched_at")
+                    (launched or {}).get("recording_started_at")
+                    or (launched or {}).get("waiting_since")
+                    or (launched or {}).get("launched_at")
                     or ""
                 )
                 try:
                     created = isoparse(raw) if raw else now
                 except Exception:
                     created = now
-                if now - created > timedelta(days=2):
+                # Retry and admission can legitimately take several minutes;
+                # only abandon unacknowledged attempts after a safe margin.
+                # Never shorten the retention of an active recording to the
+                # joining timeout. Completed deliveries clean themselves up.
+                max_age = {
+                    "joining": timedelta(minutes=20),
+                    "remote_claimed": timedelta(minutes=20),
+                    "waiting_for_admission": timedelta(minutes=40),
+                    "recording": timedelta(hours=6),
+                    "delivering": timedelta(hours=6),
+                }.get(status, timedelta(days=2))
+                if now - created > max_age:
                     launched_events.pop(event_id, None)
                     changed = True
 
@@ -1163,6 +1177,40 @@ async def state_cleanup_loop() -> None:
             print("state cleanup loop error:", repr(exc), flush=True)
 
         await asyncio.sleep(600)
+
+
+def recent_manual_join_inflight(
+    chat_id: int | str,
+    meet_url: str,
+    now: datetime,
+) -> bool:
+    """Prevent parallel Chrome tabs for duplicate manual requests.
+
+    Only recent launch attempts are blocking: old failed worker jobs are
+    recovered by the periodic stale-state cleanup, and must not lock /now
+    forever. Calendar's longer-running protections stay separate.
+    """
+    target = str(chat_id)
+    for item in state.get("join_queue", []):
+        req = item.get("req") or {}
+        if str(req.get("chat_id") or "") == target and str(item.get("meet_url") or "") == meet_url:
+            return True
+    for launched in state.get("launched_events", {}).values():
+        if not isinstance(launched, dict):
+            continue
+        if str(launched.get("chat_id") or "") != target or str(launched.get("meet_url") or "") != meet_url:
+            continue
+        status = str(launched.get("status") or "joining")
+        if status not in {"joining", "waiting_for_admission", "remote_claimed", "recording"}:
+            continue
+        raw = str(launched.get("launched_at") or "")
+        try:
+            created = isoparse(raw) if raw else None
+        except Exception:
+            created = None
+        if created and timedelta(0) <= now - created < timedelta(minutes=8):
+            return True
+    return False
 
 
 def same_meeting_inflight(
@@ -1562,6 +1610,11 @@ async def telegram_loop() -> None:
                 )
                 meet_url = normalize_meet_url(text)
                 if meet_url:
+                    if force_now and recent_manual_join_inflight(
+                        chat_id, meet_url, datetime.now(timezone.utc)
+                    ):
+                        await tg_text(chat_id, t(chat_id, "join_already_processing"))
+                        continue
                     if not await _free_recording_allowed(
                         str(chat_id),
                         include_pending=False,

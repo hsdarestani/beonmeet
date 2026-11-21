@@ -113,3 +113,53 @@ for accepted, busy in ((False, False), (False, True), (True, False)):
         assert notifications == ["launch_free"], notifications
 
 print("DISPATCH_FAILURE_DURABLE_RETRY_TEST_PASS")
+
+
+# Manual /now must not launch duplicate Chrome tabs for repeated Meet links.
+# It must also allow retries after a genuinely stale failed launch.
+import ast
+from datetime import datetime, timedelta, timezone
+from dateutil.parser import isoparse
+
+module = ast.parse(MAIN)
+helpers = {
+    node.name: node for node in module.body
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+}
+node = helpers["recent_manual_join_inflight"]
+env = {"datetime": datetime, "timedelta": timedelta, "timezone": timezone, "isoparse": isoparse, "state": {}}
+exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
+             "app/main.py", "exec"), env)
+recent_manual = env["recent_manual_join_inflight"]
+now = datetime(2026, 11, 21, 10, 50, tzinfo=timezone.utc)
+meet = "https://meet.google.com/abc-defg-hij"
+other = "https://meet.google.com/def-ghij-klm"
+
+def seed(status, minutes, meet_url=meet, chat_id="testuser"):
+    env["state"]["launched_events"] = {
+        "evt": {"status": status, "meet_url": meet_url, "chat_id": chat_id,
+                "launched_at": (now - timedelta(minutes=minutes)).isoformat()}
+    }
+    env["state"]["join_queue"] = []
+
+for status in ("joining", "waiting_for_admission", "remote_claimed", "recording"):
+    seed(status, 2)
+    assert recent_manual("testuser",meet,now),status
+    seed(status, 9)
+    assert not recent_manual("testuser",meet,now),status
+seed("joining", 2, other)
+assert not recent_manual("testuser",meet,now)
+seed("joining", 2, meet, "somebody-else")
+assert not recent_manual("testuser",meet,now)
+env["state"]["launched_events"] = {}
+env["state"]["join_queue"] = [{
+    "event_id": "queued", "req": {"chat_id": "testuser"}, "meet_url": meet
+}]
+assert recent_manual("testuser",meet,now)
+assert not recent_manual("another-user",meet,now)
+
+assert 'if force_now and recent_manual_join_inflight(' in MAIN
+assert '"joining": timedelta(minutes=20)' in MAIN
+assert '"recording": timedelta(hours=6)' in MAIN
+assert I18N.count('"join_already_processing"') == 3
+print("MANUAL_JOIN_DEDUP_AND_STALE_CLEANUP_TEST_PASS")
