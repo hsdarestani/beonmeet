@@ -26,56 +26,85 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import subprocess,json,urllib.request,datetime,collections,os,re,hashlib
-            from pathlib import Path
+            import subprocess,datetime
             print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            state=json.loads(Path("data/state.json").read_text())
-            for v in (state.get("launched_events") or {}).values():
-                if not isinstance(v,dict) or "cru-ggpe-nwi" not in str(v.get("meet_url") or ""):continue
-                print("CURRENT_MEET_STATE",json.dumps({
-                   "status":v.get("status"),"launched":v.get("launched_at"),"waiting_since":v.get("waiting_since"),
-                   "recording_started":bool(v.get("recording_started_at"))}))
-            for n in ("beonmeet-worker-five","beonmeet-chrome-single"):
-                p=subprocess.run(["docker","inspect","--format","{{json .State}}",n],capture_output=True,text=True,timeout=6)
-                if p.returncode==0:
-                    obj=json.loads(p.stdout)
-                    print("CONTAINER_STATE",n,{k:obj.get(k) for k in ("Status","Running","OOMKilled","Restarting","StartedAt")})
-            p=subprocess.run(["docker","stats","--no-stream","--format","{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.PIDs}}","beonmeet-worker-five","beonmeet-chrome-single"],capture_output=True,text=True,timeout=12)
-            print("DOCKER_RESOURCE",p.stdout.strip().splitlines()[:2])
-            # Current Chrome tab count, login/lobby category only, no URLs or titles.
-            for container in ("beonmeet-worker-five","beonmeet-chrome-single"):
-                js=r"""
-                (async()=>{
-                  const c=process.env.GOOGLE_CHROME_CDP_URL||"http://127.0.0.1:9222";
-                  const u=c.replace(/\/$/,"")+"/json/list";
-                  const ac=new AbortController();const timer=setTimeout(()=>ac.abort(),5000);
+            js=r"""
+            const wsMod=(()=>{
+              try{return require('ws');}catch(e){console.log('PAGE_CDP_WS_MODULE_MISSING',e.name);return null;}
+            })();
+            (async()=>{
+              if(!wsMod)return;
+              let timer,socket,done=false;
+              function finish(type,data=''){
+                if(done)return;done=true;
+                console.log('DIRECT_PAGE_CDP_RESULT',type,typeof data==='string'?data.slice(0,1500):JSON.stringify(data).slice(0,1500));
+                try{socket?.close()}catch{}
+                clearTimeout(timer);
+              }
+              const base=new URL(process.env.GOOGLE_CHROME_CDP_URL);
+              try{
+                const response=await fetch(base.href.replace(/\/$/,'')+'/json/list');
+                const targets=await response.json();
+                const target=targets.find(x=>String(x.url||'').includes('cru-ggpe-nwi') && x.type==='page');
+                if(!target){console.log('DIRECT_PAGE_CDP_NO_MATCHED_TAB');return;}
+                const ws=new URL(target.webSocketDebuggerUrl);
+                ws.hostname=base.hostname;ws.port=base.port;
+                console.log('DIRECT_PAGE_CDP_TARGET_FOUND',true);
+                timer=setTimeout(()=>finish('timeout'),8500);
+                socket=new wsMod(ws.href,{handshakeTimeout:6000});
+                socket.on('open',()=>{
+                   const evaluator=function(){
+                     const txt=(document.body?.innerText||'').toLowerCase();
+                     const labels=Array.from(document.querySelectorAll('button')).map(b=>String(b.getAttribute('aria-label')||b.innerText||'').toLowerCase());
+                     const markers={
+                       ask_to_join:txt.includes('ask to join'),
+                       waiting_to_be_let_in:txt.includes('waiting to be let in'),
+                       waiting_for_someone:txt.includes('someone in the call'),
+                       wait_to_join:txt.includes('waiting to join'),
+                       asking_to_join:txt.includes('asking to join'),
+                       asked_to_join:txt.includes('asked to join'),
+                       someone_will_let_you_in:txt.includes('let you in'),
+                       approval:txt.includes('approval'),
+                       request_sent:txt.includes('request sent'),
+                       cant_join:txt.includes("can't join"),
+                       denied:txt.includes('denied'),
+                       rejoin:txt.includes('rejoin'),
+                       waiting:txt.includes('waiting'),
+                       try_again:txt.includes('try again'),
+                       host:txt.includes('host'),
+                       join_now:txt.includes('join now'),
+                       disconnect:txt.includes('disconnected'),
+                       meeting_end:txt.includes('meeting has ended'),
+                       still_joining:txt.includes('still joining'),
+                       not_allowed:txt.includes('not allowed')
+                     };
+                     const buttons={
+                       ask_to_join:labels.some(t=>t.includes('ask to join')),
+                       cancel_request:labels.some(t=>t.includes('cancel request')),
+                       leave_call:labels.some(t=>t.includes('leave call')),
+                       join_now:labels.some(t=>t.includes('join now')),
+                       retry:labels.some(t=>t.includes('retry'))
+                     };
+                     return {markers,buttons,document_visibility:document.visibilityState,document_ready:document.readyState,body_length:txt.length,button_count:labels.length};
+                   };
+                   socket.send(JSON.stringify({id:42,method:'Runtime.evaluate',params:{expression:'('+evaluator.toString()+')()',returnByValue:true}}));
+                });
+                socket.on('message',v=>{
                   try{
-                    const r=await fetch(u,{signal:ac.signal});
-                    const a=await r.json();
-                    const types={meet:0,account:0,chrome:0,other:0};
-                    for(const t of a){const url=String(t.url||"");if(url.includes("meet.google.com"))types.meet++;else if(url.includes("accounts.google.com"))types.account++;else if(url.startsWith("chrome:"))types.chrome++;else types.other++;}
-                    console.log("CDP_LIST",JSON.stringify({status:r.status,total:a.length,types}));
-                  }catch(e){console.log("CDP_LIST_ERROR",e.name)}
-                  clearTimeout(timer);
-                })();
-                """
-                p=subprocess.run(["docker","exec",container,"node","-e",js],capture_output=True,text=True,timeout=10)
-                print("CDP_TABS",container,p.returncode,p.stdout.strip()[:300])
-            # Count distinct Chrome renderers and network processes (not command lines).
-            p=subprocess.run(["docker","exec","beonmeet-chrome-single","sh","-c","ps -e -o comm= | sort | uniq -c | tail -20"],capture_output=True,text=True,timeout=8)
-            print("CHROME_PROCESS_NAMES",p.stdout.strip().splitlines()[-12:])
-            logs=subprocess.run(["docker","logs","--since","2026-11-21T12:28:00Z","beonmeet-worker-five"],capture_output=True,text=True,timeout=15).stdout
-            events=[]
-            for line in logs.splitlines():
-                if not line.startswith("[2026-11-21T"):continue
-                msg=line.split("] ",4)[-1].split(" {",1)[0].strip()
-                # Only categorized events. Do not expose URLs/meeting names.
-                for k,needle in (
-                    ("start","Begin recording"),("joined","Meeting joined"),("waiting","waiting for the host"),
-                    ("ask_clicked","Success clicked using"),("retry","Retry count"),("timeout","TimeoutError"),
-                    ("failure","Meeting job permanently failed"),("closed","Meeting slot released"),
-                    ("end","Recording stopped"),("error","Error executing task"),("admit","admitted")):
-                    if needle.lower() in msg.lower():events.append([line[1:24],k]);break
-            print("WORKER_EVENTS_SINCE_SCREENSHOT",json.dumps(events[-50:]))
-            print("CDP_RECORDER_STATE_AUDIT_DONE")
+                    const data=JSON.parse(String(v));
+                    if(data.id!==42)return;
+                    const payload=data.result?.result?.value || null;
+                    finish(payload?'success':'empty',payload);
+                  }catch(e){finish('parse_error',e.name)}
+                });
+                socket.on('error',e=>finish('socket_error_class',e.name));
+                socket.on('close',()=>{if(!done)finish('closed')});
+              }catch(e){finish('setup_error_class',e.name)}
+            })().then(()=>{});
+            """
+            p=subprocess.run(["docker","exec","beonmeet-worker-five","node","-e",js],capture_output=True,text=True,timeout=24)
+            print("CDP_PAGE_QUERY_EXIT",p.returncode)
+            for line in p.stdout.splitlines():
+                if line.startswith(("DIRECT_PAGE_CDP_","PAGE_CDP_WS_")):print(line[:1800])
+            print("DIRECT_PAGE_CDP_AUDIT_COMPLETE")
             PY
