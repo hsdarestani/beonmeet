@@ -43,6 +43,7 @@ jobs:
           python3 tests/trusted_meet_join_overlay_test.py
           python3 tests/guest_join_block_notice_test.py
           python3 tests/stale_join_status_lifecycle_test.py
+          python3 tests/modern_incall_proof_test.py
           python3 tests/secure_chrome_login_gateway_test.py
           python3 -m py_compile patches/patch_low_resource_compiled_recorder.py
           bash -n scripts/activate_five_on_shared_vps.sh
