@@ -26,18 +26,16 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import os,fcntl,subprocess,json,urllib.request,datetime
-            print("CHECK_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            with open("/var/lock/pars-vds-bot-deploy.lock","a+") as f:
-                try:
-                    fcntl.flock(f.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
-                    print("DEPLOY_LOCK_AVAILABLE",True)
-                    fcntl.flock(f.fileno(),fcntl.LOCK_UN)
-                except BlockingIOError:print("DEPLOY_LOCK_AVAILABLE",False)
-            p=subprocess.run(["docker","ps","-a","--filter","name=beonmeet-five-qa-chrome","--format","{{.Names}}"],capture_output=True,text=True,timeout=7)
-            print("ABANDONED_QA_CONTAINER_PRESENT",bool(p.stdout.strip()))
-            for port in (9124,9126):
-                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=5) as res:d=json.load(res)
-                print("ACTIVE_RECORDER_JOBS",port,int((d.get("data")or d).get("runningJobs") or 0))
-            print("PRE_DEPLOY_GUARD_CHECK_COMPLETE")
+            import json,urllib.request,subprocess,datetime
+            from pathlib import Path
+            print("LIVE_VERIFY_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
+            p=subprocess.run(["docker","exec","beonmeet-worker-five","sh","-c","grep -q GOOGLE_MEET_TRUSTED_JOIN_PATCH /usr/src/app/dist/bots/GoogleMeetBot.js"],capture_output=True,text=True,timeout=8)
+            print("TRUSTED_CLICK_PATCH_RUNNING",p.returncode==0)
+            p=subprocess.run(["docker","exec","beonmeet-worker-five","sh","-c","grep -q 'const knockConfirmed =' /usr/src/app/dist/bots/GoogleMeetBot.js"],capture_output=True,text=True,timeout=8)
+            print("LOBBY_CONFIRMATION_PATCH_RUNNING",p.returncode==0)
+            for name,port,endpoint in (("controller",8109,"/health"),("five",9126,"/capacity"),("single",9124,"/capacity")):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+endpoint,timeout=6) as r:data=json.load(r)
+                d=data.get("data",data)
+                print("LIVE_STAGES",name,json.dumps({k:d.get(k) for k in ("ok","runningJobs","availableSlots","free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs") if k in d}))
+            print("TRUSTED_JOIN_LIVE_AUDIT_COMPLETE")
             PY
