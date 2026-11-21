@@ -27,17 +27,14 @@ jobs:
             cd /opt/beonmeet
             python3 - <<'PY'
             import subprocess
-            js="/usr/src/app/dist/bots/GoogleMeetBot.js"
-            source=subprocess.check_output(["docker","exec","beonmeet-worker-five","cat",js],timeout=20).decode()
-            print("COMPILED_JS_BYTES",len(source))
-            needles=["Success clicked using", "notifyBeOnMeetWaitingForAdmission", "WAITING_FOR_HOST_TO_ADMIT_BOT", "Google Meet pre-join controls are not ready yet", "Join now", "Ask to join"]
-            for word in needles:
-                pos=source.find(word)
-                print("NEEDLE",word,"COUNT",source.count(word),"POS",pos)
-                if pos>=0:
-                    snippet=source[max(0,pos-560):pos+460]
-                    print("STATIC_SOURCE_CONTEXT_START",word)
-                    print(snippet)
-                    print("STATIC_SOURCE_CONTEXT_END")
-            print("COMPILED_RECORDER_STATIC_INSPECTION_PASS")
+            src=subprocess.check_output(["docker","exec","beonmeet-worker-five","cat","/usr/src/app/dist/bots/GoogleMeetBot.js"],timeout=22).decode()
+            for marker,before,after in [
+                ("Clicking ask to join button",200,2200),
+                ("Success clicked using",800,1600),
+                ("const notifyBeOnMeetWaitingForAdmission",80,1400),
+                ("await notifyBeOnMeetWaitingForAdmission()",650,450)]:
+                at=src.find(marker)
+                print("MARKER",marker,"FOUND",at)
+                if at>=0:print("JS_SNIPPET_START",marker,"\n",src[max(0,at-before):at+after],"\nJS_SNIPPET_END")
+            print("WORKER_JOIN_HOOK_CONTEXT_DONE")
             PY
