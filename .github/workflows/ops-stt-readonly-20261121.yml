@@ -1,0 +1,80 @@
+name: BeOnMeet STT and resource baseline read-only
+on:
+  push:
+    branches: [ops/stt-capacity-readonly-20261121]
+    paths: [.github/workflows/ops-stt-readonly-20261121.yml]
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Read anonymized Whisper configuration, performance and recording pressure
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 4m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1;; esac
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,subprocess,os,shutil,urllib.request,re
+            from pathlib import Path
+            x=Path('.env').read_text().splitlines()
+            allow={'WHISPER_MODEL','WHISPER_COMPUTE_TYPE','WHISPER_CPU_THREADS','RECOVERY_WHISPER_MODEL','TRANSCRIPTION_CONCURRENCY','TRANSCRIPTION_CHUNK_SECONDS','RECOVERY_TRANSCRIPTION_CHUNK_SECONDS','SHARED_CHROME_MAX_ACTIVE','FREE_WORKER_URLS','PREMIUM_WORKER_URLS'}
+            env={}
+            for line in x:
+                if '=' not in line or line.startswith('#'):continue
+                k,v=line.split('=',1)
+                if k in allow:env[k]=v
+            print('STT_ENV_CONFIG',json.dumps(env,sort_keys=True))
+            def run(*args,timeout=10):
+                r=subprocess.run(args,capture_output=True,text=True,timeout=timeout)
+                return r.stdout if r.returncode==0 else ''
+            service=run('systemctl','show','-p','MainPID','--value','beonmeet-controller').strip()
+            if service.isdigit() and Path('/proc',service,'environ').exists():
+                data=Path('/proc',service,'environ').read_bytes()
+                cfg={}
+                for raw in data.split(b'\\x00'):
+                    try:s=raw.decode('utf-8')
+                    except UnicodeDecodeError:continue
+                    if '=' in s:
+                        k,v=s.split('=',1)
+                        if k in allow:cfg[k]=v
+                print('STT_CONTROLLER_EFFECTIVE',json.dumps(cfg,sort_keys=True))
+            print('STT_PYTHON_DEPENDENCIES',run('/opt/beonmeet/.venv/bin/python','-c','import importlib.metadata as m; print("faster-whisper",m.version("faster-whisper")); print("ctranslate2",m.version("ctranslate2"))').strip()[:250])
+            roots=[Path('/opt/beonmeet/data/whisper-models'),Path('/opt/beonmeet/data')]
+            for path in roots[:1]:
+                if path.exists():
+                    names=[p.name[:95] for p in path.iterdir() if p.is_dir()]
+                    print('STT_MODEL_CACHE_DIR_NAMES',names[:25])
+            j=run('journalctl','-u','beonmeet-controller','--since','180 minutes ago','--no-pager','-o','cat',timeout=15).splitlines()
+            terms=('primary transcription failed','transcription error','transcript','whisper','out of memory','killed process','model','cuda')
+            filtered=[s for s in j if any(q in s.lower() for q in terms)]
+            from collections import Counter
+            counts=Counter('primary_fallback' if 'primary transcription failed' in s.lower() else
+                           'transcription_error' if 'transcription error' in s.lower() else
+                           'model_error' if 'whisper' in s.lower() or 'model' in s.lower() else 'other'
+                           for s in filtered)
+            print('STT_RELATED_LOG_COUNTS_180M',dict(counts))
+            for s in filtered[-12:]:
+                s=re.sub(r'https?://[^\\s]+','[URL]',s)
+                s=re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+','[EMAIL]',s)
+                s=re.sub(r'(?<!\\w)[0-9]{5,}(?!\\w)','[ID]',s)
+                print('STT_LOG_CATEGORY',('fallback' if 'primary transcription failed' in s.lower() else 'error' if 'transcription error' in s.lower() else 'other'),s[:180])
+            for port in (9124,9126):
+                try:
+                    with urllib.request.urlopen(f'http://127.0.0.1:{port}/capacity',timeout=4) as r:payload=json.load(r)
+                    print('STT_CAPACITY',port,(payload.get('data') or payload))
+                except Exception as e:print('STT_CAPACITY_ERROR',port,type(e).__name__)
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=5) as r:h=json.load(r)
+            print('STT_HEALTH',json.dumps({k:h.get(k) for k in ('ok','premium_queue','free_queue','active_delivery_jobs','pending_delivery_jobs','remote_workers')},sort_keys=True))
+            print('STT_MEM_AVAILABLE_MB',round(int(next(l.split()[1] for l in Path('/proc/meminfo').read_text().splitlines() if l.startswith('MemAvailable:')))/1024))
+            print('STT_DISK_FREE_GB',round(shutil.disk_usage('/').free/1024**3,2))
+            print('STT_AUDIT_FINISHED')
+            PY
