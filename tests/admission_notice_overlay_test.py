@@ -11,13 +11,16 @@ spec.loader.exec_module(module)
 
 source = (
     "const notifyBeOnMeetWaitingForAdmission = async () => {\n"
+    + module.FLAG_DECLARATION + "\n"
     + module.CLICK + "\n"
     + module.CLICK + "\n"
     + module.CALLBACK_END + "\n"
 )
 patched = module.patched_source(source)
-assert patched.count("var beOnMeetAskedToJoin =") == 2
+assert patched.count("let beOnMeetAskedToJoin = false") == 1
+assert patched.count("beOnMeetAskedToJoin = /Ask to join") == 2
 assert patched.count("await notifyBeOnMeetWaitingForAdmission();") == 1
+assert patched.index("let beOnMeetAskedToJoin = false") < patched.index("beOnMeetAskedToJoin = /Ask to join")
 assert patched.index("await notifyBeOnMeetWaitingForAdmission();") > patched.index(
     "const notifyBeOnMeetWaitingForAdmission = async () => {"
 )
