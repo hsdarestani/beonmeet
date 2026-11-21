@@ -1,0 +1,67 @@
+name: Read-only audit for secure BeOnMeet Google re-authentication UI
+on:
+  push:
+    branches: [ops/audit-secure-chrome-login-path-20261121]
+    paths: [.github/workflows/audit-chrome-login-access.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - name: Read-only check of VNC, reverse proxy, and host capacity
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 4m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,subprocess,urllib.request,os,re
+            from pathlib import Path
+            print("LOGIN_UI_SECURITY_AUDIT_BEGIN")
+            name="beonmeet-chrome-single"
+            for suffix in (".NetworkSettings.Ports",".State.Health.Status"):
+                p=subprocess.run(["docker","inspect","-f","{{"+suffix+"}}",name],capture_output=True,text=True,timeout=8)
+                if suffix.endswith("Ports") and p.returncode==0:
+                    v=p.stdout.strip()
+                    print("CHROME_PUBLISHED_PORT_SUMMARY",v[:850])
+                elif p.returncode==0:
+                    print("CHROME_HEALTH_STATUS",p.stdout.strip())
+            for ep in ("http://127.0.0.1:6080/vnc.html","http://127.0.0.1:6080/","http://127.0.0.1:8109/health"):
+                try:
+                    with urllib.request.urlopen(ep,timeout=4) as r:
+                        print("LOOPBACK_ROUTE","vnc" if ":6080" in ep else "api",r.status)
+                except Exception as e:print("LOOPBACK_ROUTE_ERROR","vnc" if ":6080" in ep else "api",type(e).__name__)
+            p=subprocess.run(["docker","exec",name,"sh","-c","for port in 6080 5900 9223; do (echo > /dev/tcp/127.0.0.1/$port) >/dev/null 2>&1 && echo $port:yes || echo $port:no; done"],capture_output=True,text=True,timeout=8)
+            print("CHROME_LOCAL_SERVICE_CHECK",p.stdout.strip()[:200])
+            for svc in ("nginx","caddy","cloudflared"):
+                p=subprocess.run(["systemctl","is-active",svc],capture_output=True,text=True,timeout=5)
+                print("HOST_PROXY_SERVICE",svc,p.stdout.strip())
+            for pth in ("/etc/nginx/sites-enabled","/etc/nginx/conf.d","/opt/beonmeet/Caddyfile"):
+                p=Path(pth)
+                if not p.exists():continue
+                files=list(p.glob("*")) if p.is_dir() else [p]
+                for f in files:
+                    if not f.is_file():continue
+                    try:t=f.read_text()
+                    except Exception:continue
+                    print("REVERSE_PROXY_CONFIG_FLAGS",f.name,json.dumps({"vnc_mentioned":("6080" in t or "novnc" in t.lower()),"basic_auth_present":("auth_basic" in t or "basic_auth" in t),"host_name_present":("beonmeet.smarbiz.sbs" in t),"cloudflare_access":("cloudflare" in t.lower())}))
+            pkg=subprocess.run(["sh","-c","command -v cloudflared || true; command -v htpasswd || true; command -v socat || true"],capture_output=True,text=True,timeout=5)
+            print("HOST_AVAILABLE_TOOLS",[(Path(p).name) for p in pkg.stdout.splitlines()])
+            data=Path("/proc/meminfo").read_text()
+            mem=int(next(l.split()[1] for l in data.splitlines() if l.startswith("MemAvailable:")))
+            disk=subprocess.run(["df","-Pk","/opt/beonmeet"],capture_output=True,text=True,timeout=5)
+            print("HOST_CAPACITY",json.dumps({"mem_available_MiB":round(mem/1024),"free_disk_GiB":round(int(disk.stdout.splitlines()[-1].split()[3])/1024/1024,2),"cpu_count":os.cpu_count()}))
+            for port in (9124,9126):
+                try:
+                    with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=5) as r:cap=json.load(r)
+                    print("WORKER_CAPACITY",port,{k:cap.get("data",cap).get(k) for k in ("runningJobs","availableSlots")})
+                except Exception as e:print("WORKER_CAPACITY_ERROR",port,type(e).__name__)
+            print("LOGIN_UI_SECURITY_AUDIT_COMPLETE")
+            PY
