@@ -32,38 +32,43 @@ jobs:
             git merge-base --is-ancestor "$new" FETCH_HEAD
             stage=$(mktemp -d /opt/beonmeet/.guest-guidance-stage.XXXXXXXX)
             for file in app/main.py app/i18n.py;do
-              git show "$old:$file" > "$stage/old-$(basename "$file")"
               git show "$new:$file" > "$stage/$(basename "$file")"
             done
             python3 - "$stage" <<'PY'
-            import difflib,sys
+            import sys
             from pathlib import Path
             stage=Path(sys.argv[1])
-            for filename,expected in (("main.py",1),("i18n.py",3)):
-                original=(stage/("old-"+filename)).read_text()
-                updated=(stage/filename).read_text()
-                current=Path("/opt/beonmeet/app")/filename
-                live=current.read_text()
-                assert "join_access_notice_at" not in live if filename=="main.py" else "join_guest_access_possible" not in live
-                before=original.splitlines(keepends=True)
-                after=updated.splitlines(keepends=True)
-                diffs=[(tag,i1,i2,j1,j2) for tag,i1,i2,j1,j2 in difflib.SequenceMatcher(None,before,after,autojunk=False).get_opcodes() if tag!="equal"]
-                assert len(diffs)==expected,("Unexpected patch scope",filename,len(diffs))
-                for tag,i1,i2,j1,j2 in diffs:
-                    old_chunk="".join(before[i1:i2])
-                    new_chunk="".join(after[j1:j2])
-                    if tag=="insert":
-                        assert i1>0, "Cannot insert without context"
-                        anchor=before[i1-1]
-                        assert live.count(anchor)==1,("Insertion anchor changed",filename)
-                        live=live.replace(anchor,anchor+new_chunk,1)
-                    elif tag=="replace":
-                        assert old_chunk and live.count(old_chunk)==1,("Current code differs at patch",filename)
-                        live=live.replace(old_chunk,new_chunk,1)
-                    else:
-                        raise AssertionError("Unexpected deletion in source diff")
-                (stage/("merged-"+filename)).write_text(live)
-                print("MINIMAL_DIFF_MERGED_WITH_EXISTING_SERVER_CODE",filename,"patches",len(diffs))
+            live_main=Path("/opt/beonmeet/app/main.py").read_text()
+            new_main=(stage/"main.py").read_text()
+            marker='                # The event may be removed by a successful callback while we'
+            begin='                key = "join_slow_notified_at" if age_seconds >= 90 else ('
+            replacement_start='                # Anonymous guests and third-party note-taking bots may be'
+            assert live_main.count(begin)==1, "Current progress logic not recognized"
+            assert new_main.count(replacement_start)==1, "Reviewed new progress logic not recognized"
+            old_begin=live_main.index(begin)
+            old_end=live_main.index(marker,old_begin)
+            new_begin=new_main.index(replacement_start)
+            new_end=new_main.index(marker,new_begin)
+            assert old_end-old_begin<700 and new_end-new_begin<2000, "Unexpected progress block scope"
+            main_result=live_main[:old_begin]+new_main[new_begin:new_end]+live_main[old_end:]
+            assert main_result.count("join_guest_access_possible")==1
+            (stage/"merged-main.py").write_text(main_result)
+            live_i18n=Path("/opt/beonmeet/app/i18n.py").read_text().splitlines(keepends=True)
+            target_i18n=(stage/"i18n.py").read_text().splitlines(keepends=True)
+            new_messages=[target_i18n[i+1] for i,line in enumerate(target_i18n[:-1]) if '"join_still_unconfirmed":' in line]
+            assert len(new_messages)==3 and all('"join_guest_access_possible":' in x for x in new_messages)
+            assert sum('"join_still_unconfirmed":' in x for x in live_i18n)==3
+            assert not any('"join_guest_access_possible":' in x for x in live_i18n)
+            result=[]
+            count=0
+            for line in live_i18n:
+                result.append(line)
+                if '"join_still_unconfirmed":' in line:
+                    result.append(new_messages[count])
+                    count+=1
+            assert count==3
+            (stage/"merged-i18n.py").write_text("".join(result))
+            print("TARGETED_JOIN_PROGRESS_PATCH_AND_THREE_TRANSLATIONS_PREPARED")
             PY
             python3 -m py_compile "$stage/merged-main.py" "$stage/merged-i18n.py"
             grep -q '"join_access_notice_at" if age_seconds >= 180' "$stage/merged-main.py"
