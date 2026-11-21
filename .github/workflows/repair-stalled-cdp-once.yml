@@ -1,0 +1,90 @@
+name: One-time BeOnMeet Chrome CDP recovery and Playwright check
+
+on:
+  push:
+    branches: [ops/repair-stalled-chrome-cdp-20261121]
+    paths:
+      - .github/workflows/repair-stalled-cdp-once.yml
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - name: Restart only idle BeOnMeet Chrome and prove new Playwright page works
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 6m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST; exit 1 ;; esac
+            test "$(id -u)" = 0
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 60 9
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,subprocess,urllib.request
+            with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=8) as r:h=json.load(r)
+            assert h.get("ok"),"Controller unhealthy"
+            for k in ("free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs"):
+                assert int(h.get(k) or 0)==0,"Controller not idle: "+k
+            for p in (9124,9126):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(p)+"/capacity",timeout=8) as r:d=json.load(r)
+                assert int((d.get("data") or d).get("runningJobs") or 0)==0,"Recorder still active"
+            for n in ("beonmeet-worker-five","beonmeet-worker-single","beonmeet-chrome-single"):
+                assert subprocess.check_output(["docker","inspect","--format","{{.State.Running}}",n],text=True).strip()=="true","Expected BeOnMeet container missing"
+            for n in ("camcam-shared-api-1","camcam-shared-pet-1","camcam-shared-archive-1","camcam-shared-petarchive-1"):
+                assert subprocess.check_output(["docker","inspect","--format","{{.State.Health.Status}}",n],text=True).strip()=="healthy","Neighbor unhealthy: "+n
+            print("NO_ACTIVE_MEETINGS_CAMCAM_HEALTHY_PASS")
+            PY
+            docker restart --time 20 beonmeet-chrome-single >/dev/null
+            echo "BEONMEET_CHROME_RESTARTED_ONCE"
+            for i in $(seq 1 30); do
+              if docker exec beonmeet-worker-five node -e 'const u=process.env.GOOGLE_CHROME_CDP_URL; const c=new AbortController(); const t=setTimeout(()=>c.abort(),3000);fetch(u.replace(/\/$/,"")+"/json/version",{signal:c.signal}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))' >/dev/null 2>&1; then
+                echo "CDP_HTTP_RECOVERED"
+                break
+              fi
+              sleep 2
+            done
+            python3 - <<'PY'
+            import json,urllib.request
+            for p in (9124,9126):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(p)+"/capacity",timeout=5) as r:d=json.load(r)
+                assert int((d.get("data") or d).get("runningJobs") or 0)==0,"New recording started during recovery; skip test"
+            PY
+            docker exec beonmeet-worker-five node -e '
+              (async()=>{
+                let phase="connect";
+                try {
+                  const {chromium}=require("playwright-extra");
+                  const browser=await chromium.connectOverCDP(process.env.GOOGLE_CHROME_CDP_URL,{timeout:15000});
+                  console.log("CDP_CONNECT_SUCCESS");
+                  phase="context";
+                  const ctx=browser.contexts()[0]||await browser.newContext();
+                  ctx.setDefaultTimeout(10000);
+                  phase="new-page";
+                  const page=await ctx.newPage();
+                  console.log("CDP_NEW_PAGE_SUCCESS");
+                  phase="close-page";
+                  await page.close({timeout:10000});
+                  console.log("CDP_CLOSE_PAGE_SUCCESS");
+                  process.exit(0);
+                } catch(e) {
+                  console.log("CDP_TEST_FAILED_AT",phase,"CLASS",e.name);
+                  process.exit(2);
+                }
+              })();
+            '
+            curl -fsS --max-time 10 https://beonmeet.smarbiz.sbs/health >/dev/null
+            for n in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1; do
+              test "$(docker inspect --format '{{.State.Health.Status}}' "$n")" = healthy
+            done
+            echo "CDP_RECOVERY_VERIFIED_CAMCAM_UNCHANGED"
