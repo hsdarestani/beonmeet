@@ -31,7 +31,7 @@ jobs:
             def get(url):
                 with urllib.request.urlopen(url,timeout=6) as r:return json.load(r)
             h=get('http://127.0.0.1:8109/health')
-            print('CAPACITY_CONTROLLER',json.dumps({k:h.get(k) for k in ('ok','max_concurrent_meetings','local_free_meeting_slots','local_premium_meeting_slots','free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs','autoscaler_enabled')},sort_keys=True))
+            print('CAPACITY_CONTROLLER',json.dumps({k:h.get(k) for k in ('ok','max_concurrent_meetings','local_free_meeting_slots','local_premium_meeting_slots','free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs','autoscaler_enabled','remote_workers','remote_free_slots','remote_premium_slots','remote_free_available_slots','remote_premium_available_slots','recorder_account_profiles')},sort_keys=True))
             print('CAPACITY_MEMORY',[(x.split(':')[0],round(int(x.split()[1])/1024)) for x in Path('/proc/meminfo').read_text().splitlines() if x.startswith(('MemTotal:','MemAvailable:','SwapFree:'))])
             print('CAPACITY_CPU_COUNT',os.cpu_count())
             print('CAPACITY_DISK_FREE_GIB',round(shutil.disk_usage('/').free/1024**3,2))
