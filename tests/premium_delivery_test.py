@@ -118,3 +118,15 @@ assert "state.setdefault(\"completed_deliveries\", {})[pending_id]" in MAIN
 assert '"completed_deliveries": {}' in MAIN
 assert 'state.setdefault("completed_deliveries", {})' in MAIN
 print("MISSING_RECORDING_MUST_NOT_ACK_SUCCESS_TEST_PASS")
+
+
+# A preserved premium video that has exhausted eight retries must be eligible
+# again after the recorder directory permission is repaired. The delivered
+# video flag stays intact so only audio/transcript are regenerated.
+assert 'PENDING_DELIVERY_MAX_ATTEMPTS = max(8, min(32,' in MAIN
+assert 'if attempts >= PENDING_DELIVERY_MAX_ATTEMPTS:' in MAIN
+assert '"recovery_exhausted_notified"' in MAIN
+assert "if not video_already_delivered:" in MAIN
+assert 'pending_state["video_delivered"] = True' in MAIN
+assert I18N.count('"delivery_recovery_exhausted"') == 3
+print("PREMIUM_PENDING_RETRY_AFTER_INFRA_REPAIR_TEST_PASS")
