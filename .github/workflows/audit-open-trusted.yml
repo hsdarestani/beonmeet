@@ -22,15 +22,47 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import subprocess
-            p=subprocess.run(["docker","exec","beonmeet-worker-five","cat","/usr/src/app/dist/bots/GoogleMeetBot.js"],capture_output=True,text=True,timeout=20)
-            s=p.stdout
-            for n,k in (("PARTICIPANT_DETECTION","const participantCountDetected ="),("BROWSER_JOIN_CONFIRM","if (participantCountDetected)"),("PROMISE_RETURN","await waitAtLobbyPromise"),("RECORDING_START","recordingStarted"),("RECORDING_STARTED_NOTICE","notifyBeOnMeetRecordingStarted")):
-                i=s.find(k)
-                print("SOURCE_ANCHOR",n,i)
-                if i>=0:
-                    print("SOURCE_FRAGMENT_BEGIN",n)
-                    print(s[max(0,i-120):i+5300])
-                    print("SOURCE_FRAGMENT_END",n)
-            print("SOURCE_PARTICIPANT_DIAGNOSTIC_COMPLETE")
+            import subprocess,urllib.request,json,datetime
+            print("MEET_BADGE_DIAG_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
+            for port in (9124,9126):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=6) as r:d=json.load(r)
+                print("ACTIVE_RECORDER_JOBS",port,(d.get("data")or d).get("runningJobs"))
+            js=r"""
+            (async()=>{
+              const timeout=setTimeout(()=>process.exit(18),14500);
+              try{
+                const {chromium}=require('playwright-extra');
+                const b=await chromium.connectOverCDP(process.env.GOOGLE_CHROME_CDP_URL,{timeout:9500});
+                let count=0;
+                for(const ctx of b.contexts())for(const page of ctx.pages()){
+                  if(!page.url().startsWith('https://meet.google.com/'))continue;
+                  count++;
+                  const s=await page.evaluate(()=>{
+                    const buttons=Array.from(document.querySelectorAll('button'));
+                    const labels=buttons.map(b=>String(b.getAttribute('aria-label')||b.innerText||'').toLowerCase());
+                    const text=(document.body?.innerText||'').toLowerCase();
+                    const badges=Array.from(document.querySelectorAll('[data-avatar-count]')).map(e=>e.getAttribute('data-avatar-count')).slice(0,5);
+                    return {badges,
+                      in_call_controls: {
+                        leave:labels.some(t=>t.includes('leave call')||t.includes('anruf verlassen')),
+                        hand:labels.some(t=>t.includes('raise hand')||t.includes('hand heben')),
+                        reactions:labels.some(t=>t.includes('reactions')||t.includes('reaktion')),
+                        chat:labels.some(t=>t.includes('chat')),
+                        ask:labels.some(t=>t.includes('ask to join')),
+                        join:labels.some(t=>t.includes('join now'))
+                      },
+                      lobby_wait_text:text.includes('asking to join')||text.includes('let you in')||text.includes('waiting for someone')
+                    }
+                  });
+                  console.log('OPEN_MEET_BADGE_AND_CONTROLS',count,JSON.stringify(s));
+                }
+                console.log('OPEN_MEET_TAB_COUNT',count);
+              }catch(e){console.log('OPEN_MEET_BADGE_ERROR_CLASS',e.name)}
+              clearTimeout(timeout);process.exit(0);
+            })();
+            """
+            p=subprocess.run(["docker","exec","beonmeet-worker-five","node","-e",js],capture_output=True,text=True,timeout=23)
+            for line in p.stdout.splitlines():
+                if line.startswith(("OPEN_MEET_BADGE","OPEN_MEET_TAB")):print(line[:900])
+            print("MEET_BADGE_DIAG_COMPLETE")
             PY
