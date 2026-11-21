@@ -24,55 +24,44 @@ jobs:
           command_timeout: 4m
           script: |
             set -eu
-            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
             cd /opt/beonmeet
             python3 - <<'PY'
-            import subprocess,datetime,re,json,hashlib,collections
+            import subprocess,datetime,collections,json
             def run(args):
-                p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=45)
+                p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=42)
                 return p.stdout
-            print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
+            now=datetime.datetime.now(datetime.timezone.utc).isoformat()
+            print("AUDIT_UTC",now)
             raw=run(["docker","logs","--since","2026-11-21T10:39:00Z","beonmeet-worker-five"])
-            lines=raw.splitlines()
             names={}
-            def scrub(v):
-                v=re.sub(r"https?://[^\\s\\\"']+","[URL]",v)
-                v=re.sub(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}","[EMAIL]",v)
-                v=re.sub(r"\\b[a-z]{3}-[a-z]{4}-[a-z]{3}\\b","[MEET]",v,flags=re.I)
-                v=re.sub(r"\\b\\d{5,}\\b","[USERID]",v)
-                v=re.sub(r"(?i)(token|authorization|secret|password)[=:\\s]+[^,;} ]+","[SECRET]",v)
-                return v[:210]
-            print("WORKER_LOG_LINES",len(lines))
-            for line in lines[-140:]:
-                t=re.search(r"2026-11-21T[0-9:.]+Z",line)
-                at=t.group(0)[11:23] if t else "--"
-                corr=re.search(r"\\[correlationId:\\s*([a-f0-9-]{20,})\\]",line,re.I)
-                if corr:
-                    ident=corr.group(1)
+            events=[]
+            for line in raw.splitlines():
+                if not line.startswith("[2026-11-21T"):continue
+                at=line[1:24]
+                if "[correlationId: " in line:
+                    ident=line.split("[correlationId: ",1)[1].split("]",1)[0]
                     if ident not in names:names[ident]="job"+str(len(names)+1)
                     job=names[ident]
-                else: job="shared"
-                # Drop all JSON metadata containing user IDs, URLs, meeting titles.
-                message=line.split("] ",4)[-1].split(" {",1)[0]
-                if message.startswith("{") or message.startswith("["):message="[JSON]"
-                err_match=re.search(r'"error"\\s*:\\s*\\{?[^}]{0,180}',line)
-                error_code=""
-                if err_match:
-                    er=err_match.group(0)
-                    found=re.findall(r"(?:TimeoutError|TargetClosedError|EACCES|ECONNREFUSED|ERR_[A-Z_]+|ENOSPC|HTTP [45][0-9][0-9]|NotFoundError)",er)
-                    if found:error_code=" error_type="+",".join(found)
-                if message.startswith("at ") or not any(x in message.lower() for x in ("join","meet","chrome","page","record","attempt","error","fail","retry","wait","input","button","enter","admit","start","launch","playwright","session","browser")):continue
-                print("WORKER_EVENT",at,job,scrub(message)+error_code)
-            print("JOBS_SEEN",len(names))
-            print("CONTROLLER_LOGS_LAST:")
+                else:job="shared"
+                message=line.split("] ",4)[-1].split(" {",1)[0].strip()
+                if len(message)>130 or "http://" in message or "https://" in message or "@" in message:
+                    message="[REDACTED_MESSAGE]"
+                key=message.lower()
+                if any(s in key for s in ("meeting","join","chrome","page","record","attempt","error","fail","retry","wait","input","button","enter","admit","start","launch","playwright","session","browser","modal","profile","selector")):
+                    err_type=""
+                    for code in ("TimeoutError","TargetClosedError","EACCES","ECONNREFUSED","ENOSPC","NotFoundError","ERR_NAME_NOT_RESOLVED","ERR_CONNECTION"):
+                        if code in line:err_type=" "+code
+                    events.append([at,job,message+err_type])
+            print("WORKER_JOBS",len(names))
+            print("WORKER_EVENTS",json.dumps(events[-100:],ensure_ascii=True))
             ctl=run(["journalctl","-u","beonmeet-controller","--since","2026-11-21 10:38:00 UTC","--no-pager","-o","short-iso"])
-            for line in ctl.splitlines()[-55:]:
-                tm=re.search(r"2026-11-21T[0-9:]+",line)
-                tag=tm.group(0)[11:] if tm else "--"
-                p=re.search(r'"(POST|GET) (/[a-zA-Z0-9_/-]+) HTTP/1.1" ([1-5][0-9]{2})',line)
-                if p:print("CONTROLLER_HTTP",tag,p.group(1),p.group(2),p.group(3))
-                else:
-                    for pattern in ("dispatch error","dispatch rejected","telegram loop error","queue loop error","delivery error"):
-                        if pattern in line.lower():print("CONTROLLER_ERROR",tag,pattern)
-            print("RECENT_LOG_AUDIT_COMPLETE")
+            for line in ctl.splitlines()[-80:]:
+                at=line[:25]
+                for endpoint in ("/internal/recording-started","/internal/waiting-for-admission","/internal/recording-ready","/internal/recording-upload"):
+                    if endpoint in line:
+                        code="200" if '" 200 ' in line else ("4xx/5xx" if '" 4' in line or '" 5' in line else "unknown")
+                        print("CONTROLLER_CALLBACK",at,endpoint,code)
+                for reason in ("meeting dispatch error","meeting dispatch rejected","telegram loop error","queue loop error","delivery error"):
+                    if reason in line.lower():print("CONTROLLER_ERROR",at,reason)
+            print("JOIN_TIMELINE_READ_ONLY_DONE")
             PY
