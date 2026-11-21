@@ -982,6 +982,11 @@ async def join_progress_loop() -> None:
                 )
                 if not key or launched.get(key):
                     continue
+                # A deploy or restart may load old "joining" events. A notice
+                # designed for minute three must not be emitted twenty minutes
+                # later as if this were a new attempt.
+                if age_seconds > 360:
+                    continue
                 message_key = {
                     "join_connecting_notified_at": "join_connecting",
                     "join_slow_notified_at": "join_still_unconfirmed",
@@ -1173,6 +1178,7 @@ async def state_cleanup_loop() -> None:
             # Accepted jobs can fail in the external recorder before any
             # recording callback. The controller must not keep them "joining"
             # indefinitely and silently block later Calendar attempts.
+            expired_unconfirmed_chats: list[str] = []
             launched_events = state.setdefault("launched_events", {})
             for event_id, launched in list(launched_events.items()):
                 status = str((launched or {}).get("status") or "joining")
@@ -1200,6 +1206,17 @@ async def state_cleanup_loop() -> None:
                 if now - created > max_age:
                     launched_events.pop(event_id, None)
                     changed = True
+                    # Only unconfirmed, never-recorded joins need a terminal
+                    # user notice. Preserve legitimate recording/delivery
+                    # lifecycles and do not modify the credit ledger.
+                    if (
+                        status in {"joining", "remote_claimed", "waiting_for_admission"}
+                        and not (launched or {}).get("recording_started_at")
+                        and now - created <= max_age + timedelta(minutes=15)
+                    ):
+                        chat_id = str((launched or {}).get("chat_id") or "")
+                        if chat_id:
+                            expired_unconfirmed_chats.append(chat_id)
 
             free_limit_notified = state.setdefault("free_limit_notified", {})
             for key, raw in list(free_limit_notified.items()):
@@ -1234,6 +1251,18 @@ async def state_cleanup_loop() -> None:
 
             if changed:
                 await save_state()
+            # Persist removal before sending: a failed Telegram request must
+            # never restore a stale join, reserve fresh free credit or send
+            # duplicate notifications on the next cleanup cycle.
+            for chat_id in expired_unconfirmed_chats:
+                try:
+                    await tg_text(chat_id, t(chat_id, "join_expired_without_recording"))
+                except Exception as notify_error:
+                    print(
+                        "expired join notification error:",
+                        type(notify_error).__name__,
+                        flush=True,
+                    )
         except Exception as exc:
             print("state cleanup loop error:", repr(exc), flush=True)
 
