@@ -127,5 +127,24 @@ jobs:
                     if any(s in line.lower() for s in ("record","upload","controller","meeting","telegram","fail","error","ffmpeg","processing","finished","end","status","post /internal","api","job")):
                         print("LOG",source,line[:220])
             print("TARGETED_COMPLETION_LOGS_DONE")
+            import sqlite3
+            dbpath=Path("/opt/beonmeet/data/beonmeet.db")
+            if dbpath.exists():
+                try:
+                    db=sqlite3.connect(f"file:{dbpath}?mode=ro",uri=True,timeout=3)
+                    db.row_factory=sqlite3.Row
+                    rows=db.execute("""SELECT telegram_id,created_at,size_bytes,duration_seconds
+                        FROM recordings WHERE created_at >= ? AND created_at <= ?
+                        ORDER BY created_at DESC LIMIT 12""",
+                        ("2026-11-21T10:02:00","2026-11-21T10:08:00")).fetchall()
+                    print("AUDITED_RECORDING_ROWS",len(rows))
+                    for q in rows:
+                        matching=db.execute("""SELECT COUNT(*) FROM meeting_requests
+                            WHERE telegram_id=? AND created_at >= ? AND created_at <= ?""",
+                            (q["telegram_id"],"2026-11-21T09:45:00","2026-11-21T10:08:00")).fetchone()[0]
+                        print("RECORDING_ROW",json.dumps({"created_at":q["created_at"],"size_bytes":q["size_bytes"],
+                            "duration_seconds":q["duration_seconds"],"request_matches":matching}))
+                    db.close()
+                except Exception as exc: print("AUDITED_RECORDING_ROWS_ERROR",type(exc).__name__)
             print("READ_ONLY_DELIVERY_DIAGNOSTICS_COMPLETE")
             PY
