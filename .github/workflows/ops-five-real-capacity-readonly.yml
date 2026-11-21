@@ -60,5 +60,6 @@ jobs:
                 if not source.startswith('/opt/beonmeet/'):continue
                 src=Path(source).read_text()
                 print('CAPACITY_WORKER_CODE_MARKERS',name,json.dumps({'modern_join':'BEONMEET_MODERN_IN_CALL_PROOF_V1' in src,'capture_env_fixed':'BEONMEET_BROWSER_QUALITY_ARG_V1' in src,'external_context_page_close':'External browser page closed in join finally' in src,'browser_capture_uses_process_env':'String(process.env.BEONMEET_CAPTURE_QUALITY' in src}))
+            print('CLOUD_SCALING_READINESS',json.dumps({'hetzner_api_token_configured':bool(next((l.split('=',1)[1].strip() for l in Path('.env').read_text().splitlines() if l.startswith('HETZNER_API_TOKEN=')),'')), 'bootstrap_profile_dir':Path('/opt/beonmeet/chrome-profile').exists(),'autoscale_images_present':any(p.exists() and p.stat().st_size>1024 for p in (Path('/opt/beonmeet/autoscale-images.tar'),Path('/opt/beonmeet/data/autoscale-images.tar'))), 'remote_worker_ids_exposed':False}))
             print('CAPACITY_AUDIT_PASS')
             PY
