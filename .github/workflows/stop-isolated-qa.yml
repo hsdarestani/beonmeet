@@ -1,0 +1,39 @@
+name: One-time stop abandoned isolated BeOnMeet QA container
+
+on:
+  push:
+    branches: [ops/cleanup-orphan-synthetic-qa-20261121]
+    paths:
+      - .github/workflows/stop-isolated-qa.yml
+
+permissions:
+  contents: read
+
+jobs:
+  stop-qa:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Stop only obsolete isolated load-test browser
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 3m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
+            cd /opt/beonmeet
+            test "$(docker inspect -f '{{.Name}}' beonmeet-five-qa-chrome)" = /beonmeet-five-qa-chrome
+            test "$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' beonmeet-five-qa-chrome)" = no
+            test "$(docker inspect -f '{{.Config.Image}}' beonmeet-five-qa-chrome)" = "$(docker inspect -f '{{.Config.Image}}' beonmeet-chrome-single)"
+            docker stop --time 10 beonmeet-five-qa-chrome
+            docker rm beonmeet-five-qa-chrome
+            echo ISOLATED_QA_CHROME_STOPPED_NO_USER_SESSION_TOUCHED
+            curl -fsS --max-time 8 https://beonmeet.smarbiz.sbs/health >/dev/null
+            for service in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1; do
+              test "$(docker inspect -f '{{.State.Health.Status}}' "$service")" = healthy
+            done
+            echo PRODUCTION_AND_CAMCAM_HEALTHY_AFTER_QA_STOP
