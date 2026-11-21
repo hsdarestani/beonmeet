@@ -57,3 +57,59 @@ assert 'calendar_scan_status[chat_id]' in MAIN
 assert 'Google Calendar event listing failed for all calendars' in MAIN
 assert 'av==18.1.0' in (ROOT / "app" / "requirements.txt").read_text(encoding="utf-8")
 print("AUTO_CALENDAR_AND_TRANSCRIPTION_DEPENDENCY_FIX_PASS")
+
+
+# Verify that a worker transport failure does not silently discard an
+# immediate or calendar join. Both a busy worker and an unreachable worker
+# must enter the existing durable queue; 202 means only accepted, not admitted.
+import ast
+import asyncio
+from typing import Any
+
+module = ast.parse(MAIN)
+launch_node = next(node for node in module.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "launch_meeting")
+
+async def _allowed(*args, **kwargs):
+    return True
+
+async def _ignore_text(*args, **kwargs):
+    return None
+
+for accepted, busy in ((False, False), (False, True), (True, False)):
+    queued, notifications = [], []
+
+    async def dispatch(*args, **kwargs):
+        return accepted, busy, "free-1" if accepted else ""
+
+    async def enqueue(*args, **kwargs):
+        queued.append((args, kwargs))
+
+    async def send_text(chat_id, message, **kwargs):
+        notifications.append(message)
+
+    env = {
+        "Any": Any,
+        "asyncio": asyncio,
+        "is_premium": lambda chat_id: False,
+        "_queue_event_id": lambda event: event["id"],
+        "_free_recording_allowed": _allowed,
+        "_paid_recording_allowed": _allowed,
+        "_dispatch_meeting": dispatch,
+        "enqueue_meeting": enqueue,
+        "tg_text": send_text,
+        "t": lambda chat_id, key, **kwargs: key,
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[launch_node], type_ignores=[])), "app/main.py", "exec"), env)
+    outcome = asyncio.run(env["launch_meeting"](
+        {"id": "manual-regression-test"}, {"chat_id": "1234"}, "https://meet.google.com/abc-defg-hij"
+    ))
+    assert outcome is accepted
+    assert len(queued) == (0 if accepted else 1), (accepted, busy, queued)
+    if not accepted:
+        assert queued[0][0][-1] is False
+        assert queued[0][1]["notify"] is True
+        assert not notifications, "queue notification is owned by enqueue_meeting"
+    else:
+        assert notifications == ["launch_free"], notifications
+
+print("DISPATCH_FAILURE_DURABLE_RETRY_TEST_PASS")
