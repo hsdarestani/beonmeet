@@ -1,0 +1,143 @@
+name: Guarded controller-only shared Chrome admission serialization
+on:
+  push:
+    branches: [ops/deploy-shared-chrome-admission-gate-20261121]
+    paths: [.github/workflows/release-shared-chrome-serial-once.yml]
+permissions:
+  contents: read
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Patch exact controller dispatch function preserving production local changes
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 6m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST;exit 1;; esac
+            test "$(id -u)" = 0
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 75 9
+            cd /opt/beonmeet
+            base=22ba69ffe770291954101efe8fec559beffb70bd
+            release=8aad320e7222da9762cc4bc26f02f0181e4654c2
+            git fetch -q origin main
+            git merge-base --is-ancestor "$release" FETCH_HEAD
+            stage=$(mktemp -d /opt/beonmeet/.serial-chrome-stage.XXXXXXXX)
+            mkdir -m700 "$stage/app" "$stage/tests"
+            git show "$base:app/main.py" > "$stage/baseline-main.py"
+            git show "$release:app/main.py" > "$stage/reference-main.py"
+            git show "$release:tests/shared_chrome_admission_gate_test.py" > "$stage/tests/shared_chrome_admission_gate_test.py"
+            python3 - "$stage" <<'PY'
+            import ast,sys
+            from pathlib import Path
+            stage=Path(sys.argv[1])
+            current=Path("app/main.py").read_text()
+            baseline=(stage/"baseline-main.py").read_text()
+            target=(stage/"reference-main.py").read_text()
+            oldfn_anchor="async def _dispatch_meeting("
+            endfn_anchor="\n\nasync def launch_meeting("
+            def block(text):
+                assert text.count(oldfn_anchor)==1 and text.count(endfn_anchor)==1
+                return text[text.index(oldfn_anchor):text.index(endfn_anchor)]
+            old_fn=block(baseline)
+            live_fn=block(current)
+            assert live_fn==old_fn,"Production dispatch function was modified elsewhere; refuse overwrite"
+            new_fn=block(target)
+            assert "_dispatch_meeting_serialized(" in new_fn
+            assert "SHARED_CHROME_MAX_ACTIVE" in new_fn
+            edits=[
+              ('queue_mutation_lock = asyncio.Lock()\n',
+               'queue_mutation_lock = asyncio.Lock()\n# Distinct from queue_mutation_lock: direct /now and queued dispatch must\n# never enter the *same* Chrome concurrently before isolated pools are ready.\nshared_chrome_dispatch_lock = asyncio.Lock()\n'),
+              ('PREMIUM_MEETING_SLOTS = int(os.environ.get("PREMIUM_MEETING_SLOTS", "3"))\n',
+               'PREMIUM_MEETING_SLOTS = int(os.environ.get("PREMIUM_MEETING_SLOTS", "3"))\n# One fragile Chrome CDP instance currently serves five advertised slots.\n# Until each production slot has its own verified isolated browser, serialize\n# joining into a single Chrome worker. Separate worker URLs can each use one.\n# Zero explicitly disables this guard after independent-browser E2E QA.\nSHARED_CHROME_MAX_ACTIVE = max(0, min(16, int(os.environ.get("SHARED_CHROME_MAX_ACTIVE", "1"))))\n')
+            ]
+            for old,new in edits:
+                assert baseline.count(old)==1 and target.count(new)==1
+                assert current.count(old)==1 and new not in current,"Unexpected live change"
+                current=current.replace(old,new,1)
+            assert current.count(old_fn)==1
+            current=current.replace(old_fn,new_fn,1)
+            assert current.count("async def _dispatch_meeting_serialized(")==1
+            assert current.count("shared_chrome_dispatch_lock = asyncio.Lock()")==1
+            ast.parse(current)
+            (stage/"app/main.py").write_text(current)
+            print("EXACT_SHARED_CHROME_MINIMAL_DIFF_STAGED")
+            PY
+            python3 -m py_compile "$stage/app/main.py"
+            python3 "$stage/tests/shared_chrome_admission_gate_test.py"
+            echo SHARED_CHROME_REAL_DISPATCH_REGRESSION_PASS
+            python3 - <<'PY'
+            import time,json,urllib.request,subprocess
+            def ready():
+                with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=6) as r:h=json.load(r)
+                if not h.get("ok"):raise RuntimeError("Controller not healthy")
+                for name in ("free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs"):
+                    if int(h.get(name) or 0):return False
+                for port in (9124,9126):
+                    with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=6) as r:d=json.load(r)
+                    if int((d.get("data")or d).get("runningJobs") or 0):return False
+                return True
+            for attempt in range(20):
+                if ready():break
+                if attempt==19:raise RuntimeError("Active recorder/queue/delivery: refuse controller restart")
+                time.sleep(6)
+            for name in ("camcam-shared-api-1","camcam-shared-pet-1","camcam-shared-archive-1","camcam-shared-petarchive-1"):
+                assert subprocess.check_output(["docker","inspect","-f","{{.State.Health.Status}}",name],text=True).strip()=="healthy"
+            print("CHROME_AND_DELIVERIES_IDLE_CAMCAM_GREEN")
+            PY
+            if grep -q '^SHARED_CHROME_MAX_ACTIVE=0' .env;then
+              echo SHARED_CHROME_SAFETY_DISABLED_IN_PRODUCTION_ENV
+              exit 1
+            fi
+            backup=$(mktemp -d /opt/beonmeet/.serial-chrome-backup.XXXXXXXX)
+            cp -p app/main.py "$backup/main.py"
+            changed=0
+            complete=0
+            cleanup(){
+              if [ "$changed" = 1 ] && [ "$complete" = 0 ];then
+                cp -p "$backup/main.py" app/main.py
+                systemctl restart beonmeet-controller || true
+                echo CONTROLLER_SERIAL_GATE_ROLLBACK
+              fi
+              rm -rf "$stage"
+            }
+            trap cleanup EXIT
+            python3 - <<'PY'
+            import json,urllib.request
+            with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=5) as r:h=json.load(r)
+            for name in ("free_queue","premium_queue","active_delivery_jobs","pending_delivery_jobs"):
+                assert int(h.get(name) or 0)==0,"Controller became busy"
+            for port in (9124,9126):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=5) as r:d=json.load(r)
+                assert int((d.get("data")or d).get("runningJobs") or 0)==0,"Recorder became busy"
+            print("FINAL_IDLE_CHECK_PASS")
+            PY
+            changed=1
+            install -m 644 "$stage/app/main.py" app/main.py
+            systemctl restart beonmeet-controller
+            ready=0
+            for i in $(seq 1 25);do
+              if curl -fsS --max-time 3 http://127.0.0.1:8109/health >/dev/null 2>&1;then ready=1;break;fi
+              sleep 2
+            done
+            test "$ready" = 1
+            cmp -s app/main.py "$stage/app/main.py"
+            .venv/bin/python -m py_compile app/main.py
+            curl -fsS --max-time 8 https://beonmeet.smarbiz.sbs/health >/dev/null
+            for name in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1;do
+              test "$(docker inspect -f '{{.State.Health.Status}}' "$name")" = healthy
+            done
+            complete=1
+            trap - EXIT
+            rm -rf "$stage"
+            echo SHARED_CHROME_SERIAL_ADMISSION_GATE_PRODUCTION_DEPLOY_SUCCESS
+            echo NO_CUSTOMER_RECORDING_WORKERS_RESTARTED
+            echo CAMCAM_UNCHANGED
