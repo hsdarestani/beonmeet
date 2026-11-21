@@ -23,26 +23,53 @@ jobs:
             cd /opt/beonmeet
             python3 - <<'PY'
             import subprocess,json,urllib.request
-            for name,filename in (
-              ("chromium","/usr/src/app/dist/lib/chromium.js"),
-              ("meetbot","/usr/src/app/dist/bots/GoogleMeetBot.js")):
-                p=subprocess.run(["docker","exec","beonmeet-worker-five","cat",filename],capture_output=True,text=True,timeout=15)
-                if p.returncode:
-                    print("RUNTIME_SOURCE_ABSENT",name)
-                    continue
-                code=p.stdout
-                for marker in (
-                    "connectOverCDP","browser.newContext(","browser.contexts()",
-                    ".newContext(","this.browser.newPage(","this.browserContext.newPage(",
-                    "this.page =","this._page =","context.newPage(","newPage(",
-                    "Launching browser","Navigating to Google Meet URL",
-                    "Guest pre-join detected","Join now","Ask to join"):
-                    indices=[i for i in range(len(code)) if code.startswith(marker,i)]
-                    if indices:
-                        print("RUNTIME_BROWSER_CONTEXT_CODE",name,marker,len(indices),
-                            json.dumps([code[max(0,i-100):i+150].replace("\\n"," ") for i in indices[:2]]))
             for port in (9124,9126):
-                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=5) as r:d=json.load(r)
-                print("ACTIVE_RECORDER_JOBS",port,int((d.get("data") or d).get("runningJobs") or 0))
-            print("RECORDER_CONTEXT_READONLY_AUDIT_DONE")
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=6) as r:d=json.load(r)
+                assert int((d.get("data")or d).get("runningJobs") or 0)==0, "Customer meeting active: skip prejoin"
+            js=r"""
+            (async()=>{
+              const {chromium}=require('playwright-extra');
+              let page=null;
+              const alarm=setTimeout(()=>{console.log('SIGNEDIN_MEET_PREJOIN_TIMEOUT');process.exit(17)},27000);
+              try{
+                const b=await chromium.connectOverCDP(process.env.GOOGLE_CHROME_CDP_URL,{timeout:12000});
+                const ctx=b.contexts()[0];
+                if(!ctx)throw Error('No persistent Chrome context');
+                const names=new Set((await ctx.cookies('https://accounts.google.com')).map(c=>c.name));
+                console.log('AUTHENTICATED_CONTEXT',names.has('SID') && names.has('SAPISID'));
+                page=await ctx.newPage();
+                const response=await page.goto('https://meet.google.com/cru-ggpe-nwi',{waitUntil:'domcontentloaded',timeout:14000});
+                await page.waitForTimeout(3500);
+                const status=await page.evaluate(()=>{
+                  const t=(document.body?.innerText||'').toLowerCase();
+                  const buttons=Array.from(document.querySelectorAll('button')).map(x=>String(x.innerText||x.getAttribute('aria-label')||'').toLowerCase());
+                  const url=location.hostname;
+                  const input=document.querySelector('input[placeholder*="name" i],input[aria-label*="name" i]');
+                  return {
+                    host_category:(url==='meet.google.com'?'meet':url==='accounts.google.com'?'accounts':url==='workspace.google.com'?'workspace':'other'),
+                    guest_name_prompt:!!input,
+                    ask_to_join:buttons.some(x=>x.includes('ask to join')||x.includes('teilnahme erbitten')),
+                    join_now:buttons.some(x=>x.includes('join now')||x.includes('jetzt teilnehmen')),
+                    joining_allowed_notice:t.includes('join now'),
+                    sign_in_offer:t.includes('sign in')||t.includes('anmelden'),
+                    invalid_code:t.includes('invalid')||t.includes('couldn’t find')||t.includes('not found'),
+                    button_count:buttons.length,
+                    content_present:t.length>50
+                  };
+                });
+                console.log('SIGNEDIN_MEET_PREJOIN',JSON.stringify({httpStatus:response?.status(),...status}));
+                console.log('NO_JOIN_OR_RECORDING_ATTEMPTED',true);
+              }catch(e){console.log('SIGNEDIN_MEET_PREJOIN_ERROR_CLASS',e.name)}
+              finally{
+                try{if(page)await page.close({runBeforeUnload:false})}catch{}
+                clearTimeout(alarm);
+                process.exit(0);
+              }
+            })();
+            """
+            p=subprocess.run(["docker","exec","beonmeet-worker-five","node","-e",js],capture_output=True,text=True,timeout=34)
+            print("MEET_PREJOIN_TEST_PROCESS_EXIT",p.returncode)
+            for line in p.stdout.splitlines():
+                if line.startswith(("AUTHENTICATED_CONTEXT","SIGNEDIN_MEET_PREJOIN","NO_JOIN_OR_RECORDING_ATTEMPTED")):print(line[:1000])
+            print("SIGNEDIN_BROWSER_PREJOIN_READONLY_TEST_DONE")
             PY
