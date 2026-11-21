@@ -22,55 +22,27 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,subprocess,urllib.request,datetime
-            print("VERIFY_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
-            for name,port,path in (("controller",8109,"/health"),("five",9126,"/capacity"),("single",9124,"/capacity")):
-                try:
-                    with urllib.request.urlopen("http://127.0.0.1:"+str(port)+path,timeout=6) as r:x=json.load(r)
-                    d=x.get("data",x)
-                    keys=("ok","max_concurrent_meetings","free_queue","premium_queue","pending_delivery_jobs","active_delivery_jobs","runningJobs","availableSlots")
-                    print("BEONMEET_HEALTH",name,json.dumps({k:d.get(k) for k in keys if k in d}))
-                except Exception as e:
-                    print("BEONMEET_HEALTH_ERROR",name,type(e).__name__)
-            for name in ("beonmeet-chrome-single","beonmeet-worker-five","beonmeet-worker-single"):
-                p=subprocess.run(["docker","inspect","--format","{{json .State}}",name],capture_output=True,text=True,timeout=9)
-                if p.returncode==0:
-                    s=json.loads(p.stdout)
-                    print("CONTAINER_HEALTH",name,json.dumps({k:s.get(k) for k in ("Status","Running","OOMKilled","Restarting")}))
-            js=r"""
-            (async()=>{
-               let timer=setTimeout(()=>{console.log('LOGIN_CDP_TIMEOUT');process.exit(18)},18000);
-               try{
-                 const {chromium}=require('playwright-extra');
-                 const b=await chromium.connectOverCDP(process.env.GOOGLE_CHROME_CDP_URL,{timeout:13000});
-                 const contexts=b.contexts();const names=new Set();
-                 let googleTabs=0,meetTabs=0,otherTabs=0;
-                 for(const c of contexts){
-                   for(const ck of await c.cookies(['https://accounts.google.com','https://meet.google.com']))if(ck.domain.includes('google.com'))names.add(ck.name);
-                   for(const p of c.pages()){
-                     let u='';
-                     try{u=new URL(p.url()).hostname}catch{}
-                     if(u==='accounts.google.com'||u==='myaccount.google.com')googleTabs++;
-                     else if(u==='meet.google.com')meetTabs++;
-                     else otherTabs++;
-                   }
-                 }
-                 const authNames=['SID','HSID','SSID','APISID','SAPISID','LSID','__Secure-1PSID','__Secure-3PSID'];
-                 const flags=Object.fromEntries(authNames.map(n=>[n,names.has(n)]));
-                 console.log('GOOGLE_LOGIN_COOKIE_FLAGS',JSON.stringify(flags));
-                 console.log('GOOGLE_LOGIN_AUTH_COOKIE_COUNT',authNames.filter(n=>flags[n]).length);
-                 console.log('GOOGLE_BROWSER_CONTEXTS',contexts.length);
-                 console.log('GOOGLE_BROWSER_TAB_CATEGORIES',JSON.stringify({googleTabs,meetTabs,otherTabs}));
-                 clearTimeout(timer);process.exit(0);
-               }catch(e){clearTimeout(timer);console.log('GOOGLE_CDP_VERIFY_ERROR',e.name);process.exit(4)}
-            })();
-            """
-            p=subprocess.run(["docker","exec","beonmeet-worker-five","node","-e",js],capture_output=True,text=True,timeout=27)
-            print("GOOGLE_CDP_VERIFY_EXIT",p.returncode)
-            for line in p.stdout.splitlines():
-                if line.startswith(("GOOGLE_LOGIN_","GOOGLE_BROWSER_","GOOGLE_CDP_","LOGIN_CDP_")):print(line[:500])
-            for name in ("camcam-shared-api-1","camcam-shared-pet-1","camcam-shared-archive-1","camcam-shared-petarchive-1"):
-                p=subprocess.run(["docker","inspect","-f","{{.State.Health.Status}}",name],capture_output=True,text=True,timeout=8)
-                print("NEIGHBOR_HEALTH",name,p.stdout.strip() if p.returncode==0 else "unavailable")
-            print("GOOGLE_SERVER_RELOGIN_READONLY_AUDIT_COMPLETE")
+            import subprocess,json,urllib.request
+            for name,filename in (
+              ("chromium","/usr/src/app/dist/lib/chromium.js"),
+              ("meetbot","/usr/src/app/dist/bots/GoogleMeetBot.js")):
+                p=subprocess.run(["docker","exec","beonmeet-worker-five","cat",filename],capture_output=True,text=True,timeout=15)
+                if p.returncode:
+                    print("RUNTIME_SOURCE_ABSENT",name)
+                    continue
+                code=p.stdout
+                for marker in (
+                    "connectOverCDP","browser.newContext(","browser.contexts()",
+                    ".newContext(","this.browser.newPage(","this.browserContext.newPage(",
+                    "this.page =","this._page =","context.newPage(","newPage(",
+                    "Launching browser","Navigating to Google Meet URL",
+                    "Guest pre-join detected","Join now","Ask to join"):
+                    indices=[i for i in range(len(code)) if code.startswith(marker,i)]
+                    if indices:
+                        print("RUNTIME_BROWSER_CONTEXT_CODE",name,marker,len(indices),
+                            json.dumps([code[max(0,i-100):i+150].replace("\\n"," ") for i in indices[:2]]))
+            for port in (9124,9126):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=5) as r:d=json.load(r)
+                print("ACTIVE_RECORDER_JOBS",port,int((d.get("data") or d).get("runningJobs") or 0))
+            print("RECORDER_CONTEXT_READONLY_AUDIT_DONE")
             PY
