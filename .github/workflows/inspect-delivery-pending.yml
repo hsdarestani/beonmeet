@@ -26,89 +26,59 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,subprocess,urllib.request,datetime,collections,re,hashlib
-            from pathlib import Path
-            now=datetime.datetime.now(datetime.timezone.utc)
-            print("INCIDENT_AUDIT_UTC",now.isoformat())
-            meet_fragment="cru-ggpe-nwi"
-            state=json.loads(Path("data/state.json").read_text())
-            launches=[]
-            for eid,x in (state.get("launched_events") or {}).items():
-                if isinstance(x,dict) and meet_fragment in str(x.get("meet_url") or ""):
-                    launches.append({"id_hash":hashlib.sha256(str(eid).encode()).hexdigest()[:8],
-                         "status":x.get("status"),"launched_at":x.get("launched_at"),
-                         "waiting_since":x.get("waiting_since"),"started":bool(x.get("recording_started_at")),
-                         "notice":bool(x.get("join_connecting_notified_at")),
-                         "slow_notice":bool(x.get("join_slow_notified_at"))})
-            print("MATCHING_MEET_LAUNCHED_EVENTS",json.dumps(launches))
-            matches=0
-            for key,obj in (state.get("requests") or {}).items():
-                if meet_fragment in str(key) or (isinstance(obj,dict) and meet_fragment in json.dumps(obj)):
-                    matches+=1
-            print("MATCHING_MEET_REQUEST_COUNT",matches)
-            print("CURRENT_LAUNCH_COUNTS",dict(collections.Counter(str(v.get("status")) for v in (state.get("launched_events") or {}).values() if isinstance(v,dict))))
-            for label,url in (("controller","http://127.0.0.1:8109/health"),
-                              ("five","http://127.0.0.1:9126/capacity"),
-                              ("single","http://127.0.0.1:9124/capacity")):
-                try:
-                    with urllib.request.urlopen(url,timeout=6) as resp:d=json.load(resp)
-                    d=d.get("data",d)
-                    keys=("ok","free_queue","premium_queue","pending_delivery_jobs","active_delivery_jobs","runningJobs","availableSlots")
-                    print("LIVE_STATUS",label,json.dumps({k:d.get(k) for k in keys if k in d}))
-                except Exception as err:print("STATUS_ERROR",label,type(err).__name__)
-            phases=[
-              ("accepted","Meeting job accepted"),
-              ("launch_browser","Launching browser"),
-              ("navigate","Navigating to Google Meet URL"),
-              ("prejoin_wait","Waiting for Google Meet pre-join controls"),
-              ("prejoin_ready","Google Meet pre-join controls"),
-              ("guest","Guest pre-join detected"),
-              ("ask_join_click",'Success clicked using "Ask to join"'),
-              ("join_now_click",'Success clicked using "Join now"'),
-              ("admission_sent","BeOnMeet admission callback"),
-              ("admission","waiting for the host to admit"),
-              ("recording_start","Begin recording"),
-              ("recording_mime","Media Recorder actual mime type"),
-              ("job_failed","Meeting job permanently failed"),
-              ("retry","Retry count:"),
-              ("failure","Error executing task"),
-              ("closed","Meeting slot released"),
-              ("stopped","Recording stopped"),
-              ("confirmed","Admitted to meeting"),
-              ("api_rejected","Controller returned"),
-              ("error_timeout","TimeoutError"),
-              ("prejoin_timeout","pre-join controls are not ready"),
-              ("ask_join","Ask to join"),
-              ("lobby","lobby"),
-              ("join","join") ]
-            for container in ("beonmeet-worker-five","beonmeet-worker-single"):
-                p=subprocess.run(["docker","logs","--since","2026-11-21T12:25:00Z",container],capture_output=True,text=True,timeout=35)
-                ids={};timeline=[];counts=collections.Counter();raw=p.stdout+"\n"+p.stderr
-                for line in raw.splitlines():
-                    if not line.startswith("[2026-11-21T"):continue
-                    stamp=line[1:24]
-                    corr=line.split("[correlationId: ",1)[-1].split("]",1)[0] if "[correlationId: " in line else "shared"
-                    if corr not in ids:ids[corr]="job"+str(len(ids)+1)
-                    msg=line.split("] ",4)[-1].split(" {",1)[0]
-                    hits=[key for key,needle in phases if needle.lower() in msg.lower()]
-                    hits=list(dict.fromkeys(hits))
-                    if hits:
-                        counts.update(hits)
-                        timeline.append([stamp,ids[corr],hits[:6]])
-                print("RECORDER_EVENT_COUNTS",container,json.dumps(dict(counts)))
-                print("RECORDER_EVENT_TIMELINE",container,json.dumps(timeline[-130:]))
-                print("RECORDER_LINES_COUNT",container,len(raw.splitlines()))
-            log=subprocess.run(["journalctl","-u","beonmeet-controller","--since","2026-11-21 12:25:00 UTC","--no-pager","-o","short-iso"],capture_output=True,text=True,timeout=30).stdout
-            endpoints=[];errors=collections.Counter()
-            for line in log.splitlines():
-                ts=re.search(r"2026-11-21T\d{2}:\d{2}:\d{2}",line)
-                when=ts.group(0) if ts else "unknown"
-                m=re.search(r'"(POST|GET) (/[a-zA-Z0-9_/-]+) HTTP/1\.1" (\d{3})',line)
-                if m and m.group(2).startswith("/internal/"):
-                    endpoints.append([when,m.group(1),m.group(2),m.group(3)])
-                for sig in ("join progress loop error","telegram loop error","dispatch error","waiting for admission","recording started","callback error","retry"):
-                    if sig in line.lower():errors[sig]+=1
-            print("CONTROLLER_CALLBACK_TIMELINE",json.dumps(endpoints[-55:]))
-            print("CONTROLLER_ERROR_CATEGORY_COUNTS",json.dumps(dict(errors)))
-            print("INCIDENT_AUDIT_COMPLETE")
+            import json,datetime,subprocess,urllib.request
+            print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
+            js=r"""
+            (async()=>{
+              let browser,phase="cdp";
+              try{
+                const {chromium}=require("playwright-extra");
+                browser=await chromium.connectOverCDP(process.env.GOOGLE_CHROME_CDP_URL,{timeout:10000});
+                const all=browser.contexts().flatMap(c=>c.pages());
+                console.log("JOIN_BROWSER_TAB_COUNT",all.length);
+                let found=0;
+                for(const page of all){
+                  if(!page.url().includes("cru-ggpe-nwi"))continue;
+                  found++;
+                  phase="read_page";
+                  const details=await page.evaluate(()=>{
+                    const text=(document.body?.innerText||"").toLowerCase();
+                    const targets={
+                      ask_to_join:"ask to join",asking_to_join:"asking to join",
+                      waiting_to_be_let_in:"waiting to be let in",
+                      someone_let_you_in:"someone in the call",youll_join:"you'll join when",
+                      request_to_join:"request to join",waiting_for_host:"waiting for host",
+                      denied:"denied",cant_join:"can't join",cannot_join:"cannot join",
+                      host_to_admit:"admit",removed:"removed from this call",
+                      still_in_lobby:"waiting room",not_allowed:"not allowed",
+                      enter_name:"enter your name",you_are_asking:"you are asking",
+                      try_again:"try again",something_went_wrong:"something went wrong",
+                      rejoin:"rejoin",join_now:"join now",leave_call:"leave call",
+                      asking:"asking",host:"host"
+                    };
+                    const visible={};
+                    for(const [k,v] of Object.entries(targets))visible[k]=text.includes(v);
+                    const buttons=Array.from(document.querySelectorAll('button')).map(x=>(x.innerText||x.getAttribute('aria-label')||"").trim().toLowerCase());
+                    const b={
+                      ask_to_join:buttons.some(t=>t.includes("ask to join")),
+                      join_now:buttons.some(t=>t.includes("join now")),
+                      cancel_request:buttons.some(t=>t.includes("cancel request")),
+                      leave:buttons.some(t=>t.includes("leave call")),
+                      retry:buttons.some(t=>t.includes("retry"))
+                    };
+                    return {visible,buttons:b,button_count:buttons.length,body_char_count:text.length};
+                  });
+                  console.log("MATCHED_MEET_TAB_STATE",JSON.stringify(details));
+                }
+                console.log("MATCHED_MEET_TABS",found);
+                console.log("READONLY_CDP_LOBBY_AUDIT_DONE");
+              }catch(e){console.log("READONLY_CDP_LOBBY_AUDIT_ERROR",phase,e.name)}
+              process.exit(0);
+            })();
+            """
+            p=subprocess.run(["docker","exec","beonmeet-worker-five","node","-e",js],capture_output=True,text=True,timeout=26)
+            print("CHROME_DIAGNOSTIC_PROCESS_EXIT",p.returncode)
+            for line in p.stdout.splitlines():
+                if line.startswith(("JOIN_BROWSER_","MATCHED_MEET_","READONLY_CDP_LOBBY_")):print(line[:1000])
+            print("MEET_LOBBY_READONLY_AUDIT_COMPLETE")
             PY
