@@ -1,0 +1,90 @@
+name: Repair missing BeOnMeet Whisper Python dependency
+
+on:
+  push:
+    branches: [ops/install-whisper-runtime-20261121]
+    paths:
+      - .github/workflows/whisper-dependency-once.yml
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Guarded BeOnMeet venv dependency repair without touching CamCam
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 9m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST; exit 1 ;; esac
+            test "$(id -u)" = 0
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 50 9
+            cd /opt/beonmeet
+            test -x .venv/bin/python && test -s app/requirements.txt
+            grep -qx 'faster-whisper==1.2.1' app/requirements.txt
+            grep -qx 'av==18.1.0' app/requirements.txt
+            python3 - <<'PY'
+            import json,subprocess,urllib.request
+            with urllib.request.urlopen("http://127.0.0.1:8109/health",timeout=8) as r:h=json.load(r)
+            assert h.get("ok"),"Controller unhealthy"
+            assert int(h.get("active_delivery_jobs") or 0)==0,"Delivering user file now"
+            for port in (9124,9126):
+                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+"/capacity",timeout=6) as r:w=json.load(r)
+                assert int((w.get("data") or w).get("runningJobs") or 0)==0,"Recorder active"
+            for n in ("camcam-shared-api-1","camcam-shared-pet-1","camcam-shared-archive-1","camcam-shared-petarchive-1"):
+                assert subprocess.check_output(["docker","inspect","--format","{{.State.Health.Status}}",n],text=True).strip()=="healthy"
+            print("TRANSCRIPTION_DEPENDENCY_IDLE_PRECHECK_PASS")
+            PY
+            test "$(df -Pk /opt/beonmeet | awk 'NR==2 {print $4}')" -ge 3500000
+            backup="/opt/beonmeet/.whisper-venv-backup-$(date -u +%Y%m%dT%H%M%SZ)"
+            mkdir -m 700 "$backup"
+            cp -a .venv "$backup/venv"
+            .venv/bin/python -m pip freeze > "$backup/requirements.before.txt"
+            chmod 600 "$backup/requirements.before.txt"
+            echo "BEONMEET_PYTHON_VENV_BACKED_UP"
+            stage=$(mktemp -d /opt/beonmeet/.whisper-install-XXXXXXXX)
+            succeeded=0
+            touched=0
+            rollback() {
+              if [ "$touched" = 1 ] && [ "$succeeded" = 0 ]; then
+                mv .venv "$stage/venv-with-failed-install"
+                mv "$backup/venv" .venv
+                echo "BEONMEET_PYTHON_VENV_ROLLED_BACK"
+              fi
+              if [ "$succeeded" = 1 ]; then rm -rf "$stage"; fi
+            }
+            trap rollback EXIT
+            touched=1
+            export PIP_CACHE_DIR="$stage/cache"
+            export PIP_DISABLE_PIP_VERSION_CHECK=1
+            export PIP_NO_INPUT=1
+            timeout 300 .venv/bin/python -m pip install --only-binary=:all: "faster-whisper==1.2.1" "av==18.1.0" >/dev/null
+            .venv/bin/python - <<'PY'
+            import importlib.metadata as m
+            from faster_whisper import WhisperModel
+            import av,ctranslate2
+            assert m.version("faster-whisper")=="1.2.1"
+            assert m.version("av")=="18.1.0"
+            assert callable(WhisperModel)
+            print("FASTER_WHISPER_IMPORT_VERIFIED",m.version("faster-whisper"))
+            print("PYAV_CTRANSLATE2_IMPORT_VERIFIED")
+            PY
+            for n in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1; do
+              test "$(docker inspect -f '{{.State.Health.Status}}' "$n")" = healthy
+            done
+            curl -fsS --max-time 12 https://beonmeet.smarbiz.sbs/health >/dev/null
+            succeeded=1
+            trap - EXIT
+            rm -rf "$stage"
+            echo "BEONMEET_TRANSCRIPTION_PACKAGES_INSTALLED_NO_SERVICE_RESTART"
+            echo "CAMCAM_HEALTHY_USER_MEDIA_PRESERVED"
