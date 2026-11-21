@@ -27,29 +27,77 @@ jobs:
             case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
             cd /opt/beonmeet
             python3 - <<'PY'
-            import os,json,pathlib,subprocess,sqlite3
+            import subprocess,re,json,datetime,urllib.request,hashlib,os
             from pathlib import Path
-            def safe(s):
-                return s if s in ("/recordings","/dev/shm/beonmeet","/tmp/beonmeet-recordings") else ("[OTHER_PATH]" if s else "[UNSET]")
-            pid=subprocess.check_output(["systemctl","show","-p","MainPID","--value","beonmeet-controller"],text=True).strip()
-            raw=Path("/proc/"+pid+"/environ").read_bytes().split(b"\\x00")
-            env=dict((x.split(b"=",1)[0].decode(errors="replace"),x.split(b"=",1)[1].decode(errors="replace")) for x in raw if b"=" in x)
-            root=env.get("RECORDING_TMP_DIR","/recordings")
-            print("CONTROLLER_RECORDING_ROOT",safe(root))
-            for pth in ("/recordings","/dev/shm/beonmeet"):
-                p=Path(pth)
-                print("HOST_MOUNT",safe(pth),"exists",p.exists(),"symlink",p.is_symlink(),
-                      "is_dir",p.is_dir(),"realpath",safe(os.path.realpath(pth)) if p.exists() else "[MISSING]")
-            for name in ("beonmeet-worker-five","beonmeet-worker-single"):
-                out=subprocess.check_output(["docker","inspect","--format","{{json .Config.Env}}",name],text=True)
-                parts=dict(v.split("=",1) for v in json.loads(out) if "=" in v)
-                print("WORKER",name,"ROOT",safe(parts.get("RECORDING_TMP_DIR","/recordings")))
-            live=Path("app/main.py").read_text()
-            print("LIVE_GHOST_SUCCESS_BRANCH_PRESENT","if not raw_path.exists() and pending_id not in state.setdefault" in live)
-            print("LIVE_UPLOAD_RECEIVER_PRESENT",'@app.post("/internal/recording-ready")' in live)
-            if Path("data/beonmeet.db").exists():
-                db=sqlite3.connect("file:/opt/beonmeet/data/beonmeet.db?mode=ro",uri=True)
-                n=db.execute("SELECT COUNT(*) FROM recordings WHERE created_at >= ? AND created_at <= ?",("2026-11-21T10:02:00","2026-11-21T10:08:00")).fetchone()[0]
-                print("RECORDINGS_DB_AT_SESSION",n)
-            print("READONLY_CONTROLLER_FILE_MAPPING_CHECK_DONE")
+            def run(args,timeout=24):
+                try:
+                    p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=timeout)
+                    return p.stdout
+                except Exception as exc:return "[ERROR:"+type(exc).__name__+"]"
+            print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
+            print("CONTROLLER_SERVICE",run(["systemctl","is-active","beonmeet-controller"]).strip())
+            main=Path("/opt/beonmeet/app/main.py")
+            print("CONTROLLER_SHA256_PREFIX",hashlib.sha256(main.read_bytes()).hexdigest()[:16])
+            print("FIX_GUARD_PRESENT", "Recording source missing: no verified delivery receipt" in main.read_text())
+            for p in ("/dev/shm/beonmeet","/recordings"):
+                q=Path(p)
+                print("FILEPATH",p,"exists",q.exists(),"resolved",str(q.resolve()) if q.exists() else "missing")
+            for url in ("http://127.0.0.1:8109/health","http://127.0.0.1:9126/capacity","http://127.0.0.1:9124/capacity"):
+                try:
+                    with urllib.request.urlopen(url,timeout=5) as f:d=json.load(f)
+                    d=d.get("data",d)
+                    keys=("ok","free_queue","premium_queue","pending_delivery_jobs","active_delivery_jobs","max_concurrent_meetings","runningJobs","availableSlots","maxConcurrentJobs","healthy_free_workers","healthy_premium_workers")
+                    print("LIVE_STATUS",url.rsplit("/",2)[0].rsplit(":",1)[-1],json.dumps({k:d.get(k) for k in keys if k in d},sort_keys=True))
+                except Exception as e: print("STATUS_ERROR",type(e).__name__)
+            for name in ("beonmeet-worker-five","beonmeet-worker-single","beonmeet-chrome-single"):
+                raw=run(["docker","inspect","--format","{{json .State}}",name])
+                try:
+                    z=json.loads(raw)
+                    print("CONTAINER",name,json.dumps({k:z.get(k) for k in ("Status","Running","OOMKilled","ExitCode","StartedAt","Restarting")},sort_keys=True))
+                except Exception:print("CONTAINER",name,"not_found")
+            signals={
+                "worker_accepted":r"Meeting job accepted|Google Meet job accepted",
+                "worker_failed":r"permanently failed|Error executing task",
+                "worker_busy":r"concurrency limit|full.*capacity",
+                "login_error":r"sign.?in|not signed|authentication|login|captcha|Google account",
+                "browser_error":r"chrome.*error|browser.*(closed|disconnected)|CDP|ECONNREFUSED|Target closed|playwright.*error",
+                "prejoin_error":r"pre.join|input field|join button|Ask to join|Join now|admission|host.*admit",
+                "recording_start":r"Begin recording|Media Recorder actual|recording.started",
+                "recording_end":r"Recording stopped|recording upload result|Meeting job finished",
+                "upload_error":r"upload failed|Controller returned|recording not found|No such file",
+                "transport_error":r"dispatch error|dispatch rejected|HTTP/1.1.? (40[0-9]|50[0-9])",
+                "telegram_error":r"telegram loop error|delivery error|sendDocument|sendMessage",
+                "retry_queue":r"retry|queue",
+                "permission":r"EACCES|EPERM|ENOSPC|permission denied",
+            }
+            for name,args in [
+                ("controller",["journalctl","-u","beonmeet-controller","--since","2026-11-21 10:27:00 UTC","--no-pager","-o","short-iso"]),
+                ("worker_five",["docker","logs","--since","2026-11-21T10:27:00Z","beonmeet-worker-five"]),
+                ("worker_single",["docker","logs","--since","2026-11-21T10:27:00Z","beonmeet-worker-single"]),
+                ("chrome",["docker","logs","--since","2026-11-21T10:27:00Z","beonmeet-chrome-single"])]:
+                raw=run(args,timeout=28)
+                counts={k:len(re.findall(pattern,raw,re.I)) for k,pattern in signals.items()}
+                print("LOG_COUNTS",name,"lines",len(raw.splitlines()),json.dumps(counts,sort_keys=True))
+                selected=[]
+                for line in raw.splitlines():
+                    hits=[k for k,pat in signals.items() if re.search(pat,line,re.I)]
+                    if not hits:continue
+                    dt=re.search(r"2026-11-21[T ][0-9:.+-]+(?:Z)?",line)
+                    timestamp=dt.group(0)[:23] if dt else "UNKNOWN"
+                    # Output message class, not raw payload containing users, links, tokens, metadata.
+                    if name.startswith("worker"):
+                        match=re.search(r"\\[botType: [^\\]]+\\]\\s+([^\\{]+)",line)
+                        phrase=match.group(1) if match else "[NO_MESSAGE]"
+                    else:
+                        phrase="[REDACTED]"
+                        if " HTTP/1.1" in line:
+                            ep=re.search(r'(POST|GET) (/[a-zA-Z0-9_/-]+) HTTP/1.1" (\\d{3})',line)
+                            if ep:phrase="HTTP "+ep.group(1)+" "+ep.group(2)+" "+ep.group(3)
+                    phrase=re.sub(r"https?://\\S+","[URL]",phrase)
+                    phrase=re.sub(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}","[EMAIL]",phrase)
+                    phrase=re.sub(r"[a-z]{3}-[a-z]{4}-[a-z]{3}","[MEET]",phrase,flags=re.I)
+                    phrase=re.sub(r"\\b[0-9]{5,}\\b","[ID]",phrase)
+                    selected.append([timestamp,hits,phrase.strip()[:125]])
+                print("LOG_TIMELINE",name,json.dumps(selected[-45:],ensure_ascii=True))
+            print("READONLY_RECENT_JOIN_DIAGNOSTIC_COMPLETED")
             PY
