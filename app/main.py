@@ -923,7 +923,11 @@ async def launch_meeting(
                 await tg_text(chat_id, t(chat_id, "launch_free", meet_url=meet_url))
         return True
 
-    if busy and queue_if_busy:
+    # A transient connection error is just as retryable as a full recorder.
+    # Previously only HTTP 409 (busy) was queued; a network timeout or 5xx
+    # silently dropped /now requests while claiming a retry would happen.
+    # Keep the request durable for both cases until the worker recovers.
+    if queue_if_busy:
         await enqueue_meeting(event, req, meet_url, premium, notify=True)
         return False
 
