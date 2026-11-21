@@ -1,0 +1,50 @@
+name: Repair BeOnMeet output folder for one pending recording
+
+on:
+  push:
+    branches: [ops/repair-existing-recording-subdirs-20261121]
+    paths:
+      - .github/workflows/repair-one-recording-folder.yml
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Restore shared group write for one pending BeOnMeet session
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 3m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,os,stat,subprocess
+            from pathlib import Path
+            root=Path("/dev/shm/beonmeet").resolve()
+            state=json.loads(Path("data/state.json").read_text())
+            pending=[x for x in (state.get("pending_deliveries") or {}).values()
+                     if isinstance(x,dict) and x.get("video_delivered") and not x.get("audio_delivered")]
+            assert len(pending)==1, "Expected one delivered-video recovery"
+            val=pending[0]
+            raw=Path(str(val.get("file_path") or val.get("source_path") or "")).resolve()
+            assert raw.is_file() and raw.parent.parent==root
+            folder=raw.parent
+            st=folder.stat()
+            assert st.st_uid==1001 and st.st_gid==987
+            assert stat.S_IMODE(st.st_mode)==0o2755
+            folder.chmod(0o2770)
+            p=subprocess.run(["runuser","-u","beonmeet","--","test","-w",str(folder)],timeout=5)
+            assert p.returncode==0
+            print("PENDING_RECORDING_FOLDER_GROUP_WRITE_FIXED")
+            print("RECORDING_BYTES_UNTOUCHED",raw.stat().st_size)
+            PY
+            curl -fsS --max-time 10 https://beonmeet.smarbiz.sbs/health >/dev/null
+            echo ONE_FOLDER_REPAIRED_NO_RESTART
