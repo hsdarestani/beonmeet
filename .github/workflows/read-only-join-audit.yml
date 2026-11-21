@@ -1,0 +1,41 @@
+name: Read-only BeOnMeet join incident audit
+
+on:
+  push:
+    branches: [ops/read-only-live-join-audit-20261121]
+    paths:
+      - .github/workflows/read-only-join-audit.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Check worker and controller runtime without changing anything
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 4m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            echo "AUDIT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "CONTROLLER_SERVICE=$(systemctl is-active beonmeet-controller)"
+            echo "LIVE_SOURCE_CHECKSUM=$(sha256sum app/main.py | cut -c1-16)"
+            for name in beonmeet-worker-five beonmeet-worker-single beonmeet-chrome-single; do
+              echo "CONTAINER_$name=$(docker inspect --format '{{.State.Status}}' "$name" 2>/dev/null || echo missing)"
+              echo "OOM_$name=$(docker inspect --format '{{.State.OOMKilled}}' "$name" 2>/dev/null || echo unknown)"
+            done
+            for target in http://127.0.0.1:8109/health http://127.0.0.1:9126/capacity; do
+              curl --silent --show-error --max-time 6 --output /dev/null --write-out 'ENDPOINT_STATUS=%{http_code}\n' "$target" || true
+            done
+            echo "CONTROLLER_ERROR_COUNT=$(journalctl -u beonmeet-controller --since '60 minutes ago' --no-pager -o cat | grep -Eci 'meeting dispatch error|meeting dispatch rejected|calendar loop error|telegram loop error|queue loop error' || true)"
+            echo "WORKER_ERROR_COUNT=$(docker logs --since 60m beonmeet-worker-five 2>&1 | grep -Eci 'Error|Failed|timeout|admission|join' || true)"
+            echo "CHROME_ERROR_COUNT=$(docker logs --since 60m beonmeet-chrome-single 2>&1 | grep -Eci 'Error|Failed|timeout|crash' || true)"
+            echo "READ_ONLY_AUDIT_DONE"
