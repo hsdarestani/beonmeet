@@ -126,3 +126,39 @@ assert balance("oldsubscriber")["remaining_seconds"] == 0
 # Exact brand-new wallet showing 1h, no separate free recording-count machinery.
 assert env["free_recording_entitlement"]("buyer")["remaining"] == 0
 print("WELCOME_CREDIT_BEHAVIOR_TEST_PASS")
+
+
+# A free hour can be consumed as four separate successful 15-minute sessions.
+# Failed attempts and retries must not consume minutes.
+env["touch_user"]("four-short-meetings")
+assert balance("four-short-meetings")["trial_remaining_seconds"] == 3600
+for index in range(4):
+    env["record_recording"]("four-short-meetings",
+                            "https://meet.google.com/abc-defg-hij",
+                            f"quarter-{index}.webm", 125_000, 900)
+    expected = 3600 - (index + 1) * 900
+    assert balance("four-short-meetings")["trial_remaining_seconds"] == expected
+    assert balance("four-short-meetings")["remaining_seconds"] == expected
+    env["record_recording"]("four-short-meetings",
+                            "https://meet.google.com/abc-defg-hij",
+                            f"quarter-{index}.webm", 125_000, 900)
+    assert balance("four-short-meetings")["remaining_seconds"] == expected, "Duplicate delivery cannot debit again"
+assert db.execute(
+    "SELECT COUNT(*) FROM credit_entries WHERE telegram_id=? AND kind='recording'",
+    ("four-short-meetings",)
+).fetchone()[0] == 4
+assert db.execute(
+    "SELECT COALESCE(SUM(duration_seconds),0) FROM recordings WHERE telegram_id=?",
+    ("four-short-meetings",)
+).fetchone()[0] == 3600
+
+env["touch_user"]("failed-prejoin")
+before = balance("failed-prejoin")["remaining_seconds"]
+# Telegram join requests are recorded separately: they never touch the wallet.
+assert before == 3600
+assert db.execute(
+    "SELECT COUNT(*) FROM credit_entries WHERE telegram_id=? AND kind='recording'",
+    ("failed-prejoin",)
+).fetchone()[0] == 0
+assert balance("failed-prejoin")["remaining_seconds"] == before
+print("FREE_HOUR_FOUR_FIFTEEN_MINUTE_SESSIONS_TEST_PASS")
