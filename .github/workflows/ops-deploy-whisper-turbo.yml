@@ -62,7 +62,12 @@ jobs:
                 if k in desired:out.append(k+'='+desired.pop(k))
                 else:out.append(line)
             for k,v in desired.items():out.append(k+'='+v)
-            (folder/'env').write_text('\\n'.join(out)+'\\n')
+            (folder/'env').write_text('\n'.join(out)+'\n')
+            staged=(folder/'env').read_text()
+            assert len(staged.splitlines())>=len(src.splitlines()), 'STT env truncated/malformed'
+            assert any(line.startswith('BEONMEET_DB_PATH=') for line in staged.splitlines()), 'Existing DB path must survive env rewrite'
+            assert any(line.startswith('WHISPER_MODEL=large-v3-turbo') for line in staged.splitlines()), 'Turbo model not set'
+            print('STT_ENV_MULTILINE_INTEGRITY_PASS',len(staged.splitlines()),'lines')
             (folder/'env').chmod(0o600)
             print('STT_TURBO_CONFIG_STAGED_AND_BASELINE_MATCHES')
             PY
