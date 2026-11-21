@@ -1,0 +1,157 @@
+name: Guarded BeOnMeet Whisper Turbo production switch
+on:
+  push:
+    branches: [ops/deploy-whisper-turbo-live-20261121]
+    paths: [.github/workflows/ops-deploy-whisper-turbo.yml]
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 19
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Turbo config and patch syntax
+        run: |
+          python3 -m py_compile app/main.py patches/patch_stt_turbo_runtime.py
+          python3 tests/turbo_transcription_config_test.py
+      - name: Stage Turbo model and perform recording-idle-only controller cutover
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 17m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST;exit 1;; esac
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 90 9
+            cd /opt/beonmeet
+            test -s .env
+            test -f app/main.py
+            test -x .venv/bin/python
+            git fetch -q origin ops/deploy-whisper-turbo-live-20261121
+            release=${{ github.sha }}
+            git cat-file -e "$release^{commit}"
+            git merge-base --is-ancestor "$release" FETCH_HEAD
+            stage=$(mktemp -d /opt/beonmeet/.stt-turbo-stage.XXXXXXXX)
+            backup=$(mktemp -d /opt/beonmeet/.stt-turbo-backup.XXXXXXXX)
+            git show "$release:patches/patch_stt_turbo_runtime.py" > "$stage/patch_stt.py"
+            python3 -m py_compile "$stage/patch_stt.py"
+            python3 "$stage/patch_stt.py" app/main.py "$stage/main.py"
+            .venv/bin/python -m py_compile "$stage/main.py"
+            python3 - "$stage" <<'PY'
+            import sys
+            from pathlib import Path
+            folder=Path(sys.argv[1])
+            src=Path('.env').read_text()
+            desired={'WHISPER_MODEL':'large-v3-turbo','RECOVERY_WHISPER_MODEL':'small','WHISPER_CPU_THREADS':'1','TRANSCRIPTION_CHUNK_SECONDS':'360','TRANSCRIPTION_CONCURRENCY':'1'}
+            actual={}
+            for line in src.splitlines():
+                if line.startswith('#') or '=' not in line:continue
+                k,v=line.split('=',1)
+                if k in desired:actual[k]=v
+            if actual.get('WHISPER_MODEL') != 'small' or actual.get('RECOVERY_WHISPER_MODEL') != 'base':
+                raise RuntimeError('STT live settings changed since read-only audit; refuse update')
+            out=[]
+            for line in src.splitlines():
+                k=line.split('=',1)[0] if '=' in line and not line.startswith('#') else ''
+                if k in desired:out.append(k+'='+desired.pop(k))
+                else:out.append(line)
+            for k,v in desired.items():out.append(k+'='+v)
+            (folder/'env').write_text('\\n'.join(out)+'\\n')
+            (folder/'env').chmod(0o600)
+            print('STT_TURBO_CONFIG_STAGED_AND_BASELINE_MATCHES')
+            PY
+            python3 - <<'PY'
+            import json,urllib.request,shutil,time
+            def safe():
+                with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=6) as r:h=json.load(r)
+                assert h.get('ok') is True
+                for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'):
+                    if int(h.get(k) or 0):return False
+                for port in (9124,9126):
+                    with urllib.request.urlopen(f'http://127.0.0.1:{port}/capacity',timeout=6) as r:c=json.load(r)
+                    if int((c.get('data') or c).get('runningJobs') or 0):return False
+                return True
+            for i in range(45):
+                if safe():break
+                if i==44:raise RuntimeError('BUSY_LIVE_RECORDING_OR_QUEUE: NO CHANGES MADE')
+                time.sleep(6)
+            assert shutil.disk_usage('/').free>4*1024**3
+            print('IDLE_NO_RECORDING_NO_DELIVERY_FOR_MODEL_PREFETCH')
+            PY
+            nice -n 15 ionice -c3 .venv/bin/python - <<'PY'
+            from faster_whisper.utils import download_model
+            from pathlib import Path
+            root='/opt/beonmeet/data/whisper-models'
+            p=download_model('large-v3-turbo',cache_dir=root)
+            assert (Path(p)/'model.bin').is_file()
+            assert (Path(p)/'model.bin').stat().st_size>200*1024**2
+            print('WHISPER_TURBO_WEIGHTS_CACHED_AND_VERIFIED')
+            PY
+            python3 - <<'PY'
+            import json,urllib.request,shutil,subprocess
+            def j(url):
+                with urllib.request.urlopen(url,timeout=5) as r:return json.load(r)
+            h=j('http://127.0.0.1:8109/health')
+            assert h.get('ok')
+            assert all(int(h.get(k) or 0)==0 for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs')), 'New work appeared; abort'
+            for port in (9124,9126):
+                d=j(f'http://127.0.0.1:{port}/capacity');d=d.get('data') or d
+                assert int(d.get('runningJobs') or 0)==0, 'Live recording began; abort'
+            for s in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',s],text=True).strip()=='healthy'
+            print('FINAL_IDLE_AND_CAMCAM_SAFE_TO_RESTART_CONTROLLER')
+            PY
+            cp -p .env "$backup/.env"
+            cp -p app/main.py "$backup/main.py"
+            updated=0
+            complete=0
+            rollback() {
+              if [ "$updated" = 1 ] && [ "$complete" = 0 ]; then
+                cp -p "$backup/.env" .env
+                cp -p "$backup/main.py" app/main.py
+                systemctl restart beonmeet-controller || true
+                echo WHISPER_TURBO_ROLLED_BACK
+              fi
+            }
+            trap rollback EXIT
+            updated=1
+            cp -p "$stage/env" .env
+            cp -p "$stage/main.py" app/main.py
+            systemctl restart beonmeet-controller
+            ready=0
+            for i in $(seq 1 30); do
+              if curl -fsS --max-time 4 http://127.0.0.1:8109/health > "$stage/health.json" 2>/dev/null; then ready=1; break; fi
+              sleep 2
+            done
+            test "$ready" = 1
+            python3 - "$stage" <<'PY'
+            import sys,json,ast
+            from pathlib import Path
+            base=Path(sys.argv[1])
+            x=json.loads((base/'health.json').read_text())
+            assert x.get('ok') is True
+            config=Path('.env').read_text()
+            assert 'WHISPER_MODEL=large-v3-turbo' in config.splitlines()
+            assert 'RECOVERY_WHISPER_MODEL=small' in config.splitlines()
+            code=Path('app/main.py').read_text()
+            ast.parse(code)
+            assert 'os.environ.get("WHISPER_MODEL", "large-v3-turbo")' in code
+            assert 'beam_size=4' in code
+            print('LIVE_TURBO_ENV_AND_PATCH_VALIDATED')
+            PY
+            curl -fsS --max-time 10 https://beonmeet.smarbiz.sbs/health >/dev/null
+            systemctl is-active --quiet beonmeet-controller
+            for s in camcam-shared-api-1 camcam-shared-pet-1 camcam-shared-archive-1 camcam-shared-petarchive-1;do
+              test "$(docker inspect -f '{{.State.Health.Status}}' "$s")" = healthy
+            done
+            complete=1
+            trap - EXIT
+            rm -rf "$stage"
+            echo WHISPER_LARGE_V3_TURBO_PRODUCTION_DEPLOYED_SUCCESS
+            echo LIVE_MEETINGS_AND_CAMCAM_UNTOUCHED
