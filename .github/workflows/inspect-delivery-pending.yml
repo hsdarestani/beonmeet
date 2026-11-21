@@ -26,33 +26,40 @@ jobs:
             set -eu
             cd /opt/beonmeet
             python3 - <<'PY'
-            import json,datetime,urllib.request,collections,os,subprocess
+            import collections,datetime,json,sqlite3,subprocess
             from pathlib import Path
-            now=datetime.datetime.now(datetime.timezone.utc)
-            print("AUDIT_UTC",now.isoformat())
-            def load(port,ep):
-                with urllib.request.urlopen("http://127.0.0.1:"+str(port)+ep,timeout=5) as r:
-                    data=json.load(r)
-                return data.get("data",data)
-            h=load(8109,"/health")
-            print("HEALTH_COUNTS",json.dumps({k:h.get(k) for k in ("ok","free_queue","premium_queue","pending_delivery_jobs","active_delivery_jobs","transcription_concurrency")},sort_keys=True))
-            for p in (9124,9126):
-                v=load(p,"/capacity")
-                print("RECORDER_CAPACITY",p,json.dumps({k:v.get(k) for k in ("runningJobs","maxConcurrentJobs","availableSlots")},sort_keys=True))
-            st=Path("data/state.json")
-            if st.is_file():
-                x=json.loads(st.read_text())
-                pending=x.get("pending_deliveries") or {}
-                print("DURABLE_PENDING_COUNT",len(pending))
-                for value in list(pending.values())[-14:]:
-                    if not isinstance(value,dict):continue
-                    ts=str(value.get("updated_at") or value.get("created_at") or "")
-                    try:age=int((now-datetime.datetime.fromisoformat(ts)).total_seconds()/60)
-                    except Exception:age=-1
-                    print("DURABLE_PENDING_STAGE",json.dumps({"age_minutes":age,
-                      "video_delivered":bool(value.get("video_delivered")),"audio_delivered":bool(value.get("audio_delivered")),
-                      "transcript_delivered":bool(value.get("transcript_delivered")),
-                      "retries":int(value.get("attempts") or value.get("retry_count") or 0)}))
-            print("MEMORY_AVAILABLE_KIB",next(x.split()[1] for x in Path("/proc/meminfo").read_text().splitlines() if x.startswith("MemAvailable:")))
-            print("PENDING_DELIVERY_SAFETY_INSPECTION_FINISHED")
+            print("AUDIT_UTC",datetime.datetime.now(datetime.timezone.utc).isoformat())
+            state=json.loads(Path("data/state.json").read_text())
+            pending=state.get("pending_deliveries") or {}
+            print("PENDING_COUNT",len(pending))
+            for val in list(pending.values())[-10:]:
+                if not isinstance(val,dict):continue
+                entry=str(val.get("file_path") or val.get("source_path") or val.get("raw_path") or "")
+                p=Path(entry) if entry else None
+                print("PENDING_FILE",json.dumps({
+                    "has_pointer":bool(entry),
+                    "source_exists":bool(p and p.is_file()),
+                    "source_bytes":p.stat().st_size if p and p.is_file() else 0,
+                    "video_delivered":bool(val.get("video_delivered")),
+                    "audio_delivered":bool(val.get("audio_delivered")),
+                    "transcript_delivered":bool(val.get("transcript_delivered")),
+                    "attempts":int(val.get("attempts") or val.get("retry_count") or 0)}))
+            logs=subprocess.run(["journalctl","-u","beonmeet-controller","--since","2026-11-21 11:30:00 UTC","--no-pager","-o","short-iso"],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=25).stdout
+            signatures=("premium downstream delivery incomplete","audio delivery error","transcription error","primary transcription failed","delivery recovery error","ffmpeg","BrokenPipeError","RuntimeError","TimeoutError","FileNotFoundError","OSError","HTTPStatusError","no space left","meeting dispatch")
+            found=collections.Counter()
+            for line in logs.splitlines():
+                for term in signatures:
+                    if term.lower() in line.lower():found[term]+=1
+            print("CONTROLLER_ERROR_SIGNALS",json.dumps(dict(found),sort_keys=True))
+            db=sqlite3.connect("file:/opt/beonmeet/data/beonmeet.db?mode=ro",uri=True);db.row_factory=sqlite3.Row
+            uid=str(((state.get("requests") or {}).get("https://meet.google.com/krq-dnch-odn") or {}).get("chat_id") or "")
+            print("SCREENSHOT_REQUEST_MATCHED",bool(uid))
+            if uid:
+                rows=db.execute("SELECT kind,seconds_delta FROM credit_entries WHERE telegram_id=?",(uid,)).fetchall()
+                total=sum(int(z["seconds_delta"]) for z in rows)
+                trial=sum(int(z["seconds_delta"]) for z in rows if z["kind"]=="trial")
+                used=-sum(int(z["seconds_delta"]) for z in rows if z["kind"]=="recording")
+                recordings=db.execute("SELECT COUNT(*) n,COALESCE(SUM(duration_seconds),0) sec FROM recordings WHERE telegram_id=?",(uid,)).fetchone()
+                print("SCREENSHOT_ACCOUNT_WALLET",json.dumps({"remaining_seconds":max(0,total),"trial_granted_seconds":max(0,trial),"recording_used_seconds":used,"recordings":int(recordings["n"]),"delivered_recording_seconds":int(recordings["sec"])}))
+            print("PENDING_AND_WALLET_AUDIT_DONE")
             PY
