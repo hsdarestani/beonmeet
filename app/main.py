@@ -730,10 +730,14 @@ async def _free_recording_allowed(
         return True
 
     remaining = int(entitlement.get("remaining_seconds") or 0)
-    pending = _pending_free_recordings(str(chat_id), exclude_event_id=event_id) if include_pending else 0
-    # Reserve one hour per in-flight free recording, same conservative
-    # concurrency approach used for paid sessions.
-    if remaining > pending * 3600:
+    # Welcome credit is a wallet of recording SECONDS, not a one-session pass.
+    # No minutes have been consumed while a recorder is queued, connecting,
+    # waiting for host approval or failing to enter. A stale "joining" event
+    # must never block an unused 15-minute (or even 1-second) remainder.
+    # Actual usage is debited idempotently only after successful video delivery
+    # by record_recording(), which caps free-only debits at available balance.
+    # Concurrency is controlled separately by the worker pool and join dedup.
+    if remaining > 0:
         return True
 
     if notify:
