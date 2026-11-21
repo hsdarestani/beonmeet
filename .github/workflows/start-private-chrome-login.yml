@@ -1,0 +1,42 @@
+name: Start short-lived private Google Chrome login (one-time)
+on:
+  push:
+    branches: [ops/start-private-chrome-google-login-20261121]
+    paths: [.github/workflows/start-private-chrome-login.yml]
+permissions:
+  contents: read
+jobs:
+  setup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - name: Install verified private Chrome login gateway and notify existing tester privately
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.SHARED_VPS_PASS || secrets.PASS }}
+          command_timeout: 5m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_SERVER; exit 1;; esac
+            test "$(id -u)" = 0
+            cd /opt/beonmeet
+            release=fc65b04e9e37fa04558c74e8bbd41b6b909bd1eb
+            git fetch -q origin main
+            git merge-base --is-ancestor "$release" FETCH_HEAD
+            dest=/opt/beonmeet/.temporary-google-login
+            test ! -e "$dest/active.json" || { echo EXISTING_PRIVATE_LOGIN_SESSION;exit 1; }
+            mkdir -p "$dest"
+            chmod 0700 "$dest"
+            stage=$(mktemp -d /opt/beonmeet/.private-chrome-login-stage.XXXXXXXX)
+            trap 'rm -rf "$stage"' EXIT
+            git show "$release:scripts/secure_chrome_login_gateway.py" > "$stage/manager.py"
+            python3 -m py_compile "$stage/manager.py"
+            cmp -s "$stage/manager.py" "$dest/manager.py" || install -m 600 "$stage/manager.py" "$dest/manager.py"
+            python3 "$dest/manager.py" setup
+            test -s "$dest/active.json"
+            echo SECURE_CHROME_SETUP_ACTIVE_AND_USER_MESSAGED_VIA_TELEGRAM
+            echo SECURITY_NO_CREDENTIALS_IN_GITHUB_ACTIONS_OUTPUT
