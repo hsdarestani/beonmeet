@@ -115,7 +115,7 @@ async function main() {
   await new Promise((resolve,reject)=>{
     const timeout=setTimeout(()=>{clearInterval(checker);resolve();},SECONDS*1000);
     const checker=setInterval(()=>{
-      if(fs.existsSync('/tmp/beonmeet-five-sustained-abort-20261119')){
+      if(fs.existsSync('/tmp/beonmeet-five-sustained-abort-20261121')){
         clearTimeout(timeout);clearInterval(checker);
         reject(Error('Host health guard requested abort'));
       }
