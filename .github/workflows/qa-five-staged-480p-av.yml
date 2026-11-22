@@ -30,6 +30,7 @@ jobs:
             flock -w 90 9
             test -d .five-isolated-runtime
             QA_DIR=$(mktemp -d /opt/beonmeet/.five-isolated-qa.XXXXXXXX)
+            chmod 1777 "$QA_DIR" # only synthetic QA media; container runtime user must write
             TEST_PID=""
             QA_NAME=beonmeet-isolated-chrome-qa
             cleanup() {
