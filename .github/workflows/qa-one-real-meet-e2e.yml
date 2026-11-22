@@ -37,3 +37,5 @@ jobs:
             chmod 644 "$sink"
             python3 -m py_compile "$script"
             python3 "$script" "$sink"
+
+# Recheck real Google Meet callback media track metadata after file-validation failure.
