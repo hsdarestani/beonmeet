@@ -1,0 +1,55 @@
+name: Classify current Meet join failures and deployed patch markers safely
+on:
+  push:
+    branches: [ops/investigate-user-meet-join-20261122]
+    paths: [.github/workflows/ops-live-join-errors-20261122.yml]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Safely inspect prejoin messages and compiled worker patch markers (read only)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 4m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,subprocess,re,datetime
+            print('JOIN_FAILURE_DETAIL_UTC',datetime.datetime.now(datetime.timezone.utc).isoformat())
+            p=subprocess.run(['docker','logs','--timestamps','--since','28m','beonmeet-worker-five'],capture_output=True,text=True,timeout=17)
+            lines=(p.stdout+'\n'+p.stderr).splitlines()
+            phrases=['pre-join','prejoin','join','redirect','lobby','admission','error','failed','retry','timeout','waiting for']
+            def safe(x):
+                x=re.sub(r'https?://[^\s\x22\x27<>]+','[URL]',x)
+                x=re.sub(r'\b[a-z]{3}-[a-z]{4}-[a-z]{3}\b','[MEET]',x,flags=re.I)
+                x=re.sub(r'[\w.+-]+@[\w.-]+','[EMAIL]',x)
+                x=re.sub(r'(?i)(bearer|secret|token|api.key|authorization|cookie)[^,\s]{0,90}', '[AUTH_REDACTED]',x)
+                x=re.sub(r'(?i)(?:userId|botId|eventId|chatId|teamId|sessionId)[\x22\x27\s:=]+[\w.-]+','[ID]',x)
+                x=re.sub(r'\d{9,}', '[NUMBER]', x)
+                x=re.sub(r'(?i)user name[^,}]*','[IDENTITY]',x)
+                return x[:260]
+            important=[l for l in lines if any(q in l.lower() for q in phrases)]
+            for l in important[-43:]:
+                # Avoid raw JSON payloads and HTML containing private meeting material.
+                if any(x in l.lower() for x in ('payload','requestbody','headers','cookie','bearer','email','participant','screenshot','base64')):continue
+                print('JOIN_FAILURE_DETAIL_LOG',safe(l))
+            x=subprocess.run(['docker','exec','beonmeet-worker-five','sh','-c','grep -o -E \"BEONMEET_[A-Z0-9_]+|GOOGLE_MEET_TRUSTED_JOIN_PATCH\" /usr/src/app/dist/bots/GoogleMeetBot.js | sort -u'],capture_output=True,text=True,timeout=10)
+            print('JOIN_FAILURE_DETAIL_PATCH_MARKERS',x.stdout.strip().splitlines()[:25])
+            # Live source path overlays are sensitive infrastructure paths. Only compare worker mounts and content marker.
+            import os
+            for n in ('beonmeet-worker-five','beonmeet-worker-single'):
+                p=subprocess.run(['docker','inspect',n],capture_output=True,text=True,timeout=6)
+                obj=json.loads(p.stdout)[0]
+                mounts=[m for m in obj['Mounts'] if m['Destination']=='/usr/src/app/dist/bots/GoogleMeetBot.js']
+                print('JOIN_FAILURE_DETAIL_WORKER',n,'patched_overlay',bool(mounts),'running',obj['State']['Running'])
+            print('JOIN_FAILURE_DETAIL_DONE')
+            PY
