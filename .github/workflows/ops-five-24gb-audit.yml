@@ -1,0 +1,79 @@
+name: BeOnMeet 5 isolated local recorders — baseline audit
+on:
+  push:
+    branches: [feat/five-isolated-local-recorders-20261122]
+    paths: [.github/workflows/ops-five-24gb-audit.yml]
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Inspect current controller, worker and chrome topology without secrets
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 4m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST;exit 1;; esac
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import os,subprocess,json,urllib.request,datetime,shutil,re
+            from pathlib import Path
+            def cmd(*x):
+                p=subprocess.run(x,capture_output=True,text=True,timeout=14)
+                return p.stdout.strip() if p.returncode==0 else ''
+            def get(p):
+                with urllib.request.urlopen('http://127.0.0.1:'+str(p)+'/capacity',timeout=7) as r:
+                    d=json.load(r)
+                return d.get('data') or d
+            print('FIVE_BASELINE_TIME',datetime.datetime.now(datetime.timezone.utc).isoformat())
+            print('FIVE_BASELINE_BOOT',cmd('uptime','-s'))
+            print('FIVE_BASELINE_CORES',os.cpu_count())
+            mem={}
+            for x in Path('/proc/meminfo').read_text().splitlines():
+                if x.startswith(('MemTotal:','MemAvailable:','Shmem:','SwapTotal:')):
+                    k,v=x.split(':',1);mem[k]=round(int(v.split()[0])/1048576,2)
+            print('FIVE_BASELINE_RAM_GIB',mem)
+            print('FIVE_BASELINE_FS',cmd('df','-h','/','/dev/shm'))
+            print('FIVE_BASELINE_RECORDING_USAGE',cmd('du','-sh','/dev/shm/beonmeet'))
+            print('FIVE_BASELINE_IMAGES',cmd('docker','images','--format','{{.Repository}}:{{.Tag}} {{.Size}}').splitlines()[:20])
+            print('FIVE_BASELINE_CONTAINERS',cmd('docker','ps','--format','{{.Names}} {{.Status}}').splitlines()[:30])
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=7) as r:d=json.load(r)
+            print('FIVE_BASELINE_CONTROLLER',{k:d.get(k) for k in ('ok','free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs','remote_workers','free_worker_endpoints','premium_worker_endpoints','max_concurrent_meetings','healthy_free_workers','healthy_premium_workers','recorder_account_profiles')})
+            for p in (9124,9126):
+                try:print('FIVE_BASELINE_CAPACITY',p,get(p))
+                except Exception as e:print('FIVE_BASELINE_CAPACITY',p,type(e).__name__)
+            names=['beonmeet-chrome-single','beonmeet-worker-single','beonmeet-worker-five']
+            for name in names:
+                raw=cmd('docker','inspect',name)
+                if not raw:
+                    print('FIVE_BASELINE_INSPECT_MISSING',name);continue
+                x=json.loads(raw)[0]
+                cfg=x['HostConfig'];meta=x['Config']
+                env={}
+                keys={'GOOGLE_CHROME_CDP_URL','MAX_CONCURRENT_MEETINGS','NODE_ENV','CHROME_WINDOW_SIZE','RECORDING_TMP_DIR','CONTROLLER_STREAM_UPLOAD_URL','CONTROLLER_UPLOAD_URL','CONTROLLER_RECORDING_STARTED_URL','MAX_RECORDING_DURATION_MINUTES','GOOGLE_CHROME_USER_DATA_DIR','REDIS_HOST','REDIS_PORT','MEETING_INACTIVITY_MINUTES'}
+                for line in meta.get('Env',[]):
+                    if '=' in line:
+                        k,v=line.split('=',1)
+                        if k in keys:env[k]=v if 'URL' not in k or k=='GOOGLE_CHROME_CDP_URL' else 'configured'
+                info={'name':name,'running':x['State']['Running'],'health':x['State'].get('Health',{}).get('Status'),'image':meta['Image'],'network_mode':cfg.get('NetworkMode'),
+                      'entrypoint':meta.get('Entrypoint'),'cmd':meta.get('Cmd'),'resources':{'mem_mb':round(cfg.get('Memory',0)/1048576,1),'cpu_nano':cfg.get('NanoCpus'),'shm_mb':round(cfg.get('ShmSize',0)/1048576,1)},
+                      'ports':cfg.get('PortBindings'),'mounts':[{'type':m.get('Type'),'dst':m.get('Destination'),'src_name':Path(m.get('Source','')).name,'rw':m.get('RW')} for m in x['Mounts']], 'env':env}
+                print('FIVE_BASELINE_DOCKER',json.dumps(info,ensure_ascii=False))
+                if name.startswith('beonmeet-worker'):
+                    print('FIVE_BASELINE_BUILD_MARKERS',name,cmd('docker','exec',name,'sh','-c','grep -o -E \"BEONMEET_(MODERN_IN_CALL_PROOF_V1|BROWSER_QUALITY_ARG_V1|CAPTURE_QUALITY|LOW_RESOURCE)[A-Za-z0-9_]*\" /usr/src/app/dist/bots/GoogleMeetBot.js | sort -u').splitlines()[:18])
+            # Show directory metadata only; never read signed-in cookies.
+            for p in ('/opt/beonmeet/chrome-profile','/opt/beonmeet/recorder-accounts','/opt/beonmeet/data/whisper-models'):
+                d=Path(p)
+                print('FIVE_BASELINE_PROFILE_META',p,'exists',d.exists(),'mode',oct(d.stat().st_mode & 0o777) if d.exists() else None)
+                if d.is_dir():print('FIVE_BASELINE_PROFILE_SUBDIR_COUNT',p,len(list(d.iterdir())))
+            print('FIVE_BASELINE_DEPLOY_LOCK',Path('/var/lock/pars-vds-bot-deploy.lock').exists())
+            print('FIVE_BASELINE_COMPLETE')
+            PY

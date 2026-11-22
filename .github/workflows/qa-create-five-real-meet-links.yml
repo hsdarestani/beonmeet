@@ -1,0 +1,57 @@
+name: BeOnMeet five private Meet QA room creation
+on:
+  push:
+    branches: [feat/five-isolated-local-recorders-20261122]
+    paths: [.github/workflows/qa-create-five-real-meet-links.yml]
+permissions:
+  contents: read
+jobs:
+  create:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - run: node --check tests/create_four_more_standby_meet_links.js
+      - name: Create private QA links without sending invites or calendar updates
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 5m
+          script: |
+            set -eu
+            umask 077
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 45 9
+            test -s .five-isolated-runtime/qa_meet_link_1.json
+            python3 - <<'PY'
+            import json,urllib.request
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=6) as r:d=json.load(r)
+            assert d.get('ok')
+            assert all(not int(d.get(k) or 0) for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'))
+            print('MEET_FIVE_LINKS_IDLE_GUARD_PASS')
+            PY
+            SHA=${{ github.sha }}
+            git fetch -q origin feat/five-isolated-local-recorders-20261122
+            script=$(mktemp /tmp/four-test-links.XXXXXXXX.js)
+            output=$(mktemp /tmp/four-test-links.XXXXXXXX.json)
+            trap 'rm -f "$script" "$output"' EXIT
+            git show "$SHA:tests/create_four_more_standby_meet_links.js" > "$script"
+            docker exec -i beonmeet-worker-five node - < "$script" > "$output"
+            python3 - "$output" <<'PY'
+            import json,re,sys,pathlib
+            folder=pathlib.Path('/opt/beonmeet/.five-isolated-runtime')
+            first=json.loads((folder/'qa_meet_link_1.json').read_text())['link']
+            others=json.loads(pathlib.Path(sys.argv[1]).read_text())['links']
+            all_urls=[first]+others
+            assert len(all_urls)==5 and len(set(all_urls))==5
+            for url in all_urls:assert re.fullmatch(r'https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}',url)
+            dest=folder/'qa_meet_links.json'
+            dest.write_text(json.dumps({'links':all_urls}))
+            dest.chmod(0o600)
+            print('MEET_FIVE_DISTINCT_PRIVATE_TEST_ROOM_LINKS_CREATED')
+            PY

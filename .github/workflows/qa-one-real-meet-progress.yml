@@ -1,0 +1,37 @@
+name: BeOnMeet live real-Meet canary progress (read-only)
+on:
+  push:
+    branches: [feat/five-isolated-local-recorders-20261122]
+    paths: [.github/workflows/qa-one-real-meet-progress.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Read test callbacks without reading Meet URLs or customer data
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 90s
+          script: |
+            set -eu
+            python3 - <<'PY'
+            import json,urllib.request,datetime,subprocess
+            print('REAL_CANARY_OBSERVED',datetime.datetime.now(datetime.timezone.utc).isoformat())
+            for port,path in ((9190,'/health'),(9142,'/capacity'),(8109,'/health')):
+                try:
+                    with urllib.request.urlopen('http://127.0.0.1:%d%s'%(port,path),timeout=6) as r:d=json.load(r)
+                    keys=['ok','start','waiting','uploaded','runningJobs','availableSlots','free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs']
+                    d=d.get('data') or d
+                    print('REAL_CANARY_PORT',port,{k:d.get(k) for k in keys if k in d})
+                except Exception as e:print('REAL_CANARY_PORT',port,'unavailable',type(e).__name__)
+            for name in ('beonmeet-qa-worker-2','beonmeet-qa-sink','beonmeet-isolated-chrome-2'):
+                p=subprocess.run(['docker','inspect','-f','{{.State.Status}}',name],capture_output=True,text=True,timeout=5)
+                print('REAL_CANARY_CONTAINER',name,p.stdout.strip() if p.returncode==0 else 'absent')
+            PY

@@ -1,0 +1,41 @@
+name: Five Google Meet QA — sanitized error signatures
+on:
+  push:
+    branches: [feat/five-isolated-local-recorders-20261122]
+    paths: [.github/workflows/ops-five-real-join-signatures.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Extract only sanitized error categories and agent problem signatures
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 100s
+          timeout: 20s
+          script: |
+            python3 - <<'PY'
+            import subprocess,re,collections
+            for i in range(2,7):
+              p=subprocess.run(['docker','logs','--since','15m',f'beonmeet-qa-five-worker-{i}'],capture_output=True,text=True,timeout=10)
+              if p.returncode:
+                print('MEET_ERROR_SIGNATURES',i,'not-running')
+                continue
+              lines=(p.stdout+'\\n'+p.stderr).splitlines()
+              errors=[x for x in lines if re.search(r'\b(error|failed|timeout|denied|crash|closed|exception|not found|not accepted|waiting|admission)\b',x,re.I)]
+              def safe(s):
+                s=re.sub(r'(?i)https?://[^\s\x22\x27]+','[URL]',s)
+                s=re.sub(r'(?i)\b[a-z]{3}-[a-z]{4}-[a-z]{3}\b','[MEET_ID]',s)
+                s=re.sub(r'(?i)[\w.+-]+@[\w.-]+','[EMAIL]',s)
+                s=re.sub(r'(?i)(token|secret|password|authorization|cookie)[\x22\x27 ]*[:=][^,\s}]+',r'\1=[REDACTED]',s)
+                s=re.sub(r'\b\d{10,}\b','[ID]',s)
+                return s.strip()[:170]
+              counts=collections.Counter(safe(s) for s in errors)
+              print('MEET_ERROR_SIGNATURES',i,[(k,v) for k,v in counts.most_common(9)])
+            PY

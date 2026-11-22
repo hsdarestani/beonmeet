@@ -1,0 +1,43 @@
+name: One real Google Meet recorder E2E canary without customer effects
+on:
+  push:
+    branches: [feat/five-isolated-local-recorders-20261122]
+    paths: [.github/workflows/qa-one-real-meet-e2e.yml]
+permissions:
+  contents: read
+jobs:
+  canary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate real Meet QA harness
+        run: |
+          python3 -m py_compile scripts/run_one_real_meet_qa.py
+          node --check tests/real_meet_qa_callback_sink.js
+      - name: Run Google Meet join and record in private test lane
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 12m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            SHA=${{ github.sha }}
+            git fetch -q origin feat/five-isolated-local-recorders-20261122
+            script=$(mktemp /tmp/real-meet-qa.XXXXXXXX.py)
+            sink=$(mktemp /tmp/qa-callback-sink.XXXXXXXX.js)
+            trap 'rm -f "$script" "$sink"' EXIT
+            git show "$SHA:scripts/run_one_real_meet_qa.py" > "$script"
+            git show "$SHA:tests/real_meet_qa_callback_sink.js" > "$sink"
+            chmod 644 "$sink"
+            python3 -m py_compile "$script"
+            python3 "$script" "$sink"
+
+# Recheck real Google Meet callback media track metadata after file-validation failure.
+
+# Third QA pass: validate AV tracks and duration even when a silent test room makes file tiny.

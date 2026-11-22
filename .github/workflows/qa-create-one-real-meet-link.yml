@@ -1,0 +1,58 @@
+name: BeOnMeet disposable real Meet link canary (no calendar or invitations)
+on:
+  push:
+    branches: [feat/five-isolated-local-recorders-20261122]
+    paths: [.github/workflows/qa-create-one-real-meet-link.yml]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: node --check tests/create_standby_meet_link.js
+      - name: Mint private real Meet link in standby Chrome only
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 4m
+          script: |
+            set -eu
+            umask 077
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 45 9
+            test -d .five-isolated-runtime
+            python3 - <<'PY'
+            import urllib.request,json
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=7) as r:h=json.load(r)
+            assert h.get('ok')
+            for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'):
+                assert int(h.get(k) or 0)==0,'Live customer work'
+            for port in (9126,9132,9133,9134,9135):
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/capacity',timeout=7) as r:d=json.load(r)
+                assert int((d.get('data') or d).get('runningJobs') or 0)==0
+            print('MEET_NEW_CANARY_IDLE_SAFETY_PASS')
+            PY
+            git fetch -q origin feat/five-isolated-local-recorders-20261122
+            SHA=${{ github.sha }}
+            script=$(mktemp /tmp/meet-link.XXXXXXXX.js)
+            result=$(mktemp /tmp/meet-link-result.XXXXXXXX.json)
+            trap 'rm -f "$script" "$result"' EXIT
+            git show "$SHA:tests/create_standby_meet_link.js" > "$script"
+            docker exec -i beonmeet-worker-five node - < "$script" > "$result"
+            python3 - "$result" <<'PY'
+            import json,re,sys,pathlib
+            p=pathlib.Path(sys.argv[1])
+            d=json.loads(p.read_text())
+            assert re.fullmatch(r'https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}',d['link'])
+            dest=pathlib.Path('/opt/beonmeet/.five-isolated-runtime/qa_meet_link_1.json')
+            dest.write_text(json.dumps(d))
+            dest.chmod(0o600)
+            print('MEET_NEW_CANARY_REAL_LINK_GENERATED_AND_STORED_PRIVATELY')
+            PY
