@@ -1,0 +1,56 @@
+name: Sync authorized BeOnMeet Google recorder session to isolated Chrome lanes
+on:
+  push:
+    branches: [fix/meet-direct-url-diagnostic-20261122]
+    paths: [.github/workflows/ops-sync-local-google-recorder-session.yml]
+permissions:
+  contents: read
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax-check local-only Google session sync
+        run: node --check scripts/sync_local_google_recorder_session.js
+      - name: Copy own active Google session into idle recorder Chromes without exposing cookies
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 8m
+          script: |
+            set -eu
+            umask 077
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 100 9
+            python3 - <<'PY'
+            import urllib.request,json,subprocess
+            from pathlib import Path
+            assert Path('.five-isolated-runtime/qa_meet_links.json').is_file()
+            def j(url):
+                with urllib.request.urlopen(url,timeout=8) as r:return json.load(r)
+            h=j('http://127.0.0.1:8109/health')
+            assert h.get('ok')
+            assert all(int(h.get(k) or 0)==0 for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'))
+            for p in (9124,9126,9132,9133,9134,9135):
+                c=j('http://127.0.0.1:%d/capacity'%p);c=c.get('data') or c
+                assert int(c.get('runningJobs') or 0)==0
+            for n in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',n],text=True).strip()=='healthy'
+            print('LOCAL_GOOGLE_SYNC_IDLE_PRODUCTION_CAMCAM_VERIFIED')
+            PY
+            git fetch -q origin fix/meet-direct-url-diagnostic-20261122
+            script=$(mktemp /tmp/local-google-sync.XXXXXXXX.js)
+            trap 'rm -f "$script"' EXIT
+            git show "${{ github.sha }}:scripts/sync_local_google_recorder_session.js" > "$script"
+            chmod 644 "$script"
+            docker run --rm --user 0 --network beonmeet-single --memory=580m --cpus=.5 --pids-limit=170 \
+              -e NODE_PATH=/usr/src/app/node_modules -v "$script:/qa-sync.js:ro" \
+              -v "/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json:/qa-existing-links.json:ro" \
+              --entrypoint node beonmeet-worker-audiofix:latest /qa-sync.js
+            echo LOCAL_GOOGLE_SYNC_FINISHED_NO_PRODUCTION_ROUTING_CHANGE
