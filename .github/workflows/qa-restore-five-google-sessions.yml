@@ -59,3 +59,5 @@ jobs:
 # Latest direct-room canary includes per-lane transient navigation retries.
 
 # Verify direct Meet prejoin after original Chrome CDP surgical recovery.
+
+# Require five authenticated Join now pages after local session sync; no guest-mode false positives.
