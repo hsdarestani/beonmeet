@@ -39,3 +39,5 @@ jobs:
             python3 "$script" "$sink"
 
 # Recheck real Google Meet callback media track metadata after file-validation failure.
+
+# Third QA pass: validate AV tracks and duration even when a silent test room makes file tiny.
