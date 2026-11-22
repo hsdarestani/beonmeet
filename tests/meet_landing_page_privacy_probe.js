@@ -9,7 +9,7 @@ const { chromium }=require('playwright');
    const p=await c.newPage();
    try{
      const failures=[];
-     p.on('requestfailed',r=>{if(failures.length<6)failures.push({host:new URL(r.url()).hostname,type:r.failure()?.slice(0,70)})});
+     p.on('requestfailed',r=>{if(failures.length<6)failures.push({host:new URL(r.url()).hostname,type:String(r.failure()?.errorText||r.failure()||'unknown').slice(0,70)})});
      await p.goto(endpoint,{waitUntil:'domcontentloaded',timeout:45000}).catch(e=>console.log('QA_PAGE_NAVIGATION_ERROR_CLASS',e.name));
      await p.waitForTimeout(4500);
      const info=await p.evaluate(()=>{
