@@ -1,0 +1,77 @@
+name: Repair original Google Chrome CDP if disconnected and no recording is active
+on:
+  push:
+    branches: [fix/restore-recorder-session-from-healthy-lane-20261122]
+    paths: [.github/workflows/ops-repair-original-browser-if-idle.yml]
+permissions:
+  contents: read
+jobs:
+  safe-browser-repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Restore idle Chrome only if Playwright CDP is unreachable, preserve profile and CamCam
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 5m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 100 9
+            python3 - <<'PY'
+            import subprocess,urllib.request,json,os
+            def get(url):
+                with urllib.request.urlopen(url,timeout=7) as r:return json.load(r)
+            h=get('http://127.0.0.1:8109/health')
+            assert h.get('ok')
+            for key in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'):
+                assert not int(h.get(key) or 0),'customer request not idle'
+            for p in (9124,9126,9132,9133,9134,9135):
+                d=get(f'http://127.0.0.1:{p}/capacity');d=d.get('data') or d
+                assert not int(d.get('runningJobs') or 0),'recording running'
+            for name in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                status=subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',name],text=True).strip()
+                assert status=='healthy'
+            o=json.loads(subprocess.check_output(['docker','inspect','beonmeet-chrome-single'],text=True))[0]
+            assert o['State']['Running']
+            mount=[m for m in o['Mounts'] if m['Destination']=='/tmp/chrome-profile' and m['RW']]
+            assert len(mount)==1 and os.path.isdir(mount[0]['Source'])
+            print('ORIGINAL_CDP_RECOVERY_SAFE_IDLE_PROFILE_PRESERVED')
+            PY
+            check_cdp() {
+              docker exec -i beonmeet-worker-five node - <<'JS'
+            const {chromium}=require('playwright');
+            (async()=>{
+              const b=await chromium.connectOverCDP('http://beonmeet-chrome-single:9223',{timeout:10000});
+              try{const c=b.contexts()[0];if(!c)throw Error('missing persistent context');console.log('ORIGINAL_CDP_WORKING',c.pages().length)}
+              finally{await b.close().catch(()=>{})}
+            })().catch(e=>{console.log('ORIGINAL_CDP_NOT_WORKING',e.name);process.exitCode=2});
+            JS
+            }
+            if check_cdp; then
+              echo ORIGINAL_CDP_ALREADY_WORKING_NO_RESTART
+            else
+              echo ORIGINAL_CDP_RESTARTING_ONLY_IDLE_CHROME
+              docker restart -t 15 beonmeet-chrome-single >/dev/null
+              ready=0
+              for i in $(seq 1 35); do
+                if docker exec beonmeet-chrome-single curl -fsS --max-time 3 http://127.0.0.1:9223/json/version >/dev/null 2>&1 && check_cdp; then ready=1; break;fi
+                sleep 2
+              done
+              test "$ready" = 1 || { echo ORIGINAL_CDP_RESTART_FAILED_NO_OTHER_SERVICE_CHANGED; exit 1; }
+              echo ORIGINAL_CDP_RECOVERED_AFTER_RESTART
+            fi
+            python3 - <<'PY'
+            import urllib.request,json,subprocess
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=8) as r:h=json.load(r)
+            assert h.get('ok')
+            for n in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',n],text=True).strip()=='healthy'
+            print('ORIGINAL_CDP_HEALTH_BEONMEET_CAMCAM_PASS')
+            PY
