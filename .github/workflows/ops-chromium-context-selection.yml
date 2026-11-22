@@ -1,0 +1,50 @@
+name: Inspect deployed Chromium CDP context selection safely
+on:
+  push:
+    branches: [ops/investigate-user-meet-join-20261122]
+    paths: [.github/workflows/ops-chromium-context-selection.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - name: Read Chromium implementation source, no credentials or recordings
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 3m
+          script: |
+            set -eu
+            docker exec -i beonmeet-worker-five node - <<'JS'
+            const fs=require('fs'),path=require('path');
+            const root='/usr/src/app/dist';
+            const bot=fs.readFileSync(root+'/bots/GoogleMeetBot.js','utf8');
+            console.log('JOIN_BROWSER_IMPORTS',bot.split('\n').slice(0,60).filter(x=>x.includes('chromium')||x.includes('require(')).slice(0,30));
+            function walk(folder,depth,items){
+              if(depth>5||items.length>1500)return;
+              for(const n of fs.readdirSync(folder,{withFileTypes:true})){
+                const p=path.join(folder,n.name);
+                if(n.isDirectory())walk(p,depth+1,items);
+                else if(n.isFile()&&n.name.toLowerCase().includes('chromium'))items.push(p);
+              }
+            }
+            const list=[];walk(root,0,list);
+            console.log('CHROME_IMPLEMENTATION_PATHS',JSON.stringify(list.slice(0,30).map(x=>x.replace(root,'dist'))));
+            for(const file of list.slice(0,4)){
+              const code=fs.readFileSync(file,'utf8');
+              const lines=code.split('\n');
+              console.log('CHROME_IMPLEMENTATION_SOURCE',file.replace(root,'dist'),'lines',lines.length);
+              for(let i=0;i<lines.length;i++){
+                if(/connectOverCDP|newContext|context\(|newPage|launchPersistentContext|browserContexts|userDataDir|storageState|isExternalBrowserContext/.test(lines[i])){
+                  const region=lines.slice(Math.max(0,i-3),Math.min(lines.length,i+8)).join('\n');
+                  console.log('CHROME_IMPLEMENTATION_FOCUS',i+1,region.slice(0,1050));
+                }
+              }
+            }
+            JS
