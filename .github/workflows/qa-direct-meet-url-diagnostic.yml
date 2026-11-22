@@ -1,0 +1,56 @@
+name: Diagnose direct Google Meet URLs with signed-in BeOnMeet Chrome
+on:
+  push:
+    branches: [fix/meet-direct-url-diagnostic-20261122]
+    paths: [.github/workflows/qa-direct-meet-url-diagnostic.yml]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate script syntax
+        run: node --check tests/qa_direct_meet_url_status.js
+      - name: Read-only Chrome navigation; compares account / Meet home / existing QA room
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 5m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 100 9
+            python3 - <<'PY'
+            import urllib.request,json
+            def j(url):
+                with urllib.request.urlopen(url,timeout=8) as r:return json.load(r)
+            h=j('http://127.0.0.1:8109/health')
+            assert h.get('ok')
+            assert all(int(h.get(k) or 0)==0 for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'))
+            for port in (9126,9132,9133,9134,9135):
+                c=j('http://127.0.0.1:%d/capacity'%port)
+                assert int((c.get('data') or c).get('runningJobs') or 0)==0
+            print('MEET_DIRECT_QA_IDLE_OK')
+            PY
+            git fetch -q origin fix/meet-direct-url-diagnostic-20261122
+            script=$(mktemp /tmp/qa-direct-meet.XXXXXXXX.js)
+            trap 'rm -f "$script"' EXIT
+            git show "${{ github.sha }}:tests/qa_direct_meet_url_status.js" > "$script"
+            chmod 644 "$script"
+            if [ -s .five-isolated-runtime/qa_meet_links.json ]; then
+              docker run --rm --network beonmeet-single --memory=500m --cpus=.5 --pids-limit=160 \
+                -v "$script:/qa-test.js:ro" \
+                -v "/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json:/qa-existing-links.json:ro" \
+                --entrypoint node beonmeet-worker-audiofix:latest /qa-test.js
+            else
+              docker run --rm --network beonmeet-single --memory=500m --cpus=.5 --pids-limit=160 \
+                -v "$script:/qa-test.js:ro" \
+                --entrypoint node beonmeet-worker-audiofix:latest /qa-test.js
+            fi
