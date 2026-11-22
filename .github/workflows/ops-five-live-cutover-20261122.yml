@@ -1,0 +1,69 @@
+name: BeOnMeet ACTIVATE five independent production recording lanes
+on:
+  push:
+    branches: [ops/activate-five-live-recorder-lanes-20261122]
+    paths: [.github/workflows/ops-five-live-cutover-20261122.yml]
+permissions:
+  contents: read
+jobs:
+  activate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test five distinct worker routing and rollback policy
+        run: |
+          python3 -m py_compile scripts/cutover_five_isolated_local_workers.py scripts/rollback_five_isolated_local_workers.py
+          python3 tests/five_local_cutover_policy_test.py
+      - name: Cut over only if no recordings or delivery are active; auto rollback if unhealthy
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 7m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo FIVE_LIVE_WRONG_SERVER;exit 1;; esac
+            cd /opt/beonmeet
+            git fetch -q origin ops/activate-five-live-recorder-lanes-20261122
+            SHA=${{ github.sha }}
+            script=$(mktemp /tmp/five-live-cutover.XXXXXXXX.py)
+            rollback=$(mktemp /tmp/five-live-rollback.XXXXXXXX.py)
+            trap 'rm -f "$script" "$rollback"' EXIT
+            git show "$SHA:scripts/cutover_five_isolated_local_workers.py" > "$script"
+            git show "$SHA:scripts/rollback_five_isolated_local_workers.py" > "$rollback"
+            python3 -m py_compile "$script" "$rollback"
+            echo FIVE_LIVE_BEGIN_SAFE_IDLE_ONLY_CUTOVER
+            python3 "$script"
+            if ! python3 - <<'PY'
+            import json,subprocess,urllib.request
+            def get(url):
+                with urllib.request.urlopen(url,timeout=8) as r:return json.load(r)
+            h=get('http://127.0.0.1:8109/health')
+            assert h.get('ok')
+            assert int(h.get('free_worker_endpoints') or 0)==5
+            assert int(h.get('premium_worker_endpoints') or 0)==5
+            assert int(h.get('max_concurrent_meetings') or 0)==5
+            assert int(h.get('healthy_free_workers') or 0)==5
+            assert int(h.get('healthy_premium_workers') or 0)==5
+            assert all(int(h.get(k) or 0)==0 for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'))
+            for port in (9126,9132,9133,9134,9135):
+                d=get(f'http://127.0.0.1:{port}/capacity');d=d.get('data') or d
+                assert int(d.get('runningJobs') or 0)==0 and int(d.get('availableSlots') or 0)>0
+                if port!=9126:assert int(d.get('maxConcurrentJobs') or 0)==1
+                print('FIVE_LIVE_DISTINCT_LANE_READY',port)
+            for n in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',n],text=True).strip()=='healthy'
+            assert get('https://beonmeet.smarbiz.sbs/health').get('ok')
+            print('FIVE_LIVE_PRODUCTION_HEALTH_AND_CAMCAM_OK')
+            PY
+            then
+              echo FIVE_LIVE_POSTCHECK_FAILED_ROLLING_BACK
+              python3 "$rollback" || true
+              exit 1
+            fi
+            echo FIVE_LIVE_ACTIVATION_COMPLETE_READY_FOR_REAL_USER_TEST
