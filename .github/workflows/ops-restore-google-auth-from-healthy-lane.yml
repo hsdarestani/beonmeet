@@ -1,0 +1,57 @@
+name: Restore BeOnMeet authenticated Chrome sessions from healthy on-host lane
+on:
+  push:
+    branches: [fix/restore-recorder-session-from-healthy-lane-20261122]
+    paths: [.github/workflows/ops-restore-google-auth-from-healthy-lane.yml]
+permissions:
+  contents: read
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify authentication recovery script syntax before VPS operations
+        run: node --check scripts/recover_google_recorder_sessions_from_healthy_lane.js
+      - name: Repair only idle authorized BeOnMeet Chrome profiles; preserve active customer data
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 7m
+          script: |
+            set -eu
+            umask 077
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 100 9
+            python3 - <<'PY'
+            import json,subprocess,urllib.request,os
+            from pathlib import Path
+            assert Path('.five-isolated-runtime/qa_meet_links.json').is_file()
+            def g(url):
+                with urllib.request.urlopen(url,timeout=8) as r:return json.load(r)
+            h=g('http://127.0.0.1:8109/health')
+            assert h.get('ok')
+            assert all(not int(h.get(k) or 0) for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'))
+            for p in (9124,9126,9132,9133,9134,9135):
+                r=g(f'http://127.0.0.1:{p}/capacity');r=r.get('data') or r
+                assert int(r.get('runningJobs') or 0)==0,'Active recording, no auth mutation allowed'
+            for name in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',name],text=True).strip()=='healthy'
+            print('AUTH_RECOVERY_SERVER_IDLE_AND_CAMCAM_HEALTHY')
+            PY
+            git fetch -q origin fix/restore-recorder-session-from-healthy-lane-20261122
+            script=$(mktemp /tmp/recover-google-sessions.XXXXXXXX.js)
+            trap 'rm -f "$script"' EXIT
+            git show "${{ github.sha }}:scripts/recover_google_recorder_sessions_from_healthy_lane.js" > "$script"
+            chmod 644 "$script"
+            docker run --rm --user 0 --network beonmeet-single --memory=600m --cpus=.5 --pids-limit=150 \
+              -e NODE_PATH=/usr/src/app/node_modules \
+              -v "$script:/run.js:ro" \
+              -v "/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json:/qa-existing-links.json:ro" \
+              --entrypoint node beonmeet-worker-audiofix:latest /run.js
+            echo AUTH_RECOVERY_COMPLETE_NO_PRODUCTION_RESTART_OR_ROUTING_CHANGE
