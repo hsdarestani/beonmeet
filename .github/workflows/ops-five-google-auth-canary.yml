@@ -1,0 +1,35 @@
+name: BeOnMeet five local recorders — Google profile integrity canary
+on:
+  push:
+    branches: [feat/five-isolated-local-recorders-20261122]
+    paths: [.github/workflows/ops-five-google-auth-canary.yml]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: node --check tests/five_local_auth_cdp_canary.js
+      - name: Inspect login marker in copied independent browsers
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 3m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            test -d .five-isolated-runtime
+            SHA=${{ github.sha }}
+            git fetch -q origin feat/five-isolated-local-recorders-20261122
+            tmp=$(mktemp /tmp/isolated-auth-canary.XXXXXXXX.js)
+            trap 'rm -f "$tmp"' EXIT
+            git show "$SHA:tests/five_local_auth_cdp_canary.js" > "$tmp"
+            node --check "$tmp"
+            docker exec -i beonmeet-worker-five node - < "$tmp"
