@@ -43,3 +43,5 @@ jobs:
             trap 'rm -f "$tmp"' EXIT
             git show "${{ github.sha }}:tests/meet_landing_page_privacy_probe.js" > "$tmp"
             docker exec -i beonmeet-worker-five node - < "$tmp"
+
+# QA retry with corrected Playwright failure signal classifier.
