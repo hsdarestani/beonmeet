@@ -1,0 +1,50 @@
+name: Google Meet Sign-in button diagnostic in private test room
+on:
+  push:
+    branches: [fix/meet-direct-url-diagnostic-20261122]
+    paths: [.github/workflows/qa-meet-signin-control.yml]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - run: node --check tests/qa_meet_signin_button_flow.js
+      - name: Check if clicking Meet Sign in requires new credentials or account chooser
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 4m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 100 9
+            python3 - <<'PY'
+            import urllib.request,json
+            def j(url):
+                with urllib.request.urlopen(url,timeout=8) as r:return json.load(r)
+            h=j('http://127.0.0.1:8109/health')
+            assert h.get('ok')
+            assert all(int(h.get(k) or 0)==0 for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'))
+            for port in (9126,9132,9133,9134,9135):
+                c=j('http://127.0.0.1:%d/capacity'%port)
+                assert int((c.get('data') or c).get('runningJobs') or 0)==0
+            print('MEET_SIGNIN_CONTROL_IDLE_PASS')
+            PY
+            test -s .five-isolated-runtime/qa_meet_links.json
+            git fetch -q origin fix/meet-direct-url-diagnostic-20261122
+            script=$(mktemp /tmp/meet-signin-control.XXXXXXXX.js)
+            trap 'rm -f "$script"' EXIT
+            git show "${{ github.sha }}:tests/qa_meet_signin_button_flow.js" > "$script"
+            chmod 644 "$script"
+            docker run --rm --user 0 --network beonmeet-single --memory=500m --cpus=.5 --pids-limit=160 \
+              -e NODE_PATH=/usr/src/app/node_modules -v "$script:/qa-test.js:ro" \
+              -v "/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json:/qa-existing-links.json:ro" \
+              --entrypoint node beonmeet-worker-audiofix:latest /qa-test.js

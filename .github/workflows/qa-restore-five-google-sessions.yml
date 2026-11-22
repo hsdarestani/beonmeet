@@ -1,21 +1,20 @@
-name: Validate authenticated recorder browsers and create five stable QA meetings
+name: Verify five direct Meet prejoin pages without altering Google sign-in
 on:
   push:
-    branches: [fix/stable-google-meet-qa-20261122]
+    branches: [fix/meet-direct-url-diagnostic-20261122]
     paths: [.github/workflows/qa-restore-five-google-sessions.yml]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  restore:
+  preflight:
     runs-on: ubuntu-24.04
-    timeout-minutes: 12
+    timeout-minutes: 7
     steps:
       - uses: actions/checkout@v4
-      - name: Validate scripts before contact with live Chrome
-        run: |
-          node --check scripts/propagate_recorder_google_login_on_host.js
-          node --check tests/qa_create_five_stable_meet_links.js
-      - name: Verify owner-authenticated Chrome, propagate session inside VPS, create stable test links
+      - name: Validate direct-room QA script
+        run: node --check tests/qa_all_five_direct_meet_room_preflight.js
+      - name: Preflight five Chrome Meet test rooms with zero credential mutations
         uses: appleboy/ssh-action@v1
         with:
           host: 143.20.60.195
@@ -23,50 +22,42 @@ jobs:
           username: root
           password: ${{ secrets.PASS }}
           timeout: 20s
-          command_timeout: 10m
+          command_timeout: 6m
           script: |
             set -eu
-            umask 077
             cd /opt/beonmeet
             exec 9>/var/lock/pars-vds-bot-deploy.lock
             flock -w 100 9
             python3 - <<'PY'
-            import json,urllib.request,subprocess
+            import urllib.request,json,subprocess
             from pathlib import Path
-            assert Path('.five-isolated-runtime').is_dir()
+            assert Path('.five-isolated-runtime/qa_meet_links.json').is_file()
             def j(url):
-                with urllib.request.urlopen(url,timeout=7) as r:return json.load(r)
+                with urllib.request.urlopen(url,timeout=8) as r:return json.load(r)
             h=j('http://127.0.0.1:8109/health')
             assert h.get('ok')
-            assert all(not int(h.get(k) or 0) for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'))
-            for p in (9126,9132,9133,9134,9135):
-                d=j(f'http://127.0.0.1:{p}/capacity');d=d.get('data') or d
-                assert not int(d.get('runningJobs') or 0)
+            assert all(int(h.get(k) or 0)==0 for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'))
+            for port in (9126,9132,9133,9134,9135):
+                d=j('http://127.0.0.1:%d/capacity'%port);d=d.get('data') or d
+                assert int(d.get('runningJobs') or 0)==0
             for name in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
                 assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',name],text=True).strip()=='healthy'
-            print('FIVE_GOOGLE_SESSION_SAFETY_PRECHECK_PASS')
+            print('FIVE_MEET_DIRECT_PREFLIGHT_HEALTHY_AND_IDLE')
             PY
-            SHA=${{ github.sha }}
-            git fetch -q origin fix/stable-google-meet-qa-20261122
-            sync_script=$(mktemp /tmp/sync-google-five.XXXXXXXX.js)
-            create_script=$(mktemp /tmp/create-later-five.XXXXXXXX.js)
-            qa_json=$(mktemp /opt/beonmeet/.five-isolated-runtime/qa-links.XXXXXXXX.json)
-            trap 'rm -f "$sync_script" "$create_script" "$qa_json"' EXIT
-            git show "$SHA:scripts/propagate_recorder_google_login_on_host.js" > "$sync_script"
-            git show "$SHA:tests/qa_create_five_stable_meet_links.js" > "$create_script"
-            docker exec -i beonmeet-worker-five node - < "$sync_script"
-            docker exec -i beonmeet-worker-five node - < "$create_script" > "$qa_json"
-            python3 - "$qa_json" <<'PY'
-            import json,pathlib,re,sys,os
-            src=pathlib.Path(sys.argv[1])
-            doc=json.loads(src.read_text())
-            urls=doc.get('links')
-            assert doc.get('source')=='create-for-later'
-            assert isinstance(urls,list) and len(urls)==5 and len(set(urls))==5
-            for u in urls:assert re.fullmatch(r'https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}',u)
-            src.chmod(0o600)
-            dst=pathlib.Path('/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json')
-            os.replace(src,dst)
-            print('FIVE_STABLE_MEET_FOR_LATER_LINKS_CREATED_AND_STORED_PRIVATELY')
-            PY
-            echo FIVE_GOOGLE_BROWSER_REAUTH_AND_TEST_ROOM_CREATION_DONE
+            git fetch -q origin fix/meet-direct-url-diagnostic-20261122
+            script=$(mktemp /tmp/qa-direct-five.XXXXXXXX.js)
+            trap 'rm -f "$script"' EXIT
+            git show "${{ github.sha }}:tests/qa_all_five_direct_meet_room_preflight.js" > "$script"
+            chmod 644 "$script"
+            docker run --rm --user 0 --network beonmeet-single --memory=550m --cpus=.5 --pids-limit=160 \
+              -e NODE_PATH=/usr/src/app/node_modules \
+              -v "$script:/qa-test.js:ro" \
+              -v "/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json:/qa-existing-links.json:ro" \
+              --entrypoint node beonmeet-worker-audiofix:latest /qa-test.js
+            echo FIVE_MEET_DIRECT_PREFLIGHT_COMPLETE_NO_SIGNIN_CHANGE
+
+# Latest direct-room canary includes per-lane transient navigation retries.
+
+# Verify direct Meet prejoin after original Chrome CDP surgical recovery.
+
+# Require five authenticated Join now pages after local session sync; no guest-mode false positives.

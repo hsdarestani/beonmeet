@@ -1,0 +1,61 @@
+name: Safely recover original BeOnMeet Chrome DevTools connection
+on:
+  push:
+    branches: [fix/meet-direct-url-diagnostic-20261122]
+    paths: [.github/workflows/ops-recover-original-chrome-cdp.yml]
+permissions:
+  contents: read
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate surgical browser tab recovery
+        run: node --check scripts/recover_original_chrome_cdp_tab.js
+      - name: Replace only blocked Google login tab, keep Chrome profile and workers running
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 5m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 100 9
+            python3 - <<'PY'
+            import json,subprocess,urllib.request
+            def g(url):
+                with urllib.request.urlopen(url,timeout=7) as r:return json.load(r)
+            h=g('http://127.0.0.1:8109/health')
+            assert h.get('ok')
+            for key in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'):
+                assert int(h.get(key) or 0)==0,'User jobs present'
+            for p in (9124,9126,9132,9133,9134,9135):
+                d=g(f'http://127.0.0.1:{p}/capacity');d=d.get('data') or d
+                assert int(d.get('runningJobs') or 0)==0,'Live recording at port '+str(p)
+            for name in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',name],text=True).strip()=='healthy'
+            info=json.loads(subprocess.check_output(['docker','inspect','beonmeet-chrome-single'],text=True))[0]
+            assert info['State']['Running']
+            assert len([x for x in info['Mounts'] if x['Destination']=='/tmp/chrome-profile' and x.get('RW')])==1
+            print('CDP_TAB_RECOVERY_SAFETY_IDLE_AND_PROFILE_MOUNT_VERIFIED')
+            PY
+            git fetch -q origin fix/meet-direct-url-diagnostic-20261122
+            tmp=$(mktemp /tmp/repair-chrome-cdp.XXXXXXXX.js)
+            trap 'rm -f "$tmp"' EXIT
+            git show "${{ github.sha }}:scripts/recover_original_chrome_cdp_tab.js" > "$tmp"
+            node --check "$tmp"
+            docker exec -i beonmeet-worker-five node - < "$tmp"
+            python3 - <<'PY'
+            import urllib.request,json,subprocess
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=8) as r:h=json.load(r)
+            assert h.get('ok')
+            for name in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',name],text=True).strip()=='healthy'
+            print('CDP_TAB_RECOVERY_BEONMEET_CAMCAM_UNAFFECTED')
+            PY

@@ -51,8 +51,10 @@ jobs:
           python3 -m py_compile scripts/stage_four_isolated_local_workers.py scripts/cutover_five_isolated_local_workers.py
           node --check tests/five_local_auth_cdp_canary.js
           node --check tests/compare_original_and_cloned_meet_login.js
+          node --check tests/qa_direct_meet_url_status.js
+          node --check tests/qa_all_five_direct_meet_room_preflight.js
+          node --check tests/qa_meet_signin_button_flow.js
           node --check tests/qa_create_five_stable_meet_links.js
-          node --check scripts/propagate_recorder_google_login_on_host.js
           node --check tests/meet_landing_page_privacy_probe.js
           node --check tests/five_staged_chrome_av_smoke.js
           node --check tests/meet_homepage_standby_ui_probe.js
