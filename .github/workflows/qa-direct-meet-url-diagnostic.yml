@@ -45,12 +45,12 @@ jobs:
             git show "${{ github.sha }}:tests/qa_direct_meet_url_status.js" > "$script"
             chmod 644 "$script"
             if [ -s .five-isolated-runtime/qa_meet_links.json ]; then
-              docker run --rm --network beonmeet-single --memory=500m --cpus=.5 --pids-limit=160 \
+              docker run --rm --user 0 --network beonmeet-single --memory=500m --cpus=.5 --pids-limit=160 \
                 -v "$script:/qa-test.js:ro" \
                 -v "/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json:/qa-existing-links.json:ro" \
                 -e NODE_PATH=/usr/src/app/node_modules --entrypoint node beonmeet-worker-audiofix:latest /qa-test.js
             else
-              docker run --rm --network beonmeet-single --memory=500m --cpus=.5 --pids-limit=160 \
+              docker run --rm --user 0 --network beonmeet-single --memory=500m --cpus=.5 --pids-limit=160 \
                 -v "$script:/qa-test.js:ro" \
                 -e NODE_PATH=/usr/src/app/node_modules --entrypoint node beonmeet-worker-audiofix:latest /qa-test.js
             fi
