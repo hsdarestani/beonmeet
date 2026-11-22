@@ -1,5 +1,6 @@
-/* Checks CDP connectivity and Google auth cookie presence without reading values.
- * No new Google Meet rooms are joined and no recordings or user messages are read.
+/* Checks *actual* authenticated Meet navigation in four private Chrome
+ * instances, not merely the presence of stale Google cookie markers.
+ * No meeting creation, recording, user content or credentials.
  */
 'use strict';
 const {chromium}=require('playwright');
@@ -9,10 +10,17 @@ const {chromium}=require('playwright');
   try{
    const c=b.contexts()[0];
    if(!c)throw Error('No persistent Chrome context for lane '+i);
-   const cookies=await c.cookies(['https://accounts.google.com','https://meet.google.com']);
-   const signed=cookies.some(x=>['SID','HSID','SSID','SAPISID','__Secure-1PSID','__Secure-3PSID'].includes(x.name));
-   console.log('FIVE_GOOGLE_LANE_AUTH_COOKIE_MARKER '+i+' '+(signed?'present':'missing')+' count='+cookies.length);
-   if(!signed)process.exitCode=2;
-  }finally{await b.close().catch(()=>{});}
+   const page=await c.newPage();
+   try{
+     await page.goto('https://meet.google.com/?hl=en',{waitUntil:'domcontentloaded',timeout:40000});
+     await page.waitForTimeout(1400);
+     const valid=new URL(page.url()).hostname==='meet.google.com';
+     console.log('FIVE_GOOGLE_LANE_AUTHENTICATED',i,valid);
+     if(!valid)process.exitCode=2;
+   }finally{await page.close().catch(()=>{})}
+  }finally{await b.close().catch(()=>{})}
  }
-})().catch(err=>{console.error('FIVE_GOOGLE_LANE_AUTH_CANARY_FAILED '+err.message);process.exitCode=2;});
+})().catch(err=>{
+ console.error('FIVE_GOOGLE_LANE_AUTH_CANARY_FAILED',err.name);
+ process.exitCode=2;
+});

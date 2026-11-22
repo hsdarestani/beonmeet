@@ -50,6 +50,10 @@ jobs:
           python3 tests/five_local_cutover_policy_test.py
           python3 -m py_compile scripts/stage_four_isolated_local_workers.py scripts/cutover_five_isolated_local_workers.py
           node --check tests/five_local_auth_cdp_canary.js
+          node --check tests/compare_original_and_cloned_meet_login.js
+          node --check tests/qa_create_five_stable_meet_links.js
+          node --check scripts/propagate_recorder_google_login_on_host.js
+          node --check tests/meet_landing_page_privacy_probe.js
           node --check tests/five_staged_chrome_av_smoke.js
           node --check tests/meet_homepage_standby_ui_probe.js
           python3 tests/secure_chrome_login_gateway_test.py
