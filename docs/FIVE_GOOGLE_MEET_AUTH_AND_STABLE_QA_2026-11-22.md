@@ -11,11 +11,21 @@ Direct Chrome probes in the same production browser and every isolated browser d
 - [Five actual room admission test failed, only one recording-started](https://github.com/hsdarestani/beonmeet/actions/runs/45006471901)
 - [Five synthetic 720p/15fps video+audio files passed](https://github.com/hsdarestani/beonmeet/actions/runs/45005936763)
 
+## Confirmed repair of the original Chrome and four cloned Google sessions
+
+The original Chrome DevTools HTTP and raw WebSocket both worked but Playwright CDP attachment timed out while one `accounts.google.com` login-flow tab remained stuck. With all production workers idle, an automated guarded action created a replacement `about:blank` page and closed **only** that blocked tab. It did **not** restart the Chrome container, delete the account profile, or touch CamCam; Playwright immediately reconnected. [Surgical CDP recovery evidence](https://github.com/hsdarestani/beonmeet/actions/runs/45012754247).
+
+The direct-room check then showed that the original authenticated Chrome had **Join now** without Sign in, while cloned browsers 2–5 had **Ask to join** plus Sign in. That discrepancy explains why copying Chrome profile folders had not actually replicated a usable Meet sign-in. [Five-lane before synchronization evidence](https://github.com/hsdarestani/beonmeet/actions/runs/45012847410).
+
+A guarded, **on-host-only** session synchronization then copied the BeOnMeet recorder's existing eligible Google session cookies from the original signed-in Chrome to its four private QA browser profiles through local CDP; no cookie or password values were logged, stored in Git or transmitted off host. All four clones independently verified a signed-in **Join now** Meet state after the transfer, and the original remained signed in. [Five-lane sign-in repair passed](https://github.com/hsdarestani/beonmeet/actions/runs/45013023805).
+
+This verifies the **five browser authentication states**, not concurrent actual media capture or successful deliveries. A separate five-real-room test is still required with host-admitted/controlled sessions and media-file verification.
+
 ## Corrected automated test behavior
 
-`qa-restore-five-google-sessions.yml` has been changed into an **idle-only, credential-neutral direct-room preflight**. It reads five private existing test links from `/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json`, opens each in its isolated Chrome, and requires HTTP 200 with a real Meet room URL and actionable Join/Ask-to-join UI, never a marketing redirect, invalid room or other page.
+`qa-restore-five-google-sessions.yml` has been changed into an **idle-only, credential-neutral direct-room preflight**. It reads five private existing test links from `/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json`, opens each in its isolated Chrome, and requires HTTP 200 with a real Meet room URL, a signed-in **Join now** UI and **no** Sign in prompt, never a marketing redirect, invalid room or other page.
 
-This is **prejoin availability, not a login test, host admission test or recording guarantee**. The workflow no longer copies Google cookies across profiles, alters the owner's login, creates meetings or sends invites. The legacy `meet.google.com/` landing-page auth gate was wrong for this environment.
+This is **actual signed-in Meet prejoin verification in bot-owned private QA rooms**, not evidence of five simultaneous admissions or recordings. The workflow no longer copies Google cookies across profiles, alters the owner's login, creates meetings or sends invites. The legacy `meet.google.com/` landing-page auth gate was wrong for this environment.
 
 ## Why five real sessions failed despite five 720p synthetic successes
 
