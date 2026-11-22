@@ -1,0 +1,60 @@
+name: Inspect compiled Google Meet prejoin control flow (source only)
+on:
+  push:
+    branches: [ops/investigate-user-meet-join-20261122]
+    paths: [.github/workflows/ops-compiled-join-control-flow.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - name: Read approved mounted recorder code near prejoin and CDP context
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 3m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,subprocess,re
+            o=json.loads(subprocess.check_output(['docker','inspect','beonmeet-worker-five'],text=True))[0]
+            paths=[x['Source'] for x in o['Mounts'] if x['Destination']=='/usr/src/app/dist/bots/GoogleMeetBot.js']
+            if len(paths)!=1:raise SystemExit('No single approved compiled source mount')
+            src=open(paths[0],encoding='utf8').read()
+            probes=[
+                'Guest pre-join detected',
+                'Waiting for Google Meet pre-join controls',
+                'Redirected away from the meeting',
+                'Success clicked using',
+                'Retrying anonymous Google Meet join request',
+                'connectOverCDP',
+                'browser.newContext',
+                '.contexts()',
+                'newPage()',
+                'Join now',
+                'Ask to join',
+                'continueWithout',
+                'Google Meet guest join request was not accepted'
+            ]
+            print('SOURCE_JOIN_TOTAL_CHARS',len(src))
+            for phrase in probes:
+                hits=list(re.finditer(re.escape(phrase),src,re.I))
+                print('SOURCE_JOIN_HITS',phrase,len(hits))
+                for k,m in enumerate(hits[:2]):
+                    before=450 if phrase in ('Guest pre-join detected','Redirected away from the meeting','Retrying anonymous Google Meet join request','connectOverCDP','browser.newContext','.contexts()','newPage()') else 210
+                    after=1600 if phrase in ('Guest pre-join detected','Redirected away from the meeting','Retrying anonymous Google Meet join request','connectOverCDP','browser.newContext','.contexts()') else 900
+                    snippet=src[max(0,m.start()-before):min(len(src),m.end()+after)]
+                    # Only static source; redact uncommon literals resembling usernames, urls or tokens.
+                    snippet=re.sub(r'https?://[^\s\x22\x27<>]+','[SOURCE_URL]',snippet)
+                    snippet=re.sub(r'\b[a-z]{3}-[a-z]{4}-[a-z]{3}\b','[SOURCE_MEET]',snippet,flags=re.I)
+                    snippet=re.sub(r'[\w.+-]+@[\w.-]+','[SOURCE_EMAIL]',snippet)
+                    print('SOURCE_JOIN_SNIPPET',phrase,k,'\n'+snippet[:1750])
+            print('SOURCE_JOIN_DONE')
+            PY
