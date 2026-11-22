@@ -60,7 +60,7 @@ function errCategory(e){
     });
     const final=where(p.url());
     console.log('MEET_QA_LANE_PREFLIGHT',JSON.stringify({lane,attempt,final,status:res?.status()||0,visited,ui}));
-    ready=final==='room'&&res?.status()===200&&!ui.expired&&(ui.joinNow||ui.askToJoin||ui.leaveCall);
+    ready=final==='room'&&res?.status()===200&&!ui.expired&&ui.joinNow&&!ui.signIn;
     if(!ready)console.log('MEET_QA_LANE_PREJOIN_NOT_READY',lane);
    }catch(e){
     console.log('MEET_QA_LANE_TRANSIENT',JSON.stringify({lane,attempt,stage:step,type:e.name,category:errCategory(e)}));
@@ -73,5 +73,5 @@ function errCategory(e){
   if(!ready)failed.push(lane);
  }
  if(failed.length)throw Error('one-or-more-lanes-not-ready');
- console.log('FIVE_PRIVATE_GOOGLE_MEET_PREJOIN_OK_NO_HOST_ADMISSION_PROOF');
+ console.log('FIVE_PRIVATE_GOOGLE_MEET_SIGNED_IN_JOIN_NOW_PASS');
 })().catch(e=>{console.log('MEET_QA_LANE_PREFLIGHT_FAILED',e.code||e.name);process.exitCode=2});
