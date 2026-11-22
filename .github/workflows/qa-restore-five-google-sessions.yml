@@ -57,3 +57,5 @@ jobs:
             echo FIVE_MEET_DIRECT_PREFLIGHT_COMPLETE_NO_SIGNIN_CHANGE
 
 # Latest direct-room canary includes per-lane transient navigation retries.
+
+# Verify direct Meet prejoin after original Chrome CDP surgical recovery.
