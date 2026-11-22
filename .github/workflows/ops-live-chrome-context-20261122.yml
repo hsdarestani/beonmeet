@@ -1,0 +1,56 @@
+name: Read live Chrome page categories and recorder browser context (read only)
+on:
+  push:
+    branches: [ops/investigate-user-meet-join-20261122]
+    paths: [.github/workflows/ops-live-chrome-context-20261122.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Inspect CDP targets, worker CDP configuration, browser selection code
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 4m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import subprocess,json,re,urllib.request
+            for worker in ('beonmeet-worker-five','beonmeet-worker-single'):
+                j=json.loads(subprocess.check_output(['docker','inspect',worker],text=True))[0]
+                env=dict(x.split('=',1) for x in j['Config']['Env'] if '=' in x)
+                raw=env.get('GOOGLE_CHROME_CDP_URL') or ''
+                import urllib.parse
+                p=urllib.parse.urlparse(raw)
+                print('CURRENT_BROWSER_WORKER_CDP',worker,p.hostname,p.port)
+            for host in ('beonmeet-chrome-single','beonmeet-isolated-chrome-2'):
+                cmd=['docker','exec','beonmeet-worker-five','node','-e',
+                 'fetch("http://'+host+':9223/json/list").then(r=>r.json()).then(d=>console.log(JSON.stringify(d.filter(x=>x.type==="page").map(x=>({type:x.type,url:x.url}))))).catch(e=>console.log(JSON.stringify({error:e.name})))']
+                p=subprocess.run(cmd,capture_output=True,text=True,timeout=9)
+                try:pages=json.loads(p.stdout.strip().splitlines()[-1])
+                except Exception:pages=[]
+                for page in pages if isinstance(pages,list) else []:
+                    from urllib.parse import urlparse
+                    u=urlparse(page.get('url') or '')
+                    category='meet-room' if u.hostname=='meet.google.com' and re.fullmatch('/[a-z]{3}-[a-z]{4}-[a-z]{3}',u.path) else ('google-auth' if u.hostname=='accounts.google.com' else ('google-account' if u.hostname=='myaccount.google.com' else ('other' if u.hostname else 'blank')))
+                    print('CURRENT_BROWSER_TARGET',host,category)
+            j=json.loads(subprocess.check_output(['docker','inspect','beonmeet-worker-five'],text=True))[0]
+            src=next(m['Source'] for m in j['Mounts'] if m['Destination']=='/usr/src/app/dist/bots/GoogleMeetBot.js')
+            s=open(src,encoding='utf8').read()
+            for phrase in ['const nameInputSelector','nameInputSelector =','Guest pre-join detected','await this.page.goto(url','this.page.goto(url','externalBrowser','_browser','this.page =']:
+                hits=[m.start() for m in re.finditer(re.escape(phrase),s,re.I)]
+                print('CURRENT_BROWSER_SOURCE_MATCH',phrase,len(hits))
+                for pos in hits[:1]:
+                    snippet=s[max(0,pos-650):min(len(s),pos+900)]
+                    snippet=re.sub('https?://[^\\s\\x22\\x27<>]+','[URL]',snippet)
+                    print('CURRENT_BROWSER_SOURCE',phrase,'\n'+snippet)
+            print('CURRENT_BROWSER_AUDIT_COMPLETE')
+            PY
