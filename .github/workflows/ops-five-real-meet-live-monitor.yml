@@ -1,0 +1,44 @@
+name: Live five-real-Meet private QA status (read-only)
+on:
+  push:
+    branches: [feat/five-isolated-local-recorders-20261122]
+    paths: [.github/workflows/ops-five-real-meet-live-monitor.yml]
+permissions:
+  contents: read
+jobs:
+  monitor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - name: Read five QA running jobs and start callbacks without personal data
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 2m
+          script: |
+            set -eu
+            python3 - <<'PY'
+            import json,urllib.request,datetime,os
+            from pathlib import Path
+            def g(port,path):
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/{path}',timeout=6) as r:return json.load(r)
+            print('FIVE_REAL_MONITOR_TIME',datetime.datetime.now(datetime.timezone.utc).isoformat())
+            try:
+                s=g(9192,'health')
+                print('FIVE_REAL_MONITOR_SINK',{'ok':s.get('ok'),'started_count':len(s.get('started') or []),'waiting_count':len(s.get('waiting') or []),'uploaded_count':len(s.get('uploaded') or [])})
+            except Exception as e:print('FIVE_REAL_MONITOR_SINK_ERROR',type(e).__name__)
+            for port in range(9142,9147):
+                try:
+                    d=g(port,'capacity');d=d.get('data') or d
+                    print('FIVE_REAL_MONITOR_WORKER',port,{'runningJobs':d.get('runningJobs'),'availableSlots':d.get('availableSlots')})
+                except Exception as e:print('FIVE_REAL_MONITOR_WORKER',port,'not running',type(e).__name__)
+            h=g(8109,'health')
+            print('FIVE_REAL_MONITOR_PRODUCTION',{'ok':h.get('ok'),'free_queue':h.get('free_queue'),'premium_queue':h.get('premium_queue'),'active_deliveries':h.get('active_delivery_jobs')})
+            m=int(next(a.split()[1] for a in Path('/proc/meminfo').read_text().splitlines() if a.startswith('MemAvailable:')))
+            print('FIVE_REAL_MONITOR_RAM_AVAILABLE_MB',round(m/1024))
+            print('FIVE_REAL_MONITOR_LOAD',Path('/proc/loadavg').read_text().split()[:3])
+            PY
