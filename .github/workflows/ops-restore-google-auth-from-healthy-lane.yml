@@ -55,3 +55,5 @@ jobs:
               -v "/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json:/qa-existing-links.json:ro" \
               --entrypoint node beonmeet-worker-audiofix:latest /run.js
             echo AUTH_RECOVERY_COMPLETE_NO_PRODUCTION_RESTART_OR_ROUTING_CHANGE
+
+# Use the verified Chrome 2 session first; fail closed if no authenticated source survives.
