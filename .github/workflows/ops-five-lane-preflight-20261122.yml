@@ -1,0 +1,93 @@
+name: BeOnMeet five-lane production cutover preflight (read-only)
+on:
+  push:
+    branches: [ops/activate-five-live-recorder-lanes-20261122]
+    paths: [.github/workflows/ops-five-lane-preflight-20261122.yml]
+permissions:
+  contents: read
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate cutover and rollback source
+        run: |
+          python3 -m py_compile scripts/cutover_five_isolated_local_workers.py scripts/rollback_five_isolated_local_workers.py
+          python3 tests/five_local_cutover_policy_test.py
+          node --check tests/qa_all_five_direct_meet_room_preflight.js
+      - name: Audit host worker, controller and login readiness without modifying production
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 8m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo FIVE_CUTOVER_WRONG_HOST;exit 1;; esac
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 70 9
+            python3 - <<'PY'
+            import os,subprocess,json,urllib.request,shutil,datetime
+            from pathlib import Path
+            def g(url):
+                with urllib.request.urlopen(url,timeout=7) as r:return json.load(r)
+            h=g('http://127.0.0.1:8109/health')
+            print('FIVE_CUTOVER_PREFLIGHT_TIME',datetime.datetime.now(datetime.timezone.utc).isoformat())
+            print('FIVE_CUTOVER_PREFLIGHT_CONTROLLER',json.dumps({k:h.get(k) for k in ('ok','free_worker_endpoints','premium_worker_endpoints','max_concurrent_meetings','free_meeting_slots','premium_reserved_slots','free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs','autoscaler_enabled','healthy_free_workers')},default=str))
+            mem=int(next(x.split()[1] for x in Path('/proc/meminfo').read_text().splitlines() if x.startswith('MemAvailable:')))
+            print('FIVE_CUTOVER_PREFLIGHT_RESOURCES',{'cpu':os.cpu_count(),'available_ram_gib':round(mem/1048576,2),'free_root_gib':round(shutil.disk_usage('/').free/1024**3,2),'shm_free_gib':round(shutil.disk_usage('/dev/shm').free/1024**3,2)})
+            config={}
+            for line in Path('.env').read_text().splitlines():
+                if '=' not in line or line.startswith('#'):continue
+                k,v=line.split('=',1)
+                if k in ('FREE_WORKER_URLS','PREMIUM_WORKER_URLS','FREE_MEETING_SLOTS','PREMIUM_MEETING_SLOTS','SHARED_CHROME_MAX_ACTIVE','AUTOSCALE_ENABLED','WHISPER_MODEL'):
+                    config[k]=v
+            print('FIVE_CUTOVER_PREFLIGHT_CONFIG',json.dumps(config))
+            for port in (9124,9126,9132,9133,9134,9135):
+                try:
+                    v=g(f'http://127.0.0.1:{port}/capacity');v=v.get('data') or v
+                    print('FIVE_CUTOVER_PREFLIGHT_CAPACITY',port,{k:v.get(k) for k in ('runningJobs','maxConcurrentJobs','availableSlots')})
+                except Exception as e:
+                    print('FIVE_CUTOVER_PREFLIGHT_CAPACITY_ERROR',port,type(e).__name__)
+                    raise
+            assert Path('.five-isolated-runtime/qa_meet_links.json').is_file()
+            assert h.get('ok')
+            assert int(h.get('max_concurrent_meetings') or 0)==5
+            assert int(h.get('free_worker_endpoints') or 0) in (1,5)
+            assert not any(int(h.get(k) or 0) for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs')), 'Customers have active queued or delivery work'
+            assert os.cpu_count()>=7 and mem>=9*1048576
+            assert shutil.disk_usage('/').free>12*1024**3
+            for n in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                x=subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',n],text=True).strip()
+                print('FIVE_CUTOVER_PREFLIGHT_CAMCAM',n,x)
+                assert x=='healthy'
+            for i in range(2,6):
+                cname=f'beonmeet-isolated-chrome-{i}'
+                wname=f'beonmeet-isolated-worker-{i}'
+                for name in (cname,wname):
+                    assert subprocess.check_output(['docker','inspect','-f','{{.State.Running}}',name],text=True).strip()=='true'
+                env=json.loads(subprocess.check_output(['docker','inspect',wname],text=True))[0]['Config']['Env']
+                d={k:v for k,v in (s.split('=',1) for s in env if '=' in s)}
+                assert d.get('GOOGLE_CHROME_CDP_URL')==f'http://{cname}:9223'
+                assert d.get('MAX_CONCURRENT_MEETINGS')=='1'
+                print('FIVE_CUTOVER_PREFLIGHT_ISOLATED_LANE',i,'distinct_and_one_slot')
+            print('FIVE_CUTOVER_PREFLIGHT_HOST_OK')
+            PY
+            git fetch -q origin ops/activate-five-live-recorder-lanes-20261122
+            SRC=${{ github.sha }}
+            script=$(mktemp /tmp/five-cutover-auth.XXXXXXXX.js)
+            trap 'rm -f "$script"' EXIT
+            git show "$SRC:tests/qa_all_five_direct_meet_room_preflight.js" > "$script"
+            chmod 644 "$script"
+            docker run --rm --user 0 --network beonmeet-single \
+              --memory=500m --cpus=.5 --pids-limit=160 \
+              -e NODE_PATH=/usr/src/app/node_modules \
+              -v "$script:/qa-auth.js:ro" \
+              -v "/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json:/qa-existing-links.json:ro" \
+              --entrypoint node beonmeet-worker-audiofix:latest /qa-auth.js
+            echo FIVE_CUTOVER_PREFLIGHT_ALL_FIVE_AUTHENTICATED_AND_READY
