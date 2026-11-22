@@ -1,0 +1,43 @@
+name: Check original and cloned BeOnMeet Google sign-in status
+on:
+  push:
+    branches: [fix/stable-google-meet-qa-20261122]
+    paths: [.github/workflows/qa-compare-google-profile-login.yml]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+      - run: node --check tests/compare_original_and_cloned_meet_login.js
+      - name: Profile auth / redirect health using temporary pages
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 6m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 120 9
+            python3 - <<'PY'
+            import urllib.request,json
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=7) as r:h=json.load(r)
+            assert h.get('ok')
+            assert all(not int(h.get(k) or 0) for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'))
+            for p in (9126,9132,9133,9134,9135):
+                with urllib.request.urlopen(f'http://127.0.0.1:{p}/capacity',timeout=7) as r:d=json.load(r)
+                assert not int((d.get('data') or d).get('runningJobs') or 0)
+            print('MEET_PROFILE_DIAG_IDLE_PASS')
+            PY
+            git fetch -q origin fix/stable-google-meet-qa-20261122
+            t=$(mktemp /tmp/meet-profile-qa.XXXXXXXX.js)
+            trap 'rm -f "$t"' EXIT
+            git show "${{ github.sha }}:tests/compare_original_and_cloned_meet_login.js" > "$t"
+            docker exec -i beonmeet-worker-five node - < "$t"
