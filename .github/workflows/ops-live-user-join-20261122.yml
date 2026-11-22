@@ -1,0 +1,99 @@
+name: Diagnose live BeOnMeet join failure without exposing meeting data
+on:
+  push:
+    branches: [ops/investigate-user-meet-join-20261122]
+    paths: [.github/workflows/ops-live-user-join-20261122.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Safely inspect live join/recording state, controller logs and Chrome CDP
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 4m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,subprocess,datetime,re,urllib.request,collections,os
+            from pathlib import Path
+            now=datetime.datetime.now(datetime.timezone.utc)
+            print('LIVE_JOIN_AUDIT_UTC',now.isoformat())
+            def request(url):
+                with urllib.request.urlopen(url,timeout=6) as response:return json.load(response)
+            try:
+                h=request('http://127.0.0.1:8109/health')
+                print('LIVE_JOIN_CONTROLLER',json.dumps({k:h.get(k) for k in ('ok','free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs','free_worker_endpoints','premium_worker_endpoints','max_concurrent_meetings','healthy_free_workers')},default=str))
+            except Exception as e:print('LIVE_JOIN_CONTROLLER_ERROR',type(e).__name__)
+            for p in (9124,9126,9132,9133,9134,9135):
+                try:
+                    d=request('http://127.0.0.1:%d/capacity'%p)
+                    d=d.get('data') or d
+                    print('LIVE_JOIN_WORKER',p,{k:d.get(k) for k in ('runningJobs','maxConcurrentJobs','availableSlots')})
+                except Exception as e:print('LIVE_JOIN_WORKER_ERROR',p,type(e).__name__)
+            for name in ('beonmeet-chrome-single','beonmeet-worker-five','beonmeet-isolated-chrome-2','beonmeet-isolated-worker-2'):
+                p=subprocess.run(['docker','inspect','-f','{{.State.Status}}',name],text=True,capture_output=True,timeout=6)
+                print('LIVE_JOIN_CONTAINER',name,p.stdout.strip() if p.returncode==0 else 'absent')
+            for worker in ('beonmeet-worker-five','beonmeet-worker-single','beonmeet-isolated-worker-2','beonmeet-isolated-worker-3','beonmeet-isolated-worker-4','beonmeet-isolated-worker-5'):
+                p=subprocess.run(['docker','logs','--since','95m','--timestamps',worker],capture_output=True,text=True,timeout=15)
+                if p.returncode:continue
+                lines=(p.stdout+'\n'+p.stderr).splitlines()
+                terms={
+                    'JOIN_ACCEPT':r'join request|joining.*meet|starting.*meeting|start.*meeting',
+                    'PREJOIN_FAILED':r'pre.join.*fail|fail.*pre.join|prejoin.*fail|pre.join controls are',
+                    'PREJOIN_SEARCH':r'waiting for google meet pre.join',
+                    'REDIRECTED':r'redirected away from the meeting',
+                    'NAVIGATION_ERROR':r'navigation.*error|net::err|page.goto|navigation.*timeout',
+                    'AUTH':r'login required|sign.in required|account chooser|google auth',
+                    'JOIN_CLICK':r'join now|ask to join|trusted.*click',
+                    'JOIN_CONFIRM':r'joined.*meeting|join.*confirm|meeting joined',
+                    'JOIN_WAIT':r'admission|lobby|waiting.*host|asked to join',
+                    'RECORDER_START':r'recording started|starting recording|recording.started',
+                    'RECORDER_DONE':r'finish.*record|recording uploaded|recording-ready',
+                    'RECORDING_ERROR':r'mediarecorder|codec|recording error|recording fail',
+                    'BROWSER_CLOSED':r'target closed|browser has been closed|cdp disconnect|browser disconnected',
+                    'ERROR':r'\berror\b|\bfailed\b|\bexception\b|\btimeout\b',
+                    'SUCCESS':r'successfully joined|recording started',
+                }
+                counts={k:sum(bool(re.search(v,line,re.I)) for line in lines) for k,v in terms.items()}
+                tagged=[]
+                for line in lines:
+                    cats=[k for k,v in terms.items() if re.search(v,line,re.I)]
+                    if cats:tagged.append({'time':line[:30],'types':cats[:4]})
+                print('LIVE_JOIN_LOG_COUNTS',worker,len(lines),counts)
+                print('LIVE_JOIN_LOG_TIMELINE',worker,json.dumps(tagged[-25:]))
+            p=subprocess.run(['journalctl','-u','beonmeet-controller','--since','95 minutes ago','--no-pager','-o','short-iso'],capture_output=True,text=True,timeout=20)
+            if p.returncode==0:
+                lines=p.stdout.splitlines()
+                rules={
+                    'dispatch_error':r'meeting dispatch error|meeting dispatch rejected',
+                    'capacity_error':r'meeting capacity check error',
+                    'recording_started':r'/internal/recording-started|recording.started',
+                    'telegram_error':r'telegram loop error',
+                    'timeout':r'timeout|timed out',
+                    'start':r'started server process|startup complete',
+                    'join_error':r'join.*failed|join.*error|joining.*timeout',
+                    'upload_error':r'upload.*error|recording.*error',
+                }
+                counts={k:sum(bool(re.search(v,line,re.I)) for line in lines) for k,v in rules.items()}
+                print('LIVE_JOIN_CONTROLLER_LOG_COUNTS',len(lines),counts)
+                markers=[{'time':x[:27],'type':k} for x in lines for k,v in rules.items() if re.search(v,x,re.I)]
+                print('LIVE_JOIN_CONTROLLER_TIMELINE',json.dumps(markers[-30:]))
+            mem=int(next(x.split()[1] for x in Path('/proc/meminfo').read_text().splitlines() if x.startswith('MemAvailable:')))
+            print('LIVE_JOIN_RAM_AVAILABLE_GB',round(mem/1048576,2))
+            print('LIVE_JOIN_LOAD',Path('/proc/loadavg').read_text().split()[:3])
+            for port in (8109,):
+                pass
+            for n in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                p=subprocess.run(['docker','inspect','-f','{{.State.Health.Status}}',n],capture_output=True,text=True,timeout=7)
+                print('LIVE_JOIN_CAMCAM',n,p.stdout.strip() if p.returncode==0 else 'unknown')
+            print('LIVE_JOIN_AUDIT_COMPLETE')
+            PY
