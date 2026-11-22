@@ -61,3 +61,5 @@ jobs:
             print('READINESS_SERVICE',run(['systemctl','is-active','beonmeet-controller'])[1])
             print('READINESS_COMPLETE')
             PY
+
+# Fresh post-power-cycle verification: 2026-11-22 (read-only RAM, vCPU, boot and worker checks).
