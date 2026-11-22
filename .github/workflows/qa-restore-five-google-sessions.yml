@@ -55,3 +55,5 @@ jobs:
               -v "/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json:/qa-existing-links.json:ro" \
               --entrypoint node beonmeet-worker-audiofix:latest /qa-test.js
             echo FIVE_MEET_DIRECT_PREFLIGHT_COMPLETE_NO_SIGNIN_CHANGE
+
+# Latest direct-room canary includes per-lane transient navigation retries.
