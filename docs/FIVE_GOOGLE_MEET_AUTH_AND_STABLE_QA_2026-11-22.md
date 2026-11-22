@@ -1,44 +1,36 @@
-# Google Meet authentication and five-real-room QA (2026-11-22)
+# BeOnMeet — Google Account vs Meet admission: corrected live findings (2026-11-22)
 
-## Root cause (verified live)
-The Google recorder profile is **not currently signed in to Meet**, despite having Google auth-shaped cookies. A browser navigation to `https://meet.google.com/` redirected **both the original production Chrome and each of four isolated Chrome containers** to `workspace.google.com`. A navigation to `https://meet.new/` sent an isolated Chrome to `accounts.google.com` sign-in. The previous cookie-marker health check was a false positive.
+## What was actually verified
 
-Evidence:
-- [Original and four-clone redirect comparison](https://github.com/hsdarestani/beonmeet/actions/runs/45009928100)
-- [Meet landing and instant link diagnosis](https://github.com/hsdarestani/beonmeet/actions/runs/45009805796)
-- [Five-way actual Meet test: only one recording-started](https://github.com/hsdarestani/beonmeet/actions/runs/45006471901)
-- [Safe auth restore readiness test: fails closed with SOURCE_GOOGLE_LOGIN_EXPIRED](https://github.com/hsdarestani/beonmeet/actions/runs/45010394833)
+The owner showed a screenshot of an authenticated Google Account page in the original BeOnMeet Chrome. The earlier conclusion that the browser account had signed out **was not proved and must not be repeated**. A redirect from the bare `meet.google.com/` homepage to the Google Workspace marketing site, by itself, is **not** a valid authentication gate.
 
-`meet.new` creates instant meeting rooms and may be invalid if nobody remains; it is **not** an appropriate five-room acceptance fixture. Use the authenticated Meet UI `New meeting > Create a meeting for later` and ensure participants/hosts can join those rooms legitimately. These are not a substitute for a consented, hosted 60-minute endurance test.
+Direct Chrome probes in the same production browser and every isolated browser demonstrated that the existing private test meeting URLs still load real Google Meet prejoin pages, HTTP 200, with `Ask to join` controls. The test UI also displayed a `Sign in` button, so the probes do not prove that Google Meet itself recognizes the session as authenticated; neither should they be described as a total sign-out. An explicit, hosted room is needed to establish admission and recording.
 
-## Single owner-controlled action to restore Google auth
+- [Original Chrome, account and direct meeting URL comparison](https://github.com/hsdarestani/beonmeet/actions/runs/45011465274)
+- [Five independent Chrome prejoin pages (all five 200; Ask to join)](https://github.com/hsdarestani/beonmeet/actions/runs/45011580972)
+- [Five actual room admission test failed, only one recording-started](https://github.com/hsdarestani/beonmeet/actions/runs/45006471901)
+- [Five synthetic 720p/15fps video+audio files passed](https://github.com/hsdarestani/beonmeet/actions/runs/45005936763)
 
-The VPS has a noVNC browser UI bound to **localhost only** on TCP 6081. It was verified as available with HTTP 200, and it should never be opened publicly without a secure gateway.
+## Corrected automated test behavior
 
-On the owner's Windows terminal:
+`qa-restore-five-google-sessions.yml` has been changed into an **idle-only, credential-neutral direct-room preflight**. It reads five private existing test links from `/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json`, opens each in its isolated Chrome, and requires HTTP 200 with a real Meet room URL and actionable Join/Ask-to-join UI, never a marketing redirect, invalid room or other page.
 
-```powershell
-ssh -p 9011 -L 6081:127.0.0.1:6081 root@143.20.60.195
-```
+This is **prejoin availability, not a login test, host admission test or recording guarantee**. The workflow no longer copies Google cookies across profiles, alters the owner's login, creates meetings or sends invites. The legacy `meet.google.com/` landing-page auth gate was wrong for this environment.
 
-Leave that SSH tunnel running. On the **owner's computer only** open:
+## Why five real sessions failed despite five 720p synthetic successes
 
-`http://localhost:6081/vnc.html?autoconnect=true`
+Five Worker processes and five CDPs ran simultaneously, with plenty of RAM; however, only one of five real Meet tests emitted a `recording-started` callback. Several other rooms remained at the `Ask to join` / prejoin stage, and the original QA fixture created temporary `meet.new` rooms then closed the page that created them. There were **no five consenting live hosts present to admit the recorders**, so it is not a valid five-room acceptance test. The precise cause of each Google redirect/timeout remains unproven.
 
-In the visible original recorder Chrome, sign in to the authorized BeOnMeet Google account. Complete any verification/challenge; never disclose the Google password, recovery codes, or 2FA tokens in ChatGPT, GitHub Actions, Telegram or logs.
+One earlier real-room canary delivered a tiny 159,488-byte file after around four minutes; its audio/video validity is **still unverified**. Never interpret upload success as a valid recording.
 
-After confirming `meet.google.com` opens rather than redirecting to Google Workspace, rerun the **failed** GitHub job for workflow `qa-restore-five-google-sessions.yml` (or start a new deployment job on the approved branch if needed). It will:
-1. Refuse unless BeOnMeet and CamCam are healthy and no live jobs/queues/deliveries exist.
-2. Confirm original Chrome actually reaches authenticated Meet, and propagate valid Google cookies **inside this VPS only**, without logging credential values, to the four protected Chrome profiles.
-3. Confirm each isolated Chrome can navigate to authenticated Meet. Fail closed otherwise.
-4. Create five unique, private "Create for later" meeting links, never send invitations, and store them only as mode-0600 `/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json`.
-5. Do NOT alter controller routing, subscription credits, Telegram messages or customer files.
+## Remaining acceptance gate
 
-Then rerun five-room real Meet join acceptance with qualified/consenting hosts and evaluate AV files. Only cut over `FREE_WORKER_URLS` and `PREMIUM_WORKER_URLS` after five real independent 60-minute recording **and** delivery validations pass.
+Create five independent meetings with organizers actually present and able to admit the recorder, preferably using non-ephemeral invitations. Then:
+1. Verify each Worker can join the room and obtain genuine in-call controls.
+2. Confirm five distinct `recording-started` callbacks and five simultaneous real media sessions.
+3. Run five separate, consented 60-minute sessions with audio/video from other participants and confirm five fully playable, correctly isolated recordings, five deliveries and correct billing.
+4. Observe Chrome CPU, memory, WebRTC, CamCam, recording temp disk and recovery throughout.
 
-## Guardrails
+Until then, keep live BeOnMeet production routing on the original serialized one-room path. Five standby Chrome/Worker pairs remain staged; no promise of five simultaneous real recordings is justified yet.
 
-- Original controller retains one real Meet session at a time until real acceptance. The five independent Chrome+worker lanes stay staged, and CamCam is untouched.
-- The previous test's five successful synthetic 720p AV files do not prove Meet admission or robust recording of actual people.
-- The previous real-room test emitted a 159,488-byte file for about four minutes; actual stream content and durations remained unverified. An empty/closed host room may yield static/near-empty media. Do not sell five guaranteed sessions based on upload callbacks alone.
-- No Google credentials are stored in code, CI logs, documents or chat. The temporary SSH tunnel does not expose the browser VNC port on the internet.
+No Google password or tokens should be entered into GitHub Actions, scripts or chat. The owner does **not** need to reauthenticate solely because of the Google Workspace landing-page redirect.
