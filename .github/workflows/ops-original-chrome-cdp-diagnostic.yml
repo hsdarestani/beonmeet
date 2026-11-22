@@ -1,0 +1,60 @@
+name: Inspect original Chrome CDP health without restarting BeOnMeet
+on:
+  push:
+    branches: [fix/meet-direct-url-diagnostic-20261122]
+    paths: [.github/workflows/ops-original-chrome-cdp-diagnostic.yml]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Inspect browser health, Chrome debugger connectivity and active jobs
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 4m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import subprocess,json,datetime,urllib.request
+            print('ORIGINAL_CDP_DIAG_UTC',datetime.datetime.now(datetime.timezone.utc).isoformat())
+            def g(url):
+                with urllib.request.urlopen(url,timeout=5) as r:return json.load(r)
+            h=g('http://127.0.0.1:8109/health')
+            print('ORIGINAL_CDP_CONTROLLER',{'ok':h.get('ok'),'queue':{k:h.get(k) for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs')}})
+            for p in (9124,9126,9132,9133,9134,9135):
+                try:
+                    d=g(f'http://127.0.0.1:{p}/capacity');d=d.get('data') or d
+                    print('ORIGINAL_CDP_WORKER',p,'running',d.get('runningJobs'))
+                except Exception as e:print('ORIGINAL_CDP_WORKER',p,'error',type(e).__name__)
+            for name in ('beonmeet-chrome-single','beonmeet-isolated-chrome-2','beonmeet-worker-five'):
+                p=subprocess.run(['docker','inspect','-f','{{.State.Status}}',name],capture_output=True,text=True,timeout=6)
+                print('ORIGINAL_CDP_DOCKER',name,p.stdout.strip() if p.returncode==0 else 'not-found')
+                p=subprocess.run(['docker','stats','--no-stream','--format','{{.CPUPerc}} {{.MemUsage}}',name],capture_output=True,text=True,timeout=10)
+                print('ORIGINAL_CDP_STATS',name,p.stdout.strip()[:90] if p.returncode==0 else 'unknown')
+            PY
+            docker exec -i beonmeet-worker-five node - <<'JS'
+            const {chromium}=require('playwright');
+            (async()=>{
+              for(const host of ['beonmeet-chrome-single','beonmeet-isolated-chrome-2']){
+                let ok=false;
+                try{
+                  const response=await fetch('http://'+host+':9223/json/version',{signal:AbortSignal.timeout(5500)});
+                  const d=await response.json();
+                  console.log('ORIGINAL_CDP_HTTP',host,response.status,!!d.webSocketDebuggerUrl);
+                }catch(e){console.log('ORIGINAL_CDP_HTTP_ERROR',host,e.name)}
+                try{
+                  const b=await chromium.connectOverCDP('http://'+host+':9223',{timeout:8500});
+                  console.log('ORIGINAL_CDP_PLAYWRIGHT',host,'connected',b.contexts().length);
+                  await b.close().catch(()=>{});
+                }catch(e){console.log('ORIGINAL_CDP_PLAYWRIGHT',host,'failed',e.name)}
+              }
+            })().catch(e=>console.log('ORIGINAL_CDP_FATAL',e.name));
+            JS
