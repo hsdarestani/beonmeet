@@ -1,0 +1,60 @@
+name: BeOnMeet original Chrome CDP target-count and websocket diagnosis
+on:
+  push:
+    branches: [fix/meet-direct-url-diagnostic-20261122]
+    paths: [.github/workflows/ops-chrome-target-count.yml]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Read-only probe for orphaned targets and raw DevTools browser websocket
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 3m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,subprocess,shutil
+            info=json.loads(subprocess.check_output(['docker','inspect','beonmeet-chrome-single'],text=True))[0]
+            matches=[m for m in info['Mounts'] if m['Destination']=='/tmp/chrome-profile']
+            print('CDP_RECOVERY_ORIGINAL_PROFILE_VOLUME',len(matches)==1,'rw',matches[0].get('RW') if matches else None)
+            print('CDP_RECOVERY_DISK_FREE_GB',round(shutil.disk_usage('/').free/1024**3,1))
+            PY
+            docker exec -i beonmeet-worker-five node - <<'JS'
+            (async()=>{
+              for(const host of ['beonmeet-chrome-single','beonmeet-isolated-chrome-2']){
+                try{
+                  const x=await fetch('http://'+host+':9223/json/list',{signal:AbortSignal.timeout(5000)});
+                  const targets=await x.json();
+                  const counts={};
+                  for(const t of targets)counts[t.type]=(counts[t.type]||0)+1;
+                  console.log('CDP_RECOVERY_TARGET_COUNTS',host,targets.length,JSON.stringify(counts));
+                }catch(e){console.log('CDP_RECOVERY_TARGET_ERROR',host,e.name)}
+                try{
+                  const response=await fetch('http://'+host+':9223/json/version',{signal:AbortSignal.timeout(5000)});
+                  const data=await response.json();
+                  const WS=require('ws');
+                  const sock=new WS(data.webSocketDebuggerUrl,{handshakeTimeout:5000});
+                  const result=await new Promise(resolve=>{
+                    const timer=setTimeout(()=>{sock.terminate();resolve('no-reply')},5500);
+                    sock.on('open',()=>sock.send(JSON.stringify({id:1,method:'Browser.getVersion'})));
+                    sock.on('message',msg=>{try{
+                      const d=JSON.parse(msg.toString());
+                      if(d.id===1){clearTimeout(timer);sock.close();resolve(d.result?.product?'replied':'invalid-reply')}
+                    }catch(e){}});
+                    sock.on('error',()=>{clearTimeout(timer);resolve('websocket-error')});
+                  });
+                  console.log('CDP_RECOVERY_RAW_WS',host,result);
+                }catch(e){console.log('CDP_RECOVERY_RAW_WS_ERROR',host,e.name)}
+              }
+            })().catch(e=>console.log('CDP_RECOVERY_PROBE_FATAL',e.name));
+            JS
