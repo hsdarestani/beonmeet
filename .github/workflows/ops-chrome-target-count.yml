@@ -38,6 +38,8 @@ jobs:
                   const counts={};
                   for(const t of targets)counts[t.type]=(counts[t.type]||0)+1;
                   console.log('CDP_RECOVERY_TARGET_COUNTS',host,targets.length,JSON.stringify(counts));
+                  const pageHosts=targets.filter(t=>t.type==='page').map(t=>{try{return new URL(t.url).hostname||'internal'}catch{return 'internal'}});
+                  console.log('CDP_RECOVERY_PAGE_HOSTS',host,JSON.stringify(pageHosts));
                 }catch(e){console.log('CDP_RECOVERY_TARGET_ERROR',host,e.name)}
                 try{
                   const response=await fetch('http://'+host+':9223/json/version',{signal:AbortSignal.timeout(5000)});
