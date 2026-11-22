@@ -1,0 +1,145 @@
+name: QA five isolated 480p AV browsers on upgraded VPS
+on:
+  push:
+    branches: [feat/five-isolated-local-recorders-20261122]
+    paths: [.github/workflows/qa-five-staged-480p-av.yml]
+permissions:
+  contents: read
+jobs:
+  qa:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 17
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate original five-browser test syntax
+        run: node --check tests/five_staged_chrome_av_smoke.js
+      - name: Test five independent Chrome captures, protect production and CamCam
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 15m
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_HOST;exit 1;; esac
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 90 9
+            test -d .five-isolated-runtime
+            QA_DIR=$(mktemp -d /opt/beonmeet/.five-isolated-qa.XXXXXXXX)
+            TEST_PID=""
+            QA_NAME=beonmeet-isolated-chrome-qa
+            cleanup() {
+              if [ -n "$TEST_PID" ];then
+                touch "$QA_DIR/beonmeet-five-isolated-abort-20261122" || true
+                docker rm -f beonmeet-isolated-qa-runner >/dev/null 2>&1 || true
+                wait "$TEST_PID" >/dev/null 2>&1 || true
+              fi
+              docker rm -f "$QA_NAME" >/dev/null 2>&1 || true
+              rm -rf "$QA_DIR"
+            }
+            trap cleanup EXIT
+            python3 - <<'PY'
+            import json,urllib.request,shutil,subprocess
+            def g(p):
+                with urllib.request.urlopen(p,timeout=6) as r:return json.load(r)
+            h=g('http://127.0.0.1:8109/health')
+            assert h.get('ok')
+            assert all(int(h.get(k) or 0)==0 for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'))
+            for port in (9124,9126,9132,9133,9134,9135):
+                data=g(f'http://127.0.0.1:{port}/capacity');data=data.get('data') or data
+                assert int(data.get('runningJobs') or 0)==0
+            assert shutil.disk_usage('/').free>15*1024**3
+            for c in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',c],text=True).strip()=='healthy'
+            print('FIVE_480P_QA_SAFETY_IDLE_OK')
+            PY
+            if docker ps -a --format '{{.Names}}' | grep -Fxq "$QA_NAME";then echo QA_BROWSER_NAME_CONFLICT;exit 1;fi
+            SHA=${{ github.sha }}
+            git fetch -q origin feat/five-isolated-local-recorders-20261122
+            git show "$SHA:tests/five_staged_chrome_av_smoke.js" > "$QA_DIR/test.js"
+            node --check "$QA_DIR/test.js"
+            docker run -d --name "$QA_NAME" --network beonmeet-single \
+              --memory=1250m --memory-swap=1450m --cpus=1.15 --pids-limit=350 --shm-size=256m \
+              -e CHROME_WINDOW_SIZE=854,480 beonmeet-chrome-cdp:latest >/dev/null
+            ready=0
+            for i in $(seq 1 35);do
+              if docker exec "$QA_NAME" curl -fsS --max-time 3 http://127.0.0.1:9223/json/version >/dev/null 2>&1;then ready=1;break;fi
+              sleep 2
+            done
+            test "$ready" = 1 || { echo QA_BROWSER_NOT_READY;exit 1; }
+            echo FIVE_480P_QA_FIFTH_ISOLATED_BROWSER_READY
+            docker run --rm --name beonmeet-isolated-qa-runner --network beonmeet-single \
+              --memory=1000m --memory-swap=1200m --cpus=1.3 --pids-limit=220 \
+              --entrypoint node -e QA_SECONDS=360 -e QA_WIDTH=854 -e QA_HEIGHT=480 \
+              -e QA_FPS=10 -e QA_VIDEO_BPS=650000 -e QA_AUDIO_BPS=96000 \
+              -e QA_OUTDIR=/tmp/beonmeet-five-isolated-20261122 \
+              -v "$QA_DIR:/tmp" \
+              -i beonmeet-worker-audiofix:latest - < "$QA_DIR/test.js" > "$QA_DIR/test.log" 2>&1 &
+            TEST_PID=$!
+            FAILURE=0
+            for i in $(seq 1 47);do
+              if ! kill -0 "$TEST_PID" 2>/dev/null;then break;fi
+              mem=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+              load=$(cut -d' ' -f1 /proc/loadavg)
+              echo "FIVE_480P_RESOURCE_SAMPLE round=$i mem_available_mb=$((mem/1024)) load_1m=$load"
+              if [ "$mem" -lt 6500000 ];then
+                echo FIVE_480P_ABORT_LOW_RAM
+                FAILURE=1
+              fi
+              if ! python3 - <<'PY'
+            import json,subprocess,urllib.request
+            def g(x):
+                with urllib.request.urlopen(x,timeout=5) as r:return json.load(r)
+            h=g('http://127.0.0.1:8109/health')
+            assert h.get('ok')
+            assert all(int(h.get(k) or 0)==0 for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'))
+            for port in (9124,9126,9132,9133,9134,9135):
+                d=g(f'http://127.0.0.1:{port}/capacity');d=d.get('data') or d
+                assert int(d.get('runningJobs') or 0)==0
+            for name in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',name],text=True).strip()=='healthy'
+            PY
+              then
+                echo FIVE_480P_ABORT_CUSTOMER_WORK_OR_SERVICE_HEALTH
+                FAILURE=1
+              fi
+              if [ "$FAILURE" = 1 ];then
+                touch "$QA_DIR/beonmeet-five-isolated-abort-20261122"
+                break
+              fi
+              sleep 10
+            done
+            STATUS=0
+            wait "$TEST_PID" || STATUS=$?
+            TEST_PID=""
+            grep -E 'QA_AV_START|QA_ALL_FIVE_RECORDERS_STARTED|QA_RECORDER_INTERNAL_META|QA_AV_RESULTS|QA_FIVE_|QA_PROGRESS_ERROR' "$QA_DIR/test.log" | tail -n 20 || true
+            [ "$FAILURE" = 0 ] || { echo FIVE_480P_FAILED_SAFETY_ABORT;exit 1; }
+            [ "$STATUS" = 0 ] || { echo "FIVE_480P_QA_EXIT_$STATUS";tail -n 30 "$QA_DIR/test.log";exit 1; }
+            grep -q QA_FIVE_STAGED_CHROME_AV_STREAMS_PASS "$QA_DIR/test.log"
+            export QA_DIR
+            python3 - <<'PY'
+            import array,math,os,subprocess,json
+            from pathlib import Path
+            p=Path(os.environ['QA_DIR'])/'beonmeet-five-isolated-20261122'
+            tones=[220,330,440,550,660]
+            for i,freq in enumerate(tones,1):
+                f=p/f'stream-{i}.webm'
+                assert f.is_file() and f.stat().st_size>700000
+                meta=json.loads(subprocess.check_output(['ffprobe','-v','error','-show_streams','-of','json',str(f)],timeout=25))
+                assert {'audio','video'}<= {s['codec_type'] for s in meta['streams']}
+                wav=subprocess.check_output(['ffmpeg','-nostdin','-loglevel','error','-ss','8','-i',str(f),'-t','2','-vn','-ar','8000','-ac','1','-f','s16le','pipe:1'],timeout=25)
+                pcm=array.array('h');pcm.frombytes(wav)
+                def power(hz):
+                    co=2*math.cos(2*math.pi*hz/8000);a=b=0
+                    for v in pcm:a,b=v+co*a-b,a
+                    return a*a+b*b-co*a*b
+                strongest=tones[max(range(5),key=lambda x:power(tones[x]))]
+                assert strongest==freq,(i,strongest)
+                print('FIVE_480P_VIDEO_AUDIO_FILE_VERIFIED',i,f.stat().st_size,'audio_hz',strongest)
+            print('FIVE_480P_FIVE_ISOLATED_AUDIO_VIDEO_OUTPUTS_PASS')
+            PY
+            echo FIVE_480P_SIX_MINUTES_TEST_PASSED_WITHOUT_PRODUCTION_IMPACT
