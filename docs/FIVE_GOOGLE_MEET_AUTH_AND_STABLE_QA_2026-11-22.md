@@ -21,6 +21,14 @@ A guarded, **on-host-only** session synchronization then copied the BeOnMeet rec
 
 This verifies the **five browser authentication states**, not concurrent actual media capture or successful deliveries. A separate five-real-room test is still required with host-admitted/controlled sessions and media-file verification.
 
+## Five genuine concurrent Google Meet recording-start events now proved
+
+After the repaired source Chrome's signed-in session was synchronized locally to the four isolated browsers, the existing five-room QA was rerun with five independently bound, one-job recorder workers plus one temporary fifth QA profile. Five distinct private Meet rooms accepted jobs, **all five issued actual `recording-started` callbacks**, and all five reported running jobs for **at least 60 consecutive seconds**. No customer billing/Telegram callbacks were invoked and the main BeOnMeet/CamCam services stayed healthy. [Successful five-real-room test](https://github.com/hsdarestani/beonmeet/actions/runs/45006471901).
+
+A separate, more stringent after-test preflight verified all five permanent Chrome lanes showed **Join now** with **no** Sign in prompt. [Five authenticated Chrome recheck](https://github.com/hsdarestani/beonmeet/actions/runs/45013282807).
+
+This is a meaningful real-room admission and simultaneous start test, but **does not validate five 60-minute capture files or delivery**, because the QA worker processes were stopped once the one-minute overlap condition was satisfied. Continue to gate production five-lane cutover on sustained real media/audio, complete file verification and duration.
+
 ## Corrected automated test behavior
 
 `qa-restore-five-google-sessions.yml` has been changed into an **idle-only, credential-neutral direct-room preflight**. It reads five private existing test links from `/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json`, opens each in its isolated Chrome, and requires HTTP 200 with a real Meet room URL, a signed-in **Join now** UI and **no** Sign in prompt, never a marketing redirect, invalid room or other page.
