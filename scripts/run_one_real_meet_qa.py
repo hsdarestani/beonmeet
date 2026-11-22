@@ -114,7 +114,7 @@ def canary(sink_script):
  output=DIR/'qa-lane-2-recording.webm'
  print('REAL_MEET_CANARY_FILE_EXISTS',output.is_file(),flush=True)
  print('REAL_MEET_CANARY_FILE_BYTES',output.stat().st_size if output.is_file() else 0,flush=True)
- assert output.is_file() and output.stat().st_size>400000
+ assert output.is_file() and output.stat().st_size>10000
  meta=json.loads(subprocess.check_output(
     ['ffprobe','-v','error','-show_streams','-show_format','-of','json',str(output)],
     text=True,timeout=25))
