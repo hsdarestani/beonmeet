@@ -1,0 +1,39 @@
+name: QA five real simultaneous Google Meet joins — isolated and nonbillable
+on:
+  push:
+    branches: [feat/five-isolated-local-recorders-20261122]
+    paths: [.github/workflows/qa-five-real-meet-join.yml]
+permissions:
+  contents: read
+jobs:
+  real-five:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 27
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate safety runner and callback counter
+        run: |
+          python3 -m py_compile scripts/run_five_real_meet_join_qa.py
+          node --check tests/five_real_meet_callback_counter.js
+      - name: Five actual Meet rooms in five isolated authenticated QA Chrome instances
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 25m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            git fetch -q origin feat/five-isolated-local-recorders-20261122
+            SHA=${{ github.sha }}
+            script=$(mktemp /tmp/five-real-meet.XXXXXXXX.py)
+            sink=$(mktemp /tmp/five-real-sink.XXXXXXXX.js)
+            trap 'rm -f "$script" "$sink"' EXIT
+            git show "$SHA:scripts/run_five_real_meet_join_qa.py" > "$script"
+            git show "$SHA:tests/five_real_meet_callback_counter.js" > "$sink"
+            chmod 644 "$sink"
+            python3 -m py_compile "$script"
+            python3 "$script" "$sink"
