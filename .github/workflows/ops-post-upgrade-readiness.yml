@@ -1,0 +1,63 @@
+name: BeOnMeet post-upgrade reboot and recorder readiness (read-only)
+on:
+  push:
+    branches: [ops/check-vps-after-upgrade-alt-credential-20261122]
+    paths: [.github/workflows/ops-post-upgrade-readiness.yml]
+permissions:
+  contents: read
+jobs:
+  status:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - name: Inspect host boot, guest resources and recording prerequisites without restarting
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 90s
+          script: |
+            set -eu
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1;; esac
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import os,json,subprocess,urllib.request,datetime
+            from pathlib import Path
+            def run(cmd):
+                p=subprocess.run(cmd,capture_output=True,text=True,timeout=12)
+                return p.returncode,p.stdout.strip()
+            print('READINESS_BOOT_TIME',run(['uptime','-s'])[1])
+            print('READINESS_HOST_UPTIME',Path('/proc/uptime').read_text().split()[0])
+            print('READINESS_KERNEL',run(['uname','-r'])[1])
+            print('READINESS_REBOOT_REQUIRED_FLAG',Path('/var/run/reboot-required').exists())
+            print('READINESS_VCPU',os.cpu_count())
+            mem={}
+            for s in Path('/proc/meminfo').read_text().splitlines():
+                if s.startswith(('MemTotal:','MemAvailable:')):
+                    k,v=s.split(':',1);mem[k]=int(v.split()[0])
+            print('READINESS_RAM_GIB',round(mem['MemTotal']/1048576,2))
+            print('READINESS_AVAILABLE_GIB',round(mem['MemAvailable']/1048576,2))
+            def j(url):
+                with urllib.request.urlopen(url,timeout=6) as r:return json.load(r)
+            h=j('http://127.0.0.1:8109/health')
+            print('READINESS_HEALTH',{k:h.get(k) for k in ('ok','max_concurrent_meetings','free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs','remote_workers','recorder_account_profiles')})
+            for port in (9124,9126):
+                try:
+                    p=j(f'http://127.0.0.1:{port}/capacity')
+                    print('READINESS_WORKER',port,p.get('data') or p)
+                except Exception as e:print('READINESS_WORKER',port,type(e).__name__)
+            for name in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                print('READINESS_CAMCAM',name,run(['docker','inspect','-f','{{.State.Health.Status}}',name])[1])
+            whitelist={'WHISPER_MODEL','RECOVERY_WHISPER_MODEL','WHISPER_CPU_THREADS','SHARED_CHROME_MAX_ACTIVE','FREE_WORKER_URLS','PREMIUM_WORKER_URLS'}
+            env={}
+            for line in Path('.env').read_text().splitlines():
+                if '=' in line and not line.startswith('#'):
+                    k,v=line.split('=',1)
+                    if k in whitelist:env[k]=v
+            print('READINESS_CONFIG',env)
+            print('READINESS_SERVICE',run(['systemctl','is-active','beonmeet-controller'])[1])
+            print('READINESS_COMPLETE')
+            PY
