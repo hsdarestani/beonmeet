@@ -42,7 +42,10 @@ function where(url){
       };
     });
     console.log('MEET_QA_LANE_PREFLIGHT',JSON.stringify({lane,final:where(p.url()),status:res?.status()||0,visited,ui}));
+    if(where(p.url())!=='room'||res?.status()!==200||ui.expired||!([ui.joinNow,ui.askToJoin,ui.leaveCall].some(Boolean)))
+      throw Error('QA_MEET_PREJOIN_NOT_READY_LANE_'+lane);
    }finally{await p.close().catch(()=>{})}
   }finally{await b.close().catch(()=>{})}
  }
+ console.log('FIVE_PRIVATE_GOOGLE_MEET_PREJOIN_OK_NO_HOST_ADMISSION_PROOF');
 })().catch(e=>{console.log('MEET_QA_LANE_PREFLIGHT_FAILED',e.code||e.name);process.exitCode=2});
