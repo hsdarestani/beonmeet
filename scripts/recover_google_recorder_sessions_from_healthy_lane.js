@@ -10,8 +10,9 @@
 const {chromium}=require('playwright'),fs=require('fs');
 const fixture=JSON.parse(fs.readFileSync('/qa-existing-links.json','utf8')).links;
 const lanes=[
+ {id:2,host:'beonmeet-isolated-chrome-2',url:fixture[1]},
  {id:1,host:'beonmeet-chrome-single',url:fixture[0]},
- ...[2,3,4,5].map(n=>({id:n,host:'beonmeet-isolated-chrome-'+n,url:fixture[n-1]}))
+ ...[3,4,5].map(n=>({id:n,host:'beonmeet-isolated-chrome-'+n,url:fixture[n-1]}))
 ];
 async function connect(host){return chromium.connectOverCDP('http://'+host+':9223',{timeout:16000})}
 async function meetStatus(ctx,url){
@@ -37,11 +38,17 @@ async function meetStatus(ctx,url){
  if(fixture.length!==5||new Set(fixture).size!==5)throw Error('Private QA fixture unavailable');
  const status=[];
  for(const lane of lanes){
-  const b=await connect(lane.host);
+  let b;
   try{
+   b=await connect(lane.host);
    const c=b.contexts()[0];if(!c)throw Error('No persistent Chrome context');
-   status.push({id:lane.id,ready:await meetStatus(c,lane.url)});
-  }finally{await b.close().catch(()=>{})}
+   const ready=await meetStatus(c,lane.url);
+   status.push({id:lane.id,ready});
+   console.log('RECORDER_AUTH_SCAN_LANE',lane.id,ready);
+  }catch(e){
+   status.push({id:lane.id,ready:false});
+   console.log('RECORDER_AUTH_SCAN_LANE',lane.id,'unavailable',e.name);
+  }finally{if(b)await b.close().catch(()=>{})}
  }
  console.log('RECORDER_AUTH_READINESS_BEFORE',JSON.stringify(status));
  let source=null;
