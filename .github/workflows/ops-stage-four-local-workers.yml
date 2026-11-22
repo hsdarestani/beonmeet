@@ -1,0 +1,37 @@
+name: Stage BeOnMeet independent Chrome/worker lanes on upgraded VPS
+on:
+  push:
+    branches: [feat/five-isolated-local-recorders-20261122]
+    paths: [.github/workflows/ops-stage-four-local-workers.yml]
+permissions:
+  contents: read
+jobs:
+  stage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate staging Python before touching VPS
+        run: |
+          python3 -m py_compile scripts/stage_four_isolated_local_workers.py
+          python3 tests/five_isolated_workers_dispatch_test.py
+      - name: Isolate four standby recording lanes without controller cutover
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 15m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            git fetch -q origin feat/five-isolated-local-recorders-20261122
+            SHA=${{ github.sha }}
+            git cat-file -e "$SHA^{commit}"
+            stage_script=$(mktemp /tmp/beonmeet-5-lanes-stage.XXXXXXXX.py)
+            trap 'rm -f "$stage_script"' EXIT
+            git show "$SHA:scripts/stage_four_isolated_local_workers.py" > "$stage_script"
+            python3 -m py_compile "$stage_script"
+            python3 "$stage_script"
