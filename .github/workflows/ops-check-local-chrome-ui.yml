@@ -1,0 +1,37 @@
+name: BeOnMeet existing local browser UI availability (read-only)
+on:
+  push:
+    branches: [fix/stable-google-meet-qa-20261122]
+    paths: [.github/workflows/ops-check-local-chrome-ui.yml]
+permissions:
+  contents: read
+jobs:
+  status:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - name: Verify browser UI only reachable through SSH port forward
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 2m
+          script: |
+            set -eu
+            python3 - <<'PY'
+            import subprocess,urllib.request,os
+            for url in ("http://127.0.0.1:6081/vnc.html","http://127.0.0.1:6182/vnc.html"):
+                try:
+                    with urllib.request.urlopen(url,timeout=6) as r:
+                        print('CHROME_UI_LOOPBACK',url.split(':')[2].split('/')[0],r.status,r.headers.get('content-type','').split(';')[0])
+                except Exception as e:print('CHROME_UI_LOOPBACK_UNAVAILABLE',url.split(':')[2].split('/')[0],type(e).__name__)
+            p=subprocess.run(['ss','-lnt'],capture_output=True,text=True,timeout=10)
+            for port in (6081,6182):
+                lines=[x for x in p.stdout.splitlines() if ':'+str(port) in x]
+                print('CHROME_UI_PORT',port,'LISTEN' if lines else 'NO_LISTENER',
+                      'LOOPBACK_ONLY' if lines and all('127.0.0.1:' in x for x in lines) else 'VERIFY_BIND')
+            print('CHROME_UI_READ_ONLY_DONE')
+            PY
