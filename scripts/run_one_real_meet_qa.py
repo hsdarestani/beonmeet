@@ -112,12 +112,15 @@ def canary(sink_script):
  assert started,'Google Meet recording never reached started callback'
  assert uploaded,'Google Meet recording not delivered before test timeout'
  output=DIR/'qa-lane-2-recording.webm'
+ print('REAL_MEET_CANARY_FILE_EXISTS',output.is_file(),flush=True)
+ print('REAL_MEET_CANARY_FILE_BYTES',output.stat().st_size if output.is_file() else 0,flush=True)
  assert output.is_file() and output.stat().st_size>400000
  meta=json.loads(subprocess.check_output(
     ['ffprobe','-v','error','-show_streams','-show_format','-of','json',str(output)],
     text=True,timeout=25))
  kinds={s['codec_type'] for s in meta['streams']}
- assert 'audio' in kinds and 'video' in kinds
+ print('REAL_MEET_CANARY_FILE_CODECS',sorted((s['codec_type'],s.get('codec_name')) for s in meta['streams']),flush=True)
+ assert 'audio' in kinds and 'video' in kinds, 'Real Meet file missing audio or video track'
  duration=float(meta['format'].get('duration') or 0)
  assert duration>=30,'Recording too short'
  print('REAL_MEET_CANARY_FILE_VERIFIED',round(duration,1),'seconds',output.stat().st_size,'bytes',flush=True)
