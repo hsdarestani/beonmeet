@@ -1,0 +1,74 @@
+name: BeOnMeet read-only auth diagnosis for four standby Chrome lanes
+on:
+  push:
+    branches: [ops/diagnose-meet-guest-20261124]
+    paths: [.github/workflows/ops-nov24-four-chrome-auth.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - name: Probe signed-in state of idle standby browsers without joining any meeting
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 6m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,urllib.request,subprocess
+            def g(url):
+                with urllib.request.urlopen(url,timeout=7) as r:return json.load(r)
+            h=g('http://127.0.0.1:8109/health')
+            assert h.get('ok')
+            print('NOV24_AUTH_CONTROLLER_ENDPOINTS',h.get('free_worker_endpoints'))
+            for p in (9132,9133,9134,9135):
+                d=g(f'http://127.0.0.1:{p}/capacity');d=d.get('data') or d
+                assert int(d.get('runningJobs') or 0)==0,'Standby browser has active customer recording'
+            for n in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',n],text=True).strip()=='healthy'
+            print('NOV24_AUTH_STANDBY_BROWSERS_IDLE')
+            PY
+            js=$(mktemp /tmp/nov24-auth.XXXXXXXX.js)
+            trap 'rm -f "$js"' EXIT
+            cat > "$js" <<'JS'
+            'use strict';
+            const {chromium}=require('playwright'),fs=require('fs');
+            (async()=>{
+             const links=JSON.parse(fs.readFileSync('/qa-existing-links.json','utf8')).links;
+             if(links.length!==5)throw Error('QA fixture unavailable');
+             for(const i of [2,3,4,5]){
+              let b,p;
+              try{
+               b=await chromium.connectOverCDP('http://beonmeet-isolated-chrome-'+i+':9223',{timeout:13000});
+               const c=b.contexts()[0];
+               if(!c)throw Error('No persistent context');
+               p=await c.newPage();
+               const response=await p.goto(links[i-1],{waitUntil:'domcontentloaded',timeout:35000});
+               await p.waitForTimeout(1500);
+               const u=new URL(p.url());
+               const room=u.hostname==='meet.google.com'&&/^\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(u.pathname);
+               const state=await p.evaluate(()=>{
+                 const bs=[...document.querySelectorAll('button,[role="button"]')].map(x=>String(x.getAttribute('aria-label')||x.textContent||'').trim().toLowerCase());
+                 const has=(...words)=>bs.some(x=>words.some(w=>x.includes(w)));
+                 return {joinNow:has('join now','jetzt teilnehmen'),askToJoin:has('ask to join','teilnahme erbitten'),signIn:has('sign in','anmelden')};
+               });
+               console.log('NOV24_AUTH_LANE',i,JSON.stringify({http:response?.status()||0,validRoom:room,...state}));
+              }catch(e){console.log('NOV24_AUTH_LANE_FAILED',i,e.name)}
+              finally{if(p)await p.close().catch(()=>{});if(b)await b.close().catch(()=>{})}
+             }
+            })().catch(e=>{console.log('NOV24_AUTH_FATAL',e.name);process.exitCode=2});
+            JS
+            chmod 644 "$js"
+            docker run --rm --user 0 --network beonmeet-single --memory=550m --cpus=.5 --pids-limit=160 \
+              -e NODE_PATH=/usr/src/app/node_modules \
+              -v "$js:/qa-auth.js:ro" \
+              -v "/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json:/qa-existing-links.json:ro" \
+              --entrypoint node beonmeet-worker-audiofix:latest /qa-auth.js
