@@ -70,6 +70,8 @@ async def run():
         "PREMIUM_WORKER_URLS":[WORKERS[0]],
         "FREE_WORKER_URLS":WORKERS[1:],
         "SHARED_CHROME_MAX_ACTIVE":1,
+        "WORKER_AUTH_GUARD_ENABLED":False,
+        "_recorder_auth_ready":lambda url: True,
         "shared_chrome_dispatch_lock":asyncio.Lock(),
         "httpx":types.SimpleNamespace(AsyncClient=FakeClient),
         "state":state,
@@ -107,5 +109,22 @@ async def run():
     second=await dispatch(event(8),participant,url(8),True)
     assert first[0] and not second[0] and second[1]
     print("SHARED_CHROME_LIMIT_1_REMAINS_FAIL_CLOSED_PASS")
+
+    # Auth-aware routing must not assign a user to a browser whose Google
+    # session expired even though /health and /capacity still report OK.
+    FakeClient.active={w:0 for w in WORKERS}
+    FakeClient.started=[]
+    env["PREMIUM_WORKER_URLS"]=WORKERS
+    env["FREE_WORKER_URLS"]=WORKERS
+    env["WORKER_AUTH_GUARD_ENABLED"]=True
+    env["_recorder_auth_ready"]=lambda url: url==WORKERS[1]
+    verified=await dispatch(event(9),participant,url(9),True)
+    assert verified[0] and verified[2]=="premium-2",verified
+    assert FakeClient.started[0][0]==WORKERS[1],FakeClient.started
+    blocked=await dispatch(event(10),participant,url(10),True)
+    assert not blocked[0] and blocked[1],blocked
+    assert len(FakeClient.started)==1
+    print("STALE_GOOGLE_AUTH_WORKERS_SKIPPED_AND_QUEUED_PASS")
+
 
 asyncio.run(run())
