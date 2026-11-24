@@ -135,11 +135,16 @@ def main():
           'busy_not_probed',len(PORTS)-len(idle),flush=True)
 
 if __name__=='__main__':
-    with pathlib.Path('/var/lock/pars-vds-bot-deploy.lock').open('a') as lock:
-        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError:
-            print('AUTH_WATCH_DEPLOY_LOCK_BUSY_SKIP',flush=True);sys.exit(0)
-        try:main()
-        except Exception as e:
-            print('AUTH_WATCH_FATAL',type(e).__name__,flush=True)
-            sys.exit(1)
+    try:
+        if os.environ.get('AUTH_WATCH_INSIDE_LOCKED_DEPLOY')=='1':
+            # Deployment workflow already holds the exclusive VPS deploy lock.
+            main()
+        else:
+            with pathlib.Path('/var/lock/pars-vds-bot-deploy.lock').open('a') as lock:
+                try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                except BlockingIOError:
+                    print('AUTH_WATCH_DEPLOY_LOCK_BUSY_SKIP',flush=True);sys.exit(0)
+                main()
+    except Exception as e:
+        print('AUTH_WATCH_FATAL',type(e).__name__,flush=True)
+        sys.exit(1)
