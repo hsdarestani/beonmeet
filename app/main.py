@@ -102,6 +102,29 @@ PREMIUM_MEETING_SLOTS = int(os.environ.get("PREMIUM_MEETING_SLOTS", "3"))
 # joining into a single Chrome worker. Separate worker URLs can each use one.
 # Zero explicitly disables this guard after independent-browser E2E QA.
 SHARED_CHROME_MAX_ACTIVE = max(0, min(16, int(os.environ.get("SHARED_CHROME_MAX_ACTIVE", "1"))))
+
+# Browser/CDP health alone cannot prove authenticated Google Meet admission.
+# An on-host monitor writes atomic, short-lived per-lane signed-in status.
+# Fail closed when enabled; never send a customer to a Guest-only Chrome.
+WORKER_AUTH_GUARD_ENABLED = os.environ.get("WORKER_AUTH_GUARD_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
+WORKER_AUTH_STATE_FILE = Path(os.environ.get("WORKER_AUTH_STATE_FILE", str(DATA_DIR / "worker-auth-readiness.json")))
+WORKER_AUTH_MAX_AGE_SECONDS = max(60, min(900, int(os.environ.get("WORKER_AUTH_MAX_AGE_SECONDS", "360"))))
+
+
+def _recorder_auth_ready(base_url: str) -> bool:
+    if not WORKER_AUTH_GUARD_ENABLED:
+        return True
+    try:
+        document = json.loads(WORKER_AUTH_STATE_FILE.read_text(encoding="utf-8"))
+        entry = (document.get("workers") or {}).get(base_url)
+        if not isinstance(entry, dict) or entry.get("ready") is not True:
+            return False
+        checked_at = float(entry.get("checked_at") or 0)
+        age = datetime.now(timezone.utc).timestamp() - checked_at
+        return 0 <= age <= WORKER_AUTH_MAX_AGE_SECONDS
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
 INTERNAL_SECRET = os.environ["INTERNAL_SECRET"]
 RECORDING_ROOT = Path(os.environ.get("RECORDING_TMP_DIR", "/recordings")).resolve()
 DOWNLOAD_ROOT = DATA_DIR / "recording-downloads"
@@ -883,6 +906,11 @@ async def _dispatch_meeting_serialized(
     saw_busy = False
     async with httpx.AsyncClient(timeout=30.0) as client:
         for pool_name, base_url in targets:
+            if WORKER_AUTH_GUARD_ENABLED and not _recorder_auth_ready(base_url):
+                # Authentication may expire while the worker's HTTP health remains 200.
+                # Keep the request in the durable queue, rather than Guest / Ask to join.
+                saw_busy = True
+                continue
             # An HTTP 202 only means the worker accepted the job. The shared
             # Chrome session crashed in a real Trusted test while an Open
             # recording attempt was running. Until browser isolation is
@@ -2917,6 +2945,9 @@ async def health() -> dict[str, Any]:
         "database_backend": "postgresql" if is_postgres() else "sqlite",
         "healthy_free_workers": sum(1 for url in FREE_WORKER_URLS if worker_health_cache.get(url, True)),
         "healthy_premium_workers": sum(1 for url in PREMIUM_WORKER_URLS if worker_health_cache.get(url, True)),
+        "auth_guard_enabled": bool(WORKER_AUTH_GUARD_ENABLED),
+        "authenticated_free_workers": sum(1 for url in FREE_WORKER_URLS if _recorder_auth_ready(url)),
+        "authenticated_premium_workers": sum(1 for url in PREMIUM_WORKER_URLS if _recorder_auth_ready(url)),
         "free_queue": sum(1 for item in state.get("join_queue", []) if not bool(item.get("premium"))),
         "premium_queue": sum(1 for item in state.get("join_queue", []) if bool(item.get("premium"))),
         "transcription_concurrency": int(os.environ.get("TRANSCRIPTION_CONCURRENCY", "1")),
