@@ -79,7 +79,7 @@ jobs:
             EOF
             systemctl daemon-reload
             echo AUTH_PROD_RUNNING_INITIAL_AUTHENTICATION_PROBE
-            systemctl start beonmeet-auth-watch.service
+            AUTH_WATCH_INSIDE_LOCKED_DEPLOY=1 python3 scripts/worker_auth_monitor.py
             python3 - <<'PY'
             import json,time,os
             from pathlib import Path
