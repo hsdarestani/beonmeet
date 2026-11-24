@@ -1,0 +1,65 @@
+name: Validate production auth-aware worker routing and inspect live runtime
+on:
+  push:
+    branches: [fix/prod-auth-aware-worker-routing-20261124]
+    paths: [.github/workflows/ops-guard-preflight-20261124.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and verify fail-closed routing and worker dispatch
+        run: |
+          python3 -m py_compile app/main.py scripts/worker_auth_monitor.py tests/worker_auth_guard_test.py
+          python3 tests/worker_auth_guard_test.py
+          python3 tests/five_isolated_workers_dispatch_test.py
+          node --check scripts/probe_recorder_auth.js
+          node --check scripts/recover_google_recorder_sessions_from_healthy_lane.js
+      - name: Inspect deployed controller code and idle capacity without touching secrets
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 4m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,os,pathlib,urllib.request,subprocess,stat
+            main=pathlib.Path('app/main.py')
+            txt=main.read_text()
+            print('AUTH_GUARD_DEPLOY_SOURCE_EXISTS',main.is_file())
+            for marker in (
+              'SHARED_CHROME_MAX_ACTIVE =',
+              'async def _dispatch_meeting_serialized(',
+              '        for pool_name, base_url in targets:',
+              '        "healthy_premium_workers": sum('):
+                print('AUTH_GUARD_DEPLOY_ANCHOR',marker[:40],marker in txt)
+                assert marker in txt
+            print('AUTH_GUARD_DEPLOY_SOURCE_PERMS',oct(stat.S_IMODE(main.stat().st_mode)))
+            print('AUTH_GUARD_DEPLOY_SOURCE_OWNERS',main.stat().st_uid,main.stat().st_gid)
+            print('AUTH_GUARD_DEPLOY_EXISTING_PATCH',bool('WORKER_AUTH_GUARD_ENABLED' in txt))
+            values={}
+            for line in pathlib.Path('.env').read_text().splitlines():
+                if '=' in line and not line.startswith('#'):
+                    k,v=line.split('=',1)
+                    if k in ('FREE_WORKER_URLS','PREMIUM_WORKER_URLS','SHARED_CHROME_MAX_ACTIVE','WORKER_AUTH_GUARD_ENABLED','WORKER_AUTH_STATE_FILE','BEONMEET_DATA_DIR'):
+                        values[k]=v
+            print('AUTH_GUARD_DEPLOY_CONFIG',json.dumps(values))
+            for port in (9126,9132,9133,9134,9135):
+                try:
+                    with urllib.request.urlopen(f'http://127.0.0.1:{port}/capacity',timeout=8) as r:d=json.load(r)
+                    d=d.get('data') or d
+                    print('AUTH_GUARD_DEPLOY_WORKER',port,{k:d.get(k) for k in ('runningJobs','availableSlots','maxConcurrentJobs')})
+                except Exception as e:print('AUTH_GUARD_DEPLOY_WORKER_DOWN',port,type(e).__name__)
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=8) as r:h=json.load(r)
+            print('AUTH_GUARD_DEPLOY_CONTROLLER',{k:h.get(k) for k in ('ok','free_worker_endpoints','premium_worker_endpoints','free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs')})
+            p=subprocess.run(['systemctl','show','beonmeet-controller','--property=MainPID,ActiveState,FragmentPath','--no-pager'],capture_output=True,text=True,timeout=9)
+            print('AUTH_GUARD_DEPLOY_SYSTEMD',p.stdout.strip()[:400])
+            PY

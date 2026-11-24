@@ -1,0 +1,161 @@
+name: PRODUCTION deploy authenticated Google Meet worker routing with safe automatic recovery
+on:
+  push:
+    branches: [fix/prod-auth-aware-worker-routing-20261124]
+    paths: [.github/workflows/ops-deploy-auth-guard-20261124.yml]
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 19
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate controller and watchdog files
+        run: |
+          python3 -m py_compile app/main.py scripts/worker_auth_monitor.py scripts/apply_worker_auth_guard.py
+          python3 tests/worker_auth_guard_test.py
+          python3 tests/five_isolated_workers_dispatch_test.py
+          node --check scripts/probe_recorder_auth.js
+          node --check scripts/recover_google_recorder_sessions_from_healthy_lane.js
+      - name: Deploy read-only auth monitor and guarded fail-closed dispatch to live VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 25s
+          command_timeout: 17m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) echo WRONG_PRODUCTION_SERVER; exit 1 ;; esac
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 150 9
+            SHA=${{ github.sha }}
+            git fetch -q origin fix/prod-auth-aware-worker-routing-20261124
+            mkdir -p -m 700 scripts
+            backup="/opt/beonmeet/.auth-guard-backup-$(date -u +%Y%m%dT%H%M%SZ)"
+            mkdir -m 700 "$backup"
+            cp -p app/main.py "$backup/main.py"
+            cp -p .env "$backup/production.env"
+            printf '%s' "$backup" > /opt/beonmeet/.auth-guard-last-backup
+            chmod 600 /opt/beonmeet/.auth-guard-last-backup
+            echo AUTH_PROD_BACKUPS_CREATED
+            git show "$SHA:scripts/worker_auth_monitor.py" > scripts/worker_auth_monitor.py
+            git show "$SHA:scripts/probe_recorder_auth.js" > scripts/probe_recorder_auth.js
+            git show "$SHA:scripts/recover_google_recorder_sessions_from_healthy_lane.js" > scripts/recover_google_recorder_sessions_from_healthy_lane.js
+            git show "$SHA:scripts/apply_worker_auth_guard.py" > scripts/apply_worker_auth_guard.py
+            chmod 644 scripts/probe_recorder_auth.js scripts/recover_google_recorder_sessions_from_healthy_lane.js
+            chmod 600 scripts/apply_worker_auth_guard.py scripts/worker_auth_monitor.py
+            python3 -m py_compile scripts/worker_auth_monitor.py scripts/apply_worker_auth_guard.py
+            cat > /etc/systemd/system/beonmeet-auth-watch.service <<'EOF'
+            [Unit]
+            Description=BeOnMeet Google Meet signed-in worker health watchdog
+            After=docker.service network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=oneshot
+            User=root
+            WorkingDirectory=/opt/beonmeet
+            ExecStart=/usr/bin/python3 /opt/beonmeet/scripts/worker_auth_monitor.py
+            TimeoutStartSec=290
+            NoNewPrivileges=true
+            EOF
+            cat > /etc/systemd/system/beonmeet-auth-watch.timer <<'EOF'
+            [Unit]
+            Description=Refresh authenticated Google Meet worker status periodically
+            [Timer]
+            OnBootSec=50s
+            OnUnitInactiveSec=95s
+            AccuracySec=10s
+            Persistent=true
+            Unit=beonmeet-auth-watch.service
+            [Install]
+            WantedBy=timers.target
+            EOF
+            systemctl daemon-reload
+            echo AUTH_PROD_RUNNING_INITIAL_AUTHENTICATION_PROBE
+            AUTH_WATCH_INSIDE_LOCKED_DEPLOY=1 python3 scripts/worker_auth_monitor.py
+            python3 - <<'PY'
+            import json,time,os
+            from pathlib import Path
+            p=Path('/opt/beonmeet/data/worker-auth-readiness.json')
+            assert p.is_file(),'Auth watchdog did not write health file'
+            d=json.loads(p.read_text())
+            now=time.time()
+            ready=[k for k,v in d['workers'].items() if v.get('ready') is True and 0<=now-float(v['checked_at'])<=360]
+            print('AUTH_PROD_INITIAL_VERIFIED_GOOGLE_SESSIONS',len(ready))
+            assert len(d['workers'])==5
+            assert len(ready)>=1,'No Google-signed-in worker; do not activate'
+            PY
+            echo AUTH_PROD_RECHECKING_IDLE_PRODUCTION_BEFORE_CONTROLLER_RESTART
+            python3 - <<'PY'
+            import json,urllib.request,subprocess
+            def j(u):
+                with urllib.request.urlopen(u,timeout=7) as r:return json.load(r)
+            h=j('http://127.0.0.1:8109/health')
+            assert h.get('ok')
+            assert int(h.get('free_worker_endpoints') or 0)==5
+            assert int(h.get('premium_worker_endpoints') or 0)==5
+            assert not any(int(h.get(k) or 0) for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs')),'USER_WORK_WAITING'
+            for p in (9124,9126,9132,9133,9134,9135):
+                x=j(f'http://127.0.0.1:{p}/capacity')
+                assert int((x.get('data') or x).get('runningJobs') or 0)==0,'ACTIVE_USER_RECORDING'
+            for n in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',n],text=True).strip()=='healthy'
+            print('AUTH_PROD_ALL_IDLE_AND_CAMCAM_HEALTHY')
+            PY
+            if ! python3 scripts/apply_worker_auth_guard.py; then
+              echo AUTH_PROD_PATCH_FAILED_RESTORE
+              cp -p "$backup/main.py" app/main.py
+              cp -p "$backup/production.env" .env
+              exit 1
+            fi
+            if ! ( .venv/bin/python -m py_compile app/main.py && systemctl restart beonmeet-controller ); then
+              echo AUTH_PROD_RESTART_FAILED_ROLLING_BACK
+              cp -p "$backup/main.py" app/main.py
+              cp -p "$backup/production.env" .env
+              systemctl restart beonmeet-controller || true
+              exit 1
+            fi
+            ready=0
+            for n in $(seq 1 28); do
+              if python3 - <<'PY'
+            import json,urllib.request
+            def j(u):
+                with urllib.request.urlopen(u,timeout=5) as r:return json.load(r)
+            h=j('http://127.0.0.1:8109/health')
+            assert h.get('ok') and h.get('auth_guard_enabled') is True
+            assert int(h.get('free_worker_endpoints') or 0)==5
+            assert int(h.get('premium_worker_endpoints') or 0)==5
+            assert int(h.get('authenticated_free_workers') or 0)>=1
+            PY
+              then ready=1; break; fi
+              sleep 2
+            done
+            if [ "$ready" != 1 ]; then
+              echo AUTH_PROD_HEALTH_CHECK_FAILED_ROLLING_BACK
+              cp -p "$backup/main.py" app/main.py
+              cp -p "$backup/production.env" .env
+              systemctl restart beonmeet-controller || true
+              exit 1
+            fi
+            systemctl enable --now beonmeet-auth-watch.timer
+            systemctl is-active --quiet beonmeet-auth-watch.timer
+            python3 - <<'PY'
+            import json,urllib.request,subprocess
+            def j(u):
+                with urllib.request.urlopen(u,timeout=8) as r:return json.load(r)
+            h=j('http://127.0.0.1:8109/health')
+            print('AUTH_PROD_FINAL',{k:h.get(k) for k in ('ok','auth_guard_enabled','free_worker_endpoints','premium_worker_endpoints','authenticated_free_workers','authenticated_premium_workers','free_queue','premium_queue')})
+            assert h.get('auth_guard_enabled') is True
+            assert int(h.get('authenticated_free_workers') or 0)>=1
+            for n in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                assert subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',n],text=True).strip()=='healthy'
+            assert j('https://beonmeet.smarbiz.sbs/health').get('ok')
+            print('AUTH_PROD_DEPLOYED_GOOGLE_WORKER_GUARD_WITH_CAMCAM_HEALTHY')
+            PY

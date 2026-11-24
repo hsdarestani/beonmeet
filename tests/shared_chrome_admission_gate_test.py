@@ -56,6 +56,8 @@ async def check():
         "PREMIUM_WORKER_URLS":["http://chrome"],
         "FREE_WORKER_URLS":["http://chrome"],
         "SHARED_CHROME_MAX_ACTIVE":1,
+        "WORKER_AUTH_GUARD_ENABLED":False,
+        "_recorder_auth_ready":lambda url: True,
         "shared_chrome_dispatch_lock":asyncio.Lock(),
         "httpx":types.SimpleNamespace(AsyncClient=FakeClient),
         "state":state,

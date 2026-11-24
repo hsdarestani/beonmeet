@@ -1,0 +1,57 @@
+name: Check production Google recorder auth watchdog after installation
+on:
+  push:
+    branches: [fix/prod-auth-aware-worker-routing-20261124]
+    paths: [.github/workflows/ops-postdeploy-auth-health-20261124.yml]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - name: Read live authorization routing, watchdog timer and CamCam health
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 3m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,urllib.request,subprocess,datetime,time,pathlib,os
+            def j(u):
+                with urllib.request.urlopen(u,timeout=7) as r:return json.load(r)
+            h=j('http://127.0.0.1:8109/health')
+            keys=['ok','auth_guard_enabled','free_worker_endpoints','premium_worker_endpoints','healthy_free_workers','authenticated_free_workers','authenticated_premium_workers','free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs']
+            print('AUTH_POSTDEPLOY_TIMESTAMP',datetime.datetime.now(datetime.timezone.utc).isoformat())
+            print('AUTH_POSTDEPLOY_CONTROLLER',{k:h.get(k) for k in keys})
+            assert h.get('ok') and h.get('auth_guard_enabled') is True
+            assert int(h.get('free_worker_endpoints') or 0)==5
+            assert int(h.get('premium_worker_endpoints') or 0)==5
+            state=pathlib.Path('/opt/beonmeet/data/worker-auth-readiness.json')
+            assert state.is_file()
+            d=json.loads(state.read_text())
+            age={url.rsplit(':',1)[-1]:round(time.time()-float(v.get('checked_at') or 0),0) for url,v in d.get('workers',{}).items()}
+            status={url.rsplit(':',1)[-1]:bool(v.get('ready')) for url,v in d.get('workers',{}).items()}
+            print('AUTH_POSTDEPLOY_PER_WORKER',status)
+            print('AUTH_POSTDEPLOY_AUTH_EVIDENCE_AGE_SEC',age)
+            print('AUTH_POSTDEPLOY_LAST_REPAIR_AGE_SEC',round(time.time()-float(d.get('last_repair_at') or 0),1))
+            for unit in ('beonmeet-auth-watch.service','beonmeet-auth-watch.timer'):
+                p=subprocess.run(['systemctl','show',unit,'--property=LoadState,ActiveState,SubState,Result','--no-pager'],capture_output=True,text=True,timeout=7)
+                print('AUTH_POSTDEPLOY_SYSTEMD',unit,p.stdout.strip().replace('\n',' ')[:320])
+                assert p.returncode==0
+            p=subprocess.run(['systemctl','is-enabled','beonmeet-auth-watch.timer'],capture_output=True,text=True,timeout=7)
+            print('AUTH_POSTDEPLOY_TIMER_ENABLED',p.stdout.strip())
+            assert p.stdout.strip()=='enabled'
+            for n in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                s=subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',n],text=True).strip()
+                print('AUTH_POSTDEPLOY_CAMCAM',n,s)
+                assert s=='healthy'
+            assert j('https://beonmeet.smarbiz.sbs/health').get('ok')
+            print('AUTH_POSTDEPLOY_GUARD_TIMER_CAMCAM_VERIFIED')
+            PY
