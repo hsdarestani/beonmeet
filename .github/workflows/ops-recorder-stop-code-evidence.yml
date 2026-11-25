@@ -1,0 +1,32 @@
+name: Inspect recorder stop wait and browser disconnect guards
+on:
+  push:
+    branches: [ops/concurrent-worker-trace-retry-20261125]
+    paths: [.github/workflows/ops-recorder-stop-code-evidence.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 2m
+          script: |
+            set -eu
+            docker exec beonmeet-worker-five sed -n '690,748p;760,788p;823,945p;1040,1106p;1300,1338p' /usr/src/app/dist/bots/GoogleMeetBot.js
+            docker exec beonmeet-worker-five sh -c 'find /usr/src/app/dist -iname "*uploader*" -o -iname "*promise*"'
+            python3 - <<'PY'
+            import subprocess,re,json
+            for n in ('beonmeet-worker-five','beonmeet-isolated-worker-3'):
+                p=subprocess.run(['docker','logs','--since','2026-11-25T15:25:00Z',n],capture_output=True,text=True,timeout=20)
+                log=p.stdout+'\n'+p.stderr
+                # Error classification only; do not print user IDs, browser URLs, or raw logs.
+                patterns={'closed_browser':r'(?i)target page, context or browser has been closed|page closed|targetclosederror', 'chunk_error':r'(?i)(?:error|failed).{0,55}(?:chunk|data)|(?:chunk|data).{0,55}(?:error|failed)', 'participant_error':r'(?i)(?:error|failed).{0,55}participant|participant.{0,55}(?:error|failed)', 'stop_started':r'(?i)bot is alone|attempt to end meeting early|recording stopped', 'stop_failure':r'(?i)(?:error|failed).{0,55}(?:end|stop|recording|close)|(?:end|stop|recording|close).{0,55}(?:error|failed)'}
+                print('ERROR_CLASSIFICATION',n,{k:len(re.findall(v,log)) for k,v in patterns.items()})
+            PY
