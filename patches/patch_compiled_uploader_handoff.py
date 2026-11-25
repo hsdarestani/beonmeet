@@ -4,6 +4,9 @@ from pathlib import Path
 import argparse
 
 MARKER = 'BEONMEET_DURABLE_HANDOFF_V1'
+PERMISSION_OLD = '        await fs_1.default.promises.mkdir(instance.folderPath(), { recursive: true });'
+PERMISSION_NEW = """        await fs_1.default.promises.mkdir(instance.folderPath(), { recursive: true, mode: 0o2770 });
+        await fs_1.default.promises.chmod(instance.folderPath(), 0o2770);"""
 INIT = '        this.writeChain = Promise.resolve();'
 INIT_NEW = f'        // {MARKER}\n{INIT}\n        this.handoffAccepted = false;'
 FOLDER = "        return path_1.default.join(this.root, this.userId.replace(/[^a-zA-Z0-9_-]/g, '_'));"
@@ -54,6 +57,10 @@ SEND_NEW = """            let accepted = false;
 def patched_source(source: str) -> str:
     if MARKER in source:
         raise ValueError('Already patched')
+    if source.count(PERMISSION_OLD) == 1:
+        source = source.replace(PERMISSION_OLD, PERMISSION_NEW, 1)
+    elif source.count(PERMISSION_NEW) != 1:
+        raise ValueError('Unexpected uploader folder permissions')
     for old, new in ((INIT, INIT_NEW), (FOLDER, FOLDER_NEW), (FILE, FILE_NEW), (UPLOAD, UPLOAD_NEW), (FILENAME, FILENAME_NEW)):
         if source.count(old) != 1:
             raise ValueError('Unexpected uploader anchor: ' + old)

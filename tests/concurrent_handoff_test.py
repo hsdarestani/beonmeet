@@ -2,6 +2,8 @@
 """Behavioral regression with five real local A/V files and one chat identity."""
 import ast
 import asyncio
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -113,6 +115,20 @@ async def test(root):
     assert (await env["_process_recording_locked"]({**delivery(ids[1]), "_media_only": False}, files[ids[1]]))["ok"]
     assert ids[1] in state["completed_deliveries"] and not files[ids[1]].exists()
     assert files[ids[0]].is_file()
+    orphans = capture / 'same-account' / 'new-crash-job'
+    orphans.mkdir(parents=True)
+    orphan = orphans / 'capture.webm'
+    shutil.copyfile(files[ids[0]], orphan)
+    job = {'chat_id':'same-account','meet_url':'https://meet.google.com/abc-defg-hij','worker_url':'http://lane','status':'recording','premium':True}
+    state['launched_events']['new-crash-job'] = job
+    recovery = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == 'recover_exact_worker_source')
+    env.update(RECORDING_ROOT=capture, re=re, PENDING_DELIVERY_MAX_ATTEMPTS=8)
+    exec(compile(ast.Module(body=[recovery], type_ignores=[]), 'main.py', 'exec'), env)
+    assert await env['recover_exact_worker_source']('new-crash-job', job) is True
+    assert orphan.is_file() and Path(state['pending_deliveries']['new-crash-job']['file_path']).is_file()
+    assert await env['recover_exact_worker_source']('unknown-job', job) is False
+    assert await env['recover_exact_worker_source']('new-crash-job', {**job, 'worker_url':None}) is False
+    print('EXACT_CRASHED_WORKER_SOURCE_RECOVERY_PASS')
     print("INDEPENDENT_DELIVERY_FAILURE_AND_DEFERRED_TRANSCRIPT_PASS")
     print("FIVE_SAME_ACCOUNT_DURABLE_AV_HANDOFF_PASS")
 

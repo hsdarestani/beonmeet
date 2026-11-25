@@ -103,15 +103,21 @@ def stage_release(release, stage):
         source = stage / (worker + '.uploader.js')
         run('docker','cp',worker + ':' + UPLOADER_JS,str(source))
         uploader_hashes.append(hashlib.sha256(source.read_bytes()).hexdigest())
-    assert len(set(mounts)) == 1 and len(set(uploader_hashes)) == 1, 'WORKER_IMPLEMENTATIONS_DIFFER'
-    for script, original, fixed in (
-        ('patches/patch_recording_finalization.py', mounts[0], stage/'bot.fixed.js'),
-        ('patches/patch_compiled_uploader_handoff.py', stage/(WORKERS[0]+'.uploader.js'),stage/'uploader.fixed.js')):
+    assert len(set(mounts)) == 1, 'BOT_OVERLAY_MOUNTS_DIFFER'
+    print('DISTINCT_LIVE_UPLOADER_VERSIONS',len(set(uploader_hashes)),flush=True)
+    transformations = [('patches/patch_recording_finalization.py', mounts[0], stage/'bot.fixed.js')]
+    transformations += [('patches/patch_compiled_uploader_handoff.py', stage/(w+'.uploader.js'), stage/(w+'.uploader.fixed.js')) for w in WORKERS]
+    for script, original, fixed in transformations:
         patcher = stage / pathlib.Path(script).name
         patcher.write_bytes(run('git','show',f'{release}:{script}'))
-        run('python3',str(patcher),str(original),str(fixed))
+        try:
+            run('python3',str(patcher),str(original),str(fixed))
+        except subprocess.CalledProcessError as exc:
+            print('COMPILED_PATCH_REJECTED',original.name,exc.stderr.decode(errors='replace').splitlines()[-1][:300],flush=True)
+            raise
         run('docker','exec','-i',WORKERS[0],'node','--check',input=fixed.read_bytes())
         os.chmod(fixed,0o644)
+        print('COMPILED_PATCH_VALIDATED',fixed.name,flush=True)
     print('STAGED_CONTROLLER_AND_COMPILED_WORKERS_VALIDATED',flush=True)
     return mounts[0]
 
@@ -191,7 +197,7 @@ def main(release):
             # five recorder processes have stopped.
             overlay.write_bytes((stage/'bot.fixed.js').read_bytes())
             for w in WORKERS:
-                run('docker','cp',str(stage/'uploader.fixed.js'),w+':'+UPLOADER_JS)
+                run('docker','cp',str(stage/(w+'.uploader.fixed.js')),w+':'+UPLOADER_JS)
             for name in FILES:
                 shutil.copyfile(stage/name,ROOT/name)
                 if not (backup/name).exists():os.chmod(ROOT/name,0o644)

@@ -1282,6 +1282,10 @@ async def reconcile_recordings_loop() -> None:
                         continue
                     if (now - isoparse(job["idle_observed_at"])).total_seconds() < 60:
                         continue
+                    if job.get("worker_url"):
+                        recovered = await recover_exact_worker_source(eid, job)
+                        if recovered is not False:
+                            continue
                     job["status"] = "failed"
                     failure = {"chat_id": job["chat_id"], "meeting_link": job["meet_url"],
                                "failed_at": now.isoformat(), "reason": "worker_idle_without_handoff"}
@@ -1304,6 +1308,43 @@ async def reconcile_recordings_loop() -> None:
         except Exception as exc:
             print("recording reconciliation error:", type(exc).__name__, flush=True)
         await asyncio.sleep(30)
+
+
+async def recover_exact_worker_source(event_id: str, job: dict[str, Any]) -> bool | None:
+    """Recover only the new per-job folder, never an arbitrary legacy file."""
+    chat_id = str(job.get("chat_id") or "")
+    if not chat_id or not event_id or not job.get("worker_url"):
+        return False
+    def component(value: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_-]", "_", value)
+    expected = RECORDING_ROOT / component(chat_id) / component(event_id)
+    folder = expected.resolve()
+    if folder != expected or not folder.is_relative_to(RECORDING_ROOT) or not folder.is_dir():
+        return False
+    files = [p for p in folder.iterdir() if p.is_file() and not p.is_symlink()
+             and p.suffix.lower() in {".webm", ".mp4", ".mkv"} and p.stat().st_size > 0]
+    if len(files) != 1:
+        return False  # no cross-session guesses; report the failed job instead
+    source = files[0].resolve()
+    try:
+        source_size = source.stat().st_size
+        result = await accept_recording({"botId": event_id, "userId": chat_id,
+                                         "meetingLink": job.get("meet_url"), "size": source_size}, source)
+        if result.get("ok"):
+            pending = state.get("pending_deliveries", {}).get(event_id)
+            if pending is not None:
+                pending["recovered_source_path"] = str(source)
+                pending["recovered_source_size"] = source_size
+                await save_state()
+            print(f"recovered exact worker source job={event_id}", flush=True)
+            return True
+    except Exception as exc:
+        print(f"worker source recovery failed job={event_id}: {type(exc).__name__}", flush=True)
+        job["source_recovery_attempts"] = int(job.get("source_recovery_attempts") or 0) + 1
+        await save_state()
+        if job["source_recovery_attempts"] < PENDING_DELIVERY_MAX_ATTEMPTS:
+            return None
+    return False
 
 
 async def state_cleanup_loop() -> None:
@@ -3541,8 +3582,16 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                 delivery_filename = f"{Path(filename).stem}.mp4"
 
         if pending_state is not None and not pending_state.get("media_verified"):
-            async with MEDIA_SEMAPHORE:
-                duration = await asyncio.to_thread(verified_duration, raw_path)
+            try:
+                async with MEDIA_SEMAPHORE:
+                    duration = await asyncio.to_thread(verified_duration, raw_path)
+            except (ValueError, subprocess.CalledProcessError):
+                # A finalized immutable artifact with no playable A/V cannot
+                # become valid on retry. Preserve it and report permanent failure.
+                pending_state["attempts"] = PENDING_DELIVERY_MAX_ATTEMPTS
+                pending_state["terminal_failure"] = True
+                await save_state()
+                raise
             pending_state["duration"] = duration
             pending_state["media_verified"] = True
             await save_state()
@@ -3858,6 +3907,17 @@ async def _process_recording_locked(data: dict[str, Any], raw_path: Path) -> dic
         state.setdefault("launched_events", {}).pop(event_id, None)
         await save_state()
         raw_path.unlink(missing_ok=True)
+        recovered_path = str(pending.get("recovered_source_path") or "")
+        if recovered_path:
+            recovered = Path(recovered_path)
+            try:
+                # Remove only the exact recovered source, after the durable
+                # completion receipt; never delete a changed/reused path.
+                if (recovered.resolve() == recovered and recovered.is_relative_to(RECORDING_ROOT)
+                    and recovered.is_file() and recovered.stat().st_size == int(pending["recovered_source_size"])):
+                    recovered.unlink()
+            except OSError:
+                print(f"recovered source cleanup deferred job={event_id}", flush=True)
         return result
     except Exception as exc:
         current = state.setdefault("pending_deliveries", {}).get(pending_id)
@@ -3943,6 +4003,8 @@ async def accept_recording(data: dict[str, Any], source: Path) -> dict[str, Any]
             raise HTTPException(400, "Unsupported recording format")
         destination = RECORDING_SPOOL / (recording_key(event_id) + suffix)
         await asyncio.to_thread(persist_source, source, destination)
+        if expected_size and destination.stat().st_size != expected_size:
+            raise HTTPException(409, "Recording changed during durable handoff")
         # A stable filename makes the existing wallet/recordings transaction
         # idempotent even across repeated upload attempts and process restarts.
         name = str((pending or {}).get("filename") or f"BeOnMeet-{link.rsplit('/', 1)[-1]}-{recording_key(event_id)[:16]}{suffix}")
@@ -3989,7 +4051,7 @@ async def delivery_recovery_loop() -> None:
                 # Never infer a meeting from arbitrary files on disk. Recovery is
                 # allowed only from an exact pending-delivery record that carries
                 # the original event id and exact recorder file path.
-                await asyncio.sleep(30)
+                await asyncio.sleep(3)
                 continue
 
             for pending_id, pending in pending_items:

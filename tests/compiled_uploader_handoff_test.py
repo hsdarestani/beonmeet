@@ -7,7 +7,7 @@ root=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('compiled_uploader',root/'patches/patch_compiled_uploader_handoff.py')
 mod=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-source='\n'.join((mod.INIT,mod.FOLDER,mod.FILE,mod.UPLOAD,mod.FILENAME,mod.SEND_START,mod.SEND_END))
+source='\n'.join((mod.INIT,mod.PERMISSION_OLD,mod.FOLDER,mod.FILE,mod.UPLOAD,mod.FILENAME,mod.SEND_START,mod.SEND_END))
 fixed=mod.patched_source(source)
 assert mod.MARKER in fixed
 assert 'receipt.ok && (receipt.persisted || receipt.duplicate)' in fixed
@@ -15,6 +15,8 @@ assert fixed.index('this.handoffAccepted = true;') < fixed.index('await fs_1.def
 assert 'attempt < 4' in fixed and 'AbortSignal.timeout(300000)' in fixed
 assert 'String(this.botId).replace' in fixed
 assert 'String(this.tempFileId).replace' in fixed
+assert mod.PERMISSION_NEW in fixed
+assert mod.patched_source(source.replace(mod.PERMISSION_OLD,mod.PERMISSION_NEW)) == fixed
 for sample in (fixed,source.replace(mod.FOLDER,'missing')):
     try:mod.patched_source(sample)
     except ValueError:pass
