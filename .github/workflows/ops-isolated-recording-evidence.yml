@@ -1,0 +1,46 @@
+name: Trace isolated recording incident (read-only)
+on:
+  push:
+    branches: [ops/concurrent-worker-trace-retry-20261125]
+    paths: [.github/workflows/ops-isolated-recording-evidence.yml]
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 3m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,subprocess,pathlib,urllib.request,collections
+            codes=('obi-fudd-kmu','syn-gfbe-cdc','dva-wbnh-qik')
+            s=json.loads(pathlib.Path('data/state.json').read_text())
+            ids={c:[k for k,v in s.get('launched_events',{}).items() if c in str(v.get('meet_url',''))] for c in codes}
+            for c in codes:
+                for k in ids[c]:
+                    v=s['launched_events'][k]
+                    print('JOB',c,{a:v.get(a) for a in ('status','pool','launched_at','recording_started_at')})
+            names=subprocess.check_output(['docker','ps','--format','{{.Names}}'],text=True).splitlines()
+            markers=('target closed','session closed','execution context was destroyed','recording is empty','delivery failed','meeting job permanently failed','meeting job finished successfully','slot released','recording delivered','error processing','capture failed','browser disconnected','timeout')
+            for n in names:
+                if not n.startswith('beonmeet') or 'worker' not in n:continue
+                p=subprocess.run(['docker','logs','--since','2026-11-25T15:25:00Z',n],capture_output=True,text=True,timeout=15)
+                for i,line in enumerate((p.stdout+'\n'+p.stderr).splitlines()):
+                    found=[m for m in markers if m in line.lower()]
+                    matches=[c for c in codes if c in line or any(e in line for e in ids[c])]
+                    if found or matches:print('WORKER_EVENT',n,i,matches,found)
+            for p in (9124,9126,9132,9133,9134,9135):
+                try:
+                    with urllib.request.urlopen(f'http://127.0.0.1:{p}/capacity',timeout=5) as r:d=json.load(r)
+                    print('CAPACITY',p,d.get('data',d))
+                except Exception:print('CAPACITY_UNAVAILABLE',p)
+            PY
