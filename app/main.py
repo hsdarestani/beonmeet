@@ -804,10 +804,8 @@ async def _paid_recording_allowed(
 ) -> bool:
     """Enforce paid recording-hour quotas before dispatch or queue activation.
 
-    Completed recordings are persisted in the DB. For jobs already accepted or
-    queued, conservatively reserve an hour each to reduce concurrent overspend.
-    The upstream recorder still has its own max-duration safety limit; existing
-    in-flight recordings are never silently stopped by this check.
+    Dispatch rechecks the available reservation under the allocation lock.
+    This preliminary check does not deduct credit or reserve a queued request.
     """
     quota = await asyncio.to_thread(paid_recording_entitlement, str(chat_id))
     if not quota.get("premium"):
@@ -818,18 +816,7 @@ async def _paid_recording_allowed(
     remaining = quota.get("remaining_seconds")
     if remaining is None:
         return True  # protect grandfathered unlimited legacy subscriptions
-    busy_ids = set()
-    for item in state.get("join_queue", []):
-        req = item.get("req") or {}
-        eid = str(item.get("event_id") or "")
-        if eid and eid != event_id and str(req.get("chat_id") or "") == str(chat_id):
-            busy_ids.add(eid)
-    for eid, item in state.get("launched_events", {}).items():
-        if str(eid) != event_id and str((item or {}).get("chat_id") or "") == str(chat_id):
-            if str((item or {}).get("status") or "") in {"remote_claimed", "reserved", "joining", "waiting_for_admission", "capturing", "recording", "delivering"}:
-                busy_ids.add(str(eid))
-    reserved = len(busy_ids) * 3600
-    if remaining > reserved:
+    if await reserve_recording_seconds(chat_id, True):
         return True
     if notify:
         used = int(quota.get("used_seconds") or 0)
@@ -880,7 +867,32 @@ async def _dispatch_meeting(
     # All entrypoints use this per-process lock. It prevents competing /now
     # and queue dispatches from both observing a free shared Chrome slot.
     async with shared_chrome_dispatch_lock:
-        return await _dispatch_meeting_serialized(event, req, meet_url, premium)
+        event_id = str(event.get("id") or "")
+        current = state.get("launched_events", {}).get(event_id)
+        if current and current.get("status") not in {"failed", "failed_delivery"}:
+            return True, False, str(current.get("pool") or "")
+        credit = await reserve_recording_seconds(str(req["chat_id"]), premium)
+        if credit == 0:
+            return False, True, "wallet-reserved"
+        return await _dispatch_meeting_serialized(event, req, meet_url, premium, credit)
+
+
+async def reserve_recording_seconds(chat_id: str, premium: bool) -> int | None:
+    """Called only under shared_chrome_dispatch_lock, including extensions."""
+    quota = await asyncio.to_thread(paid_recording_entitlement if premium else free_recording_entitlement, chat_id)
+    remaining = quota.get("remaining_seconds")
+    if remaining is None and premium:
+        return None  # grandfathered unlimited legacy plan
+    reserved = 0
+    active = {"remote_claimed", "reserved", "joining", "waiting_for_admission", "capturing", "recording", "delivering"}
+    for eid, job in state.get("launched_events", {}).items():
+        if str(job.get("chat_id")) != chat_id or job.get("status") not in active:
+            continue
+        if state.get("pending_deliveries", {}).get(eid, {}).get("billing_committed"):
+            continue
+        amount = job.get("reserved_seconds", 3600)
+        reserved += max(0, int(amount or 0))
+    return max(0, min(3600, int(remaining or 0) - reserved))
 
 
 async def _dispatch_meeting_serialized(
@@ -888,6 +900,7 @@ async def _dispatch_meeting_serialized(
     req: dict[str, Any],
     meet_url: str,
     premium: bool,
+    reserved_seconds: int | None = None,
 ) -> tuple[bool, bool, str]:
     event_id = event.get("id") or str(uuid.uuid4())
     chat_id = str(req["chat_id"])
@@ -952,6 +965,7 @@ async def _dispatch_meeting_serialized(
                 "launched_at": datetime.now(timezone.utc).isoformat(),
                 "status": "reserved", "premium": bool(premium),
                 "pool": pool_name, "worker_url": base_url,
+                "reserved_seconds": reserved_seconds,
             }
             await save_state()
             try:
@@ -1234,6 +1248,17 @@ async def reconcile_recordings_loop() -> None:
                     if eid in state["pending_deliveries"] or eid in state["completed_deliveries"]:
                         continue
                     url = str(job.get("worker_url") or "")
+                    if not url:
+                        # Pre-upgrade local jobs carry the exact named lane.
+                        # Resolve only an unambiguous index in the configured
+                        # local pool; never infer remote or shared ownership.
+                        pool = str(job.get("pool") or "")
+                        match = re.fullmatch(r"(premium|free)-(\d+)", pool)
+                        if match:
+                            endpoints = PREMIUM_WORKER_URLS if match[1] == "premium" else FREE_WORKER_URLS
+                            index = int(match[2]) - 1
+                            if 0 <= index < len(endpoints):
+                                url = endpoints[index]
                     if url not in {*FREE_WORKER_URLS, *PREMIUM_WORKER_URLS}:
                         continue  # do not guess the identity of a legacy/remote worker
                     age = (now - isoparse(job["launched_at"])).total_seconds()
@@ -3073,6 +3098,8 @@ async def health() -> dict[str, Any]:
         "failed_recording_jobs": len(state.get("failed_recordings", {})),
         "failed_delivery_jobs": sum(bool(job.get("terminal_failure")) for job in state.get("pending_deliveries", {}).values()),
         "pending_transcription_jobs": sum(bool(job.get("media_complete") and not job.get("terminal_failure")) for job in state.get("pending_deliveries", {}).values()),
+        "recording_spool_free_bytes": shutil.disk_usage(RECORDING_SPOOL).free,
+        "load_average_1m": os.getloadavg()[0],
         "delivery_pipeline_busy": bool(active_delivery_jobs or any(not job.get("terminal_failure") for job in state.get("pending_deliveries", {}).values())),
         "remote_workers": sum(1 for entry in remote_worker_cache.values() if _remote_worker_alive(entry)),
         "remote_free_slots": remote_free_slots,
@@ -3134,7 +3161,7 @@ async def home() -> str:
 </div></section>
 <section id="credits" class="section"><div class="wrap">
 <h2>Buy recording hours, not subscriptions</h2>
-<p>Choose 2, 6 or 15 hours of recording credit. Each purchase instantly adds hours to your existing balance, even if you already have credit. Hours never expire, there are no monthly subscriptions, and no automatic renewal. Completed recordings consume the corresponding time. If a recording runs beyond your balance, the excess is deducted from your next purchase.</p>
+<p>Choose 2, 6 or 15 hours of recording credit. Each purchase instantly adds hours to your existing balance, even if you already have credit. Hours never expire, there are no monthly subscriptions, and no automatic renewal. Delivered recordings consume verified recording time up to your available balance; the balance never becomes negative.</p>
 <div class="grid prices">__PRICE_CARDS__</div>
 <div class="cta">__BOT_CTA__<a class="button secondary" href="/terms">Credit terms</a></div>
 </div></section>
@@ -3191,7 +3218,7 @@ async def home_fa() -> str:
 </div></section>
 <section id="credits" class="section"><div class="wrap">
 <h2>فقط خرید ساعت ضبط؛ بدون اشتراک</h2>
-<p>فقط ساعت ضبط می‌خری: ۲، ۶ یا ۱۵ ساعت. هر خرید بلافاصله به موجودی قبلی‌ات اضافه می‌شود، تاریخ انقضا ندارد و برای تمام جلسه‌ها قابل استفاده است. به‌اندازه مدت ضبط موفق از اعتبار کم می‌شود؛ اگر جلسه از موجودی بیشتر طول بکشد، مازاد از شارژ بعدی کسر می‌شود. تمدید خودکار یا هزینه اضافه خودکار نداریم.</p>
+<p>فقط ساعت ضبط می‌خری: ۲، ۶ یا ۱۵ ساعت. هر خرید بلافاصله به موجودی قبلی‌ات اضافه می‌شود، تاریخ انقضا ندارد و برای تمام جلسه‌ها قابل استفاده است. به‌اندازه مدت واقعی ضبط تحویل‌شده و حداکثر تا موجودی اعتبار کم می‌شود؛ موجودی منفی نمی‌شود. تمدید خودکار یا هزینه اضافه خودکار نداریم.</p>
 <div class="grid prices">__PRICE_CARDS__</div>
 <div class="cta">__BOT_CTA__</div>
 </div></section>
@@ -3268,7 +3295,7 @@ async def terms_of_service() -> str:
 <h2>Availability</h2>
 <p>We work to provide reliable joining of meetings explicitly requested by the user and delivery of the resulting files, but admission controls, network conditions, third party outages, capacity limits or meeting configuration can prevent or delay recording. A host may need to admit the recorder.</p>
 <h2>Recording-hour credit and temporary files</h2>
-<p>BeOnMeet sells prepaid recording hours, not monthly subscriptions. One-time purchases of 2, 6 or 15 hours immediately increase the same non-expiring credit balance. Completed recordings deduct their actual duration. When the balance is exhausted, new recordings require another top-up. An already-started recording may finish and use more than the remaining hours; the excess is deducted from later purchases. There are no automatic renewals, top-ups or overage charges.</p>
+<p>BeOnMeet sells prepaid recording hours, not monthly subscriptions. One-time purchases of 2, 6 or 15 hours immediately increase the same non-expiring credit balance. Delivered recordings deduct verified recording time up to the available credit. When the balance is exhausted, new recordings require another top-up. There are no automatic renewals, top-ups, negative wallet balances or overage charges.</p>
 <p>Remaining allowance from still-active or prepaid future plans is converted into the non-expiring wallet. Used and already-expired time is not recredited. Legacy unlimited subscribers keep previously agreed rights until the original end date. Temporary recording/download files have expiry periods separate from hour credits.</p>
 <h2>Privacy</h2>
 <p>Our handling of personal information and Google user data is described in the <a href="/privacy">Privacy Policy</a>.</p>
@@ -3400,24 +3427,42 @@ async def recording_started(
     if not chat_id or not event_id:
         raise HTTPException(status_code=400, detail="Missing recording identity")
 
-    already_notified = False
-    if event_id:
-        launched = state["launched_events"].get(event_id)
-        if not launched or str(launched.get("chat_id")) != chat_id:
-            raise HTTPException(status_code=409, detail="Unknown recording identity")
-        if launched.get("status") in {"delivering", "completed", "recording", "failed"}:
-            return {"ok": True, "duplicate": True}
-        verified = int(data.get("captureBytes") or 0) > 0
-        stage = "recording" if verified else "capturing"
-        already_notified = launched.get("status") == stage
+    if data.get("eventId") and data.get("botId") and data["eventId"] != data["botId"]:
+        raise HTTPException(409, "Conflicting recording identity")
+    launched = state["launched_events"].get(event_id)
+    if not launched or str(launched.get("chat_id")) != chat_id:
+        raise HTTPException(status_code=409, detail="Unknown recording identity")
+    if launched.get("status") in {"delivering", "completed", "failed", "failed_delivery"}:
+        return {"ok": True, "duplicate": True, "recording_limit_seconds": 0}
+    if data.get("extendFrom") is not None:
+        # A repeated request carries the old reservation value and cannot add
+        # credit twice. All concurrent sessions share this same allocation lock.
+        async with shared_chrome_dispatch_lock:
+            if state["launched_events"].get(event_id) is not launched or launched.get("status") not in {"capturing", "recording"}:
+                return {"ok": True, "recording_limit_seconds": 0}
+            current = launched.get("reserved_seconds")
+            if current is not None and int(data["extendFrom"]) == int(current):
+                additional = await reserve_recording_seconds(chat_id, bool(launched.get("premium")))
+                if additional:
+                    launched["reserved_seconds"] = int(current) + additional
+                    await save_state()
+        return {"ok": True, "recording_limit_seconds": launched.get("reserved_seconds")}
+    verified = int(data.get("captureBytes") or 0) > 0
+    stage = "recording" if verified else "capturing"
+    if launched.get("status") != "recording" and launched.get("status") != stage:
         launched["status"] = stage
         launched.setdefault("recording_started_at", datetime.now(timezone.utc).isoformat())
         await save_state()
-
-    if not already_notified:
         key = "recording_started" if verified else "capture_unconfirmed"
-        await tg_text(chat_id, recording_message(t(chat_id, key), launched.get("meet_url"), event_id))
-    return {"ok": True}
+        asyncio.create_task(notify_capture_progress(chat_id, key, launched.get("meet_url"), event_id))
+    return {"ok": True, "recording_limit_seconds": launched.get("reserved_seconds")}
+
+
+async def notify_capture_progress(chat_id: str, key: str, link: str, event_id: str) -> None:
+    try:
+        await asyncio.wait_for(tg_text(chat_id, recording_message(t(chat_id, key), link, event_id)), timeout=30)
+    except Exception as exc:
+        print(f"capture progress notification failed job={event_id}: {type(exc).__name__}", flush=True)
 
 
 def recording_message(message: str, meeting_link: str | None, event_id: str = "") -> str:
@@ -3532,7 +3577,11 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
             delivery_filename,
             int(delivery_path.stat().st_size),
             reported_seconds,
+            (pending_state or {}).get("reserved_seconds"),
         )
+        if pending_state is not None and not pending_state.get("billing_committed"):
+            pending_state["billing_committed"] = True
+            await save_state()
 
         if premium_active:
             audio_already_delivered = bool((pending_state or {}).get("audio_delivered"))
@@ -3902,6 +3951,7 @@ async def accept_recording(data: dict[str, Any], source: Path) -> dict[str, Any]
             "file_path": str(destination), "source_name": destination.name,
             "filename": name, "meeting_link": link, "duration": 0,
             "premium": bool(launched.get("premium")) if launched else bool((pending or {}).get("premium")),
+            "reserved_seconds": launched.get("reserved_seconds") if launched else (pending or {}).get("reserved_seconds"),
             "attempts": int((pending or {}).get("attempts") or 0),
             "updated_at": (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat(),
             "persisted_at": datetime.now(timezone.utc).isoformat(),

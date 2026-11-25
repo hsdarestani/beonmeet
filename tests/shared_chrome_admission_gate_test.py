@@ -47,6 +47,7 @@ class FakeClient:
 async def check():
     state={"launched_events":{}}
     async def save_state():pass
+    async def reserve_recording_seconds(*args):return 3600
     env={
         "Any":typing.Any,
         "uuid":uuid,
@@ -61,7 +62,8 @@ async def check():
         "shared_chrome_dispatch_lock":asyncio.Lock(),
         "httpx":types.SimpleNamespace(AsyncClient=FakeClient),
         "state":state,
-        "save_state":save_state
+        "save_state":save_state,
+        "reserve_recording_seconds":reserve_recording_seconds,
     }
     exec(code,env)
     dispatch=env["_dispatch_meeting"]

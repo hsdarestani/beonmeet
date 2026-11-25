@@ -19,6 +19,7 @@ class DiskUploader implements IUploader {
   private recordingDuration?: number;
   private writeChain: Promise<void> = Promise.resolve();
   private captureNotified = false;
+  private handoffAccepted = false;
   private readonly filename: string;
 
   private constructor(
@@ -78,7 +79,7 @@ class DiskUploader implements IUploader {
   }
 
   private filePath(): string {
-    return path.join(this.folderPath(), `${this.tempFileId}${this.extension}`);
+    return path.join(this.folderPath(), `${this.tempFileId.replace(/[^a-zA-Z0-9_-]/g, '_')}${this.extension}`);
   }
 
   public async saveDataToTempFile(data: Buffer): Promise<boolean> {
@@ -118,6 +119,7 @@ class DiskUploader implements IUploader {
   }
 
   public async uploadRecordingToRemoteStorage(_options?: { forceUpload?: boolean }): Promise<boolean> {
+    if (this.handoffAccepted) return true;
     const filePath = this.filePath();
     try {
       await this.writeChain;
@@ -142,45 +144,40 @@ class DiskUploader implements IUploader {
 
       // Retry the same identity and source; controller acknowledgement means
       // durable handoff, not that transcription has finished.
-      let response: Response | undefined;
+      let accepted = false;
       for (let attempt = 0; attempt < 4; attempt++) {
         try {
-      if (streamControllerUrl) {
-        const encodedMeta = Buffer.from(JSON.stringify(metadata), 'utf8').toString('base64url');
-        response = await fetch(streamControllerUrl, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/octet-stream',
-            'content-length': String(stat.size),
-            'x-beonmeet-secret': secret,
-            'x-beonmeet-meta': encodedMeta,
-          },
-          body: fs.createReadStream(filePath) as any,
-          signal: AbortSignal.timeout(300000),
-          duplex: 'half',
-        } as any);
-      } else {
-        response = await fetch(legacyControllerUrl!, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'x-beonmeet-secret': secret,
-          },
-          body: JSON.stringify({
-            ...metadata,
-            filePath,
-          }),
-          signal: AbortSignal.timeout(300000),
-        });
-      }
-          if (response.ok) break;
+          let response: Response;
+          if (streamControllerUrl) {
+            const encodedMeta = Buffer.from(JSON.stringify(metadata), 'utf8').toString('base64url');
+            response = await fetch(streamControllerUrl, {
+              method: 'POST',
+              headers: { 'content-type': 'application/octet-stream', 'content-length': String(stat.size),
+                'x-beonmeet-secret': secret, 'x-beonmeet-meta': encodedMeta },
+              body: fs.createReadStream(filePath) as any, signal: AbortSignal.timeout(300000), duplex: 'half',
+            } as any);
+          } else {
+            response = await fetch(legacyControllerUrl!, {
+              method: 'POST', headers: { 'content-type': 'application/json', 'x-beonmeet-secret': secret },
+              body: JSON.stringify({ ...metadata, filePath }), signal: AbortSignal.timeout(300000),
+            });
+          }
+          if (response.ok) {
+            const receipt = await response.json() as { ok?: boolean; persisted?: boolean; duplicate?: boolean };
+            if (receipt.ok && (receipt.persisted || receipt.duplicate)) {
+              accepted = true;
+              break;
+            }
+            throw new Error('Controller did not acknowledge durable handoff');
+          }
           if (response.status >= 400 && response.status < 500 && response.status !== 429) break;
         } catch (error) {
           this.logger.warn('Recording handoff attempt failed', { botId: this.botId, attempt });
         }
         if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 1000 * 2 ** attempt));
       }
-      if (!response?.ok) throw new Error(`Controller recording handoff failed: ${response?.status || 'network'}`);
+      if (!accepted) throw new Error('Recording durable handoff failed; source retained');
+      this.handoffAccepted = true;
 
       try {
         await fs.promises.unlink(filePath);
