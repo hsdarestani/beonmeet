@@ -1,0 +1,60 @@
+name: Verify post-release recorder health and retry authorized idle auth watchdog
+on:
+  push:
+    branches: [ops/concurrent-worker-trace-retry-20261125]
+    paths: [.github/workflows/ops-concurrent-postrelease-auth.yml]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 6m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,urllib.request,pathlib,subprocess,time
+            def get(port,path):
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/{path}',timeout=5) as r:return json.load(r)
+            h=get(8109,'health')
+            assert h.get('ok') and 'pending_transcription_jobs' in h
+            for p in (9124,9126,9132,9133,9134,9135):
+                c=get(p,'capacity');assert int((c.get('data') or c).get('runningJobs') or 0)==0,'LIVE_RECORDING_ACTIVE'
+            assert not any(int(h.get(k) or 0) for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs'))
+            print('POSTRELEASE_IDLE_GUARD_PASS')
+            PY
+            # Run the already installed, idle-aware production watchdog.
+            systemctl start beonmeet-auth-watch.service || true
+            python3 - <<'PY'
+            import json,urllib.request,pathlib,subprocess,time,sqlite3
+            def get(port,path):
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/{path}',timeout=5) as r:return json.load(r)
+            h=get(8109,'health')
+            print('POSTRELEASE_HEALTH',{k:h.get(k) for k in ('ok','healthy_free_workers','authenticated_free_workers','active_recording_jobs','failed_recording_jobs','pending_delivery_jobs','pending_transcription_jobs')})
+            a=json.loads(pathlib.Path('data/worker-auth-readiness.json').read_text())
+            print('AUTH_CHECKS',{k.rsplit(':',1)[-1]:{'ready':v.get('ready'),'age_seconds':round(time.time()-float(v.get('checked_at') or 0))} for k,v in a.get('workers',{}).items()})
+            p=subprocess.run(['journalctl','-u','beonmeet-auth-watch.service','--since','20 minutes ago','--no-pager','-o','cat'],capture_output=True,text=True,timeout=10)
+            for line in p.stdout.splitlines():
+                if line.startswith('AUTH_WATCH_') and all(x.isalnum() or x in ' _-.,:' for x in line): print('WATCHDOG',line[:240])
+            s=json.loads(pathlib.Path('data/state.json').read_text())
+            for code in ('obi-fudd-kmu','syn-gfbe-cdc','dva-wbnh-qik'):
+                for kind in ('launched_events','failed_recordings'):
+                    print('TEST_STATE',code,kind,[v.get('status') or v.get('reason') for v in s.get(kind,{}).values() if code in str(v.get('meet_url') or v.get('meeting_link') or '')])
+                db=pathlib.Path('data/beonmeet.db')
+                if db.is_file():
+                    with sqlite3.connect('file:'+str(db.resolve())+'?mode=ro',uri=True) as c:
+                        rows=c.execute('SELECT telegram_id,filename,duration_seconds FROM recordings WHERE meet_url LIKE ?',('%'+code+'%',)).fetchall()
+                        total=0;debits=0
+                        for uid,f,duration in rows:
+                            n,seconds=c.execute('SELECT COUNT(*),COALESCE(SUM(-seconds_delta),0) FROM credit_entries WHERE reference=?',('recording:'+uid+':'+f,)).fetchone()
+                            total+=seconds;debits+=n
+                        print('TEST_BILLING',code,'recordings',len(rows),'debit_rows',debits,'debited_seconds',total)
+            PY
