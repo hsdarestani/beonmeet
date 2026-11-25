@@ -1,0 +1,97 @@
+name: Concurrent delivery incident audit (read-only)
+on:
+  push:
+    branches: [ops/concurrent-delivery-audit-retry-20261125]
+    paths: [.github/workflows/ops-concurrent-delivery-audit-retry-20261125.yml]
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Inspect test meetings and live capacity without customer data
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 3m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json, subprocess, sqlite3, pathlib, urllib.request, hashlib, re, collections
+            codes=('obi-fudd-kmu','syn-gfbe-cdc','dva-wbnh-qik')
+            def cmd(*args):
+                try:return subprocess.run(args,capture_output=True,text=True,timeout=20).stdout
+                except (OSError,subprocess.TimeoutExpired):return ''
+            def get(port,path):
+                try:
+                    with urllib.request.urlopen(f'http://127.0.0.1:{port}/{path}',timeout=4) as r:return json.load(r)
+                except Exception:return {}
+            config={}
+            for line in pathlib.Path('.env').read_text().splitlines():
+                if '=' in line and not line.startswith('#'):
+                    k,v=line.split('=',1)
+                    if k in ('BEONMEET_DATA_DIR','BEONMEET_DB_PATH','RECORDING_TMP_DIR'):config[k]=v.strip('"').strip("'")
+            data=pathlib.Path(config.get('BEONMEET_DATA_DIR','/opt/beonmeet/data'))
+            file=data/'state.json'
+            state=json.loads(file.read_text()) if file.is_file() else {}
+            print('AUDIT_STATE_MIRROR',bool(state))
+            # Compare Redis state with the mirror without printing JSON, keys or customer data.
+            redis_state=cmd('redis-cli','GET','beonmeet:controller:state')
+            if not redis_state:
+                for n in cmd('docker','ps','--format','{{.Names}}').splitlines():
+                    if n.startswith('beonmeet') and 'redis' in n:
+                        redis_state=cmd('docker','exec',n,'redis-cli','GET','beonmeet:controller:state')
+                        if redis_state:break
+            try:
+                current=json.loads(redis_state)
+                print('AUDIT_REDIS_STATE',isinstance(current,dict),'matches_mirror',current==state)
+                if isinstance(current,dict):state=current
+            except Exception:print('AUDIT_REDIS_STATE unavailable via default local socket')
+            def tag(s):return hashlib.sha256(str(s).encode()).hexdigest()[:12]
+            h=get(8109,'health')
+            print('AUDIT_HEALTH',{k:h.get(k) for k in ('ok','authenticated_free_workers','healthy_free_workers','active_delivery_jobs','pending_delivery_jobs','free_queue','premium_queue','database_backend')})
+            ids={c:set() for c in codes}
+            paths={c:set() for c in codes}
+            for key in ('launched_events','pending_deliveries','completed_deliveries','requests'):
+                for eid,entry in (state.get(key) or {}).items():
+                    for c in codes:
+                        if c not in json.dumps([eid,entry]):continue
+                        ids[c].add(str(eid))
+                        for field in ('file_path','source_path'):
+                            if entry.get(field):paths[c].add(str(entry[field]))
+                        print('AUDIT_MEETING',c,key,tag(eid),{k:entry.get(k) for k in ('status','attempts','video_delivered','audio_delivered','transcript_delivered','recording_started_at','delivery_started_at','completed_at') if k in entry})
+            db=pathlib.Path(config.get('BEONMEET_DB_PATH',str(data/'beonmeet.db')))
+            if db.is_file():
+                with sqlite3.connect('file:'+str(db)+'?mode=ro',uri=True) as conn:
+                    for c in codes:
+                        rows=conn.execute('SELECT duration_seconds,size_bytes,created_at FROM recordings WHERE meet_url LIKE ?',('%'+c+'%',)).fetchall()
+                        print('AUDIT_DB',c,rows)
+            for c,files in paths.items():
+                print('AUDIT_FILES',c,[(pathlib.Path(p).is_file(),pathlib.Path(p).stat().st_size if pathlib.Path(p).is_file() else 0) for p in files])
+            logs={'controller':cmd('journalctl','-u','beonmeet-controller','--since','2026-11-25 00:00:00','--no-pager','-o','short-iso')}
+            for name in cmd('docker','ps','-a','--format','{{.Names}}').splitlines():
+                if not name.startswith('beonmeet-worker'):continue
+                print('AUDIT_WORKER',name,cmd('docker','inspect','-f','{{.State.Status}} {{.State.OOMKilled}} {{.RestartCount}}',name).strip())
+                logs[name]=cmd('docker','logs','--since','2026-11-25T00:00:00Z',name)
+                # Docker logs may be written to stderr; collect both streams privately.
+                proc=subprocess.run(['docker','logs','--since','2026-11-25T00:00:00Z',name],capture_output=True,text=True,timeout=20)
+                logs[name]=proc.stdout+'\n'+proc.stderr
+            for source,log in logs.items():
+                lines=log.splitlines()
+                categories={'upload_failure':r'upload.*(?:fail|error)|delivery failed','processing_failure':r'processing.*error|premium downstream delivery incomplete|transcription error','admission':r'admi(?:tted|ssion)','recording':r'recording started|recording-started','finished':r'meeting job finished|slot released','connection_error':r'target closed|browser.*disconnect|page.*closed','oom':r'out of memory|oomkill','callback':r'recording-upload|recording-ready'}
+                for c in codes:
+                    relevant=[line for line in lines if c in line or any(e in line for e in ids[c] if len(e)>15)]
+                    print('AUDIT_LOG',source,c,len(relevant),{k:sum(bool(re.search(p,line,re.I)) for line in relevant) for k,p in categories.items()})
+                print('AUDIT_LOG_TOTALS',source,{k:sum(bool(re.search(p,line,re.I)) for line in lines) for k,p in categories.items()})
+            for p in (9124,9126,9132,9133,9134,9135):
+                d=get(p,'capacity');d=d.get('data') or d
+                print('AUDIT_CAPACITY',p,{k:d.get(k) for k in ('runningJobs','maxConcurrentJobs','availableSlots')})
+            print('AUDIT_RESOURCES',cmd('free','-m').splitlines()[:3],cmd('df','-h','/','/dev/shm').splitlines(),cmd('uptime').strip())
+            print('AUDIT_DEPLOYED_CONTROLLER',hashlib.sha256(pathlib.Path('app/main.py').read_bytes()).hexdigest())
+            PY
