@@ -20,6 +20,7 @@ jobs:
         run: |
           set -eu
           python3 -m py_compile app/*.py patches/patch_recording_finalization.py patches/patch_compiled_uploader_handoff.py scripts/deploy_concurrent_recording_release.py
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then sudo apt-get update -qq && sudo apt-get install -y ffmpeg; fi
           command -v ffmpeg
           command -v ffprobe
           python3 tests/concurrent_handoff_test.py
