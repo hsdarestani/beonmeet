@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 275389bc8642b1e53073bb84e71a59c3ffe11d6d
+          ref: e6d408949c59066ced7ed5219ef16aa6013185ff
       - name: Validate pinned release and genuine local A/V handoff regressions
         run: |
           set -eu
@@ -45,7 +45,7 @@ jobs:
             exec 9>/var/lock/pars-vds-bot-deploy.lock
             flock -w 120 9
             cd /opt/beonmeet
-            release=275389bc8642b1e53073bb84e71a59c3ffe11d6d
+            release=e6d408949c59066ced7ed5219ef16aa6013185ff
             git fetch -q origin fix/concurrent-recording-durable-handoff-20261125
             git merge-base --is-ancestor "$release" FETCH_HEAD
             stage=$(mktemp -d /opt/beonmeet/.release-runner.XXXXXXXX)
