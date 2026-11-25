@@ -1,0 +1,70 @@
+name: Examine stuck test recording finalization (read-only)
+on:
+  push:
+    branches: [ops/concurrent-worker-trace-retry-20261125]
+    paths: [.github/workflows/ops-recording-finalization-evidence.yml]
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 4m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import json,subprocess,pathlib,re,datetime,hashlib
+            codes=('obi-fudd-kmu','dva-wbnh-qik')
+            state=json.loads(pathlib.Path('data/state.json').read_text())
+            ids={c:[k for k,v in state.get('launched_events',{}).items() if c in str(v.get('meet_url',''))] for c in codes}
+            def run(*args):
+                p=subprocess.run(args,capture_output=True,text=True,timeout=12)
+                return p.stdout if p.returncode==0 else ''
+            # Only report matching test room tab counts, not any browser URLs.
+            for n in ('beonmeet-chrome-single','beonmeet-isolated-chrome-2','beonmeet-isolated-chrome-3','beonmeet-isolated-chrome-4','beonmeet-isolated-chrome-5'):
+                try:
+                    tabs=json.loads(run('docker','exec',n,'curl','-fsS','--max-time','3','http://127.0.0.1:9223/json/list'))
+                    print('CDP_TARGETS',n,len(tabs),{c:sum(c in str(t.get('url','')) for t in tabs) for c in codes})
+                except Exception:print('CDP_TARGETS_UNAVAILABLE',n)
+            for n,c in (('beonmeet-worker-five',codes[0]),('beonmeet-isolated-worker-3',codes[1])):
+                p=subprocess.run(['docker','logs','--since','2026-11-25T15:25:00Z',n],capture_output=True,text=True,timeout=20)
+                lines=(p.stdout+'\n'+p.stderr).splitlines()
+                # Extract fixed vocabulary only; never expose raw meeting logs.
+                vocabulary=['stopTheRecording','screenAppMeetEnd','recording started','mediaRecorder','dataavailable','recording duration','Recording is empty','Unable to write recording chunk','BeOnMeet delivery failed','Target closed','TargetCloseError','Session closed','Execution context was destroyed','Error processing','Protocol error','waitForTimeout','timeout','page validity','page stayed invalid','participant','alone','stop recording','recording stopped','upload','meeting end','waitingPromise','resolveEarly','eventId','page closed','error']
+                hits=collections.Counter() if False else {}
+                for i,line in enumerate(lines):
+                    markers=[m for m in vocabulary if m.lower() in line.lower()]
+                    if markers:
+                        for m in markers:hits[m]=hits.get(m,0)+1
+                        if any(m in markers for m in ('Target closed','TargetCloseError','Session closed','Error processing','Protocol error','Execution context was destroyed','Recording is empty','Unable to write recording chunk','BeOnMeet delivery failed','stop recording','recording stopped','meeting end','page validity','page stayed invalid','upload')):
+                            print('STOP_EVENT',n,i,markers)
+                print('STOP_COUNTS',n,len(lines),hits)
+                src=run('docker','exec',n,'sed','-n','1,3000p','/usr/src/app/dist/bots/GoogleMeetBot.js')
+                print('COMPILED_BOT_HASH',n,hashlib.sha256(src.encode()).hexdigest())
+                if n=='beonmeet-worker-five':
+                    source=src.splitlines()
+                    anchors=('initialAloneGrace','hasSeenOtherParticipant','seenOtherParticipant','isOnValidGoogleMeetPageInterval','stopTheRecording','screenAppMeetEnd','mediaRecorder.onstop','mediaRecorder.ondataavailable','waitingPromise','getParticipantCount')
+                    ranges=set()
+                    for i,line in enumerate(source):
+                        if any(a in line for a in anchors):
+                            ranges.update(range(max(0,i-2),min(len(source),i+4)))
+                    for i in sorted(ranges):print('BOT_SOURCE',i+1,source[i].strip())
+                for p in run('docker','exec',n,'find','/usr/src/app/dist','-name','*Uploader.js','-o','-name','*JobStore.js').splitlines():
+                    src=run('docker','exec',n,'sed','-n','1,400p',p)
+                    print('DEPLOYED_IMPL',n,p.rsplit('/',1)[-1],hashlib.sha256(src.encode()).hexdigest(),{m:m in src for m in ('tempFileId','botId','unlink','runningJobs','writeChain','CONTROLLER_STREAM_UPLOAD_URL')})
+            for root in (pathlib.Path('/dev/shm/beonmeet'),):
+                if root.is_dir():
+                    files=[p for p in root.rglob('*') if p.is_file()]
+                    print('CAPTURE_FILE_COUNT_BYTES',len(files),sum(p.stat().st_size for p in files))
+                    for c in codes:
+                        matched=[p for p in files if any(e in str(p) for e in ids[c])]
+                        print('TEST_CAPTURE_METADATA',c,[(p.stat().st_size,datetime.datetime.fromtimestamp(p.stat().st_mtime,datetime.timezone.utc).isoformat()) for p in matched])
+            PY
