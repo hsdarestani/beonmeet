@@ -1,0 +1,36 @@
+name: Live BeOnMeet owner-run concurrent recording QA monitor
+on:
+  push:
+    branches: [ops/concurrent-worker-trace-retry-20261125]
+    paths: [.github/workflows/ops-live-owner-concurrency-qa-monitor.yml]
+permissions:
+  contents: read
+concurrency:
+  group: beonmeet-readonly-qa-monitor
+  cancel-in-progress: false
+jobs:
+  monitor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    steps:
+      - name: Read-only 75-minute owner QA monitoring window
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 80m
+          script: |
+            set -eu
+            umask 077
+            cd /opt/beonmeet
+            git fetch -q origin ops/concurrent-worker-trace-retry-20261125
+            monitor_ref=f2bb58f3635828253a2dea4e8915b012d558e47e
+            git merge-base --is-ancestor "$monitor_ref" FETCH_HEAD
+            stage=$(mktemp -d /opt/beonmeet/.qa-monitor.XXXXXXXX)
+            trap 'rm -rf "$stage"' EXIT
+            git show "$monitor_ref:scripts/monitor_concurrent_recording_qa.py" > "$stage/monitor.py"
+            python3 -m py_compile "$stage/monitor.py"
+            echo OWNER_QA_MONITOR_READY
+            python3 -u "$stage/monitor.py" --seconds 4500
