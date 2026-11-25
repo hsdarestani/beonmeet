@@ -456,9 +456,12 @@ def record_request(telegram_id: str, meet_url: str, mode: str) -> None:
         )
 
 
-def record_recording(telegram_id: str, meet_url: str, filename: str, size_bytes: int, duration_seconds: int) -> None:
+def record_recording(telegram_id: str, meet_url: str, filename: str, size_bytes: int, duration_seconds: int, reserved_seconds: int | None = None) -> None:
     now = utcnow().isoformat()
     with _db() as db:
+        # Serialize wallet deduction and duplicate detection for this owner.
+        # SQLite acquires the write transaction; PostgreSQL locks this user row.
+        db.execute("UPDATE users SET telegram_id=telegram_id WHERE telegram_id=?", (str(telegram_id),))
         duplicate = db.execute(
             "SELECT id FROM recordings WHERE telegram_id=? AND filename=? LIMIT 1",
             (str(telegram_id), filename or ""),
@@ -477,14 +480,14 @@ def record_recording(telegram_id: str, meet_url: str, filename: str, size_bytes:
             (now, str(telegram_id)),
         )
         # Both welcome minutes and purchased hours share the same ledger.
-        # Do not create an unexpected negative paid debt from a free-only trial
-        # that happened to run longer than its welcome allowance.
-        # Paying customers retain the existing metered-overrun behavior.
+        # Never create unpaid debt. The media duration remains in the recording
+        # row; the debit cannot exceed actual available prepaid credit.
         if duration_seconds and has_wallet_history(db,str(telegram_id)) and not _active_legacy_subscription(telegram_id):
             amount=max(0,int(duration_seconds))
             current=wallet_balance(db,str(telegram_id))
-            if current["paid_remaining_seconds"] <= 0 and current["trial_granted_seconds"] > 0:
-                amount=min(amount,current["remaining_seconds"])
+            amount=min(amount,current["remaining_seconds"])
+            if reserved_seconds is not None:
+                amount=min(amount,max(0,int(reserved_seconds)))
             if amount:
                 add_entry(db,str(telegram_id),-amount,
                     f"recording:{telegram_id}:{filename or ''}","recording")
