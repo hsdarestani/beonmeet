@@ -18,6 +18,8 @@ class DiskUploader implements IUploader {
   private readonly root: string;
   private recordingDuration?: number;
   private writeChain: Promise<void> = Promise.resolve();
+  private captureNotified = false;
+  private readonly filename: string;
 
   private constructor(
     _token: string,
@@ -37,6 +39,7 @@ class DiskUploader implements IUploader {
     this.meetingLink = meetingLink;
     this.extension = process.env.UPLOADER_FILE_EXTENSION || '.webm';
     this.root = process.env.RECORDING_TMP_DIR || '/recordings';
+    this.filename = `BeOnMeet-${this.botId.replace(/[^a-zA-Z0-9_-]/g, '_')}-${this.tempFileId.replace(/[^a-zA-Z0-9_-]/g, '_')}${this.extension}`;
   }
 
   public static async initialize(
@@ -71,7 +74,7 @@ class DiskUploader implements IUploader {
   }
 
   private folderPath(): string {
-    return path.join(this.root, this.userId.replace(/[^a-zA-Z0-9_-]/g, '_'));
+    return path.join(this.root, this.userId.replace(/[^a-zA-Z0-9_-]/g, '_'), this.botId.replace(/[^a-zA-Z0-9_-]/g, '_'));
   }
 
   private filePath(): string {
@@ -85,6 +88,22 @@ class DiskUploader implements IUploader {
     });
     try {
       await this.writeChain;
+      if (data.length && !this.captureNotified) {
+        this.captureNotified = true;
+        const url = process.env.CONTROLLER_RECORDING_STARTED_URL;
+        const secret = process.env.INTERNAL_SECRET;
+        if (url && secret) {
+          // The first nonempty persisted chunk is stronger evidence than
+          // calling MediaRecorder.start(). Never let notification stall capture.
+          void fetch(url, {
+            method: 'POST', headers: { 'content-type': 'application/json', 'x-beonmeet-secret': secret },
+            signal: AbortSignal.timeout(10000),
+            body: JSON.stringify({ userId: this.userId, botId: this.botId, eventId: this.botId,
+              meetingLink: this.meetingLink, captureBytes: data.length }),
+          }).then(response => { if (!response.ok) this.captureNotified = false; })
+            .catch(() => { this.captureNotified = false; });
+        }
+      }
       return true;
     } catch (error) {
       this.logger.error('Unable to write recording chunk', { error, filePath });
@@ -117,11 +136,15 @@ class DiskUploader implements IUploader {
         botId: this.botId,
         meetingLink: this.meetingLink,
         duration: this.recordingDuration,
-        filename: `BeOnMeet-${new Date().toISOString().replace(/[:.]/g, '-')}${this.extension}`,
+        filename: this.filename,
         size: stat.size,
       };
 
-      let response: Response;
+      // Retry the same identity and source; controller acknowledgement means
+      // durable handoff, not that transcription has finished.
+      let response: Response | undefined;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
       if (streamControllerUrl) {
         const encodedMeta = Buffer.from(JSON.stringify(metadata), 'utf8').toString('base64url');
         response = await fetch(streamControllerUrl, {
@@ -133,6 +156,7 @@ class DiskUploader implements IUploader {
             'x-beonmeet-meta': encodedMeta,
           },
           body: fs.createReadStream(filePath) as any,
+          signal: AbortSignal.timeout(300000),
           duplex: 'half',
         } as any);
       } else {
@@ -146,13 +170,17 @@ class DiskUploader implements IUploader {
             ...metadata,
             filePath,
           }),
+          signal: AbortSignal.timeout(300000),
         });
       }
-
-      if (!response.ok) {
-        const body = await response.text();
-        throw new Error(`Controller returned ${response.status}: ${body}`);
+          if (response.ok) break;
+          if (response.status >= 400 && response.status < 500 && response.status !== 429) break;
+        } catch (error) {
+          this.logger.warn('Recording handoff attempt failed', { botId: this.botId, attempt });
+        }
+        if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 1000 * 2 ** attempt));
       }
+      if (!response?.ok) throw new Error(`Controller recording handoff failed: ${response?.status || 'network'}`);
 
       try {
         await fs.promises.unlink(filePath);
@@ -160,6 +188,7 @@ class DiskUploader implements IUploader {
 
       this.logger.info('Recording delivered to BeOnMeet controller', {
         userId: this.userId,
+        botId: this.botId,
         size: stat.size,
       });
       return true;
