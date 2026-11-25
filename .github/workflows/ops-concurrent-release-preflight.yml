@@ -1,0 +1,55 @@
+name: Stage concurrent-recording release preflight (no restart)
+on:
+  push:
+    branches: [ops/concurrent-worker-trace-retry-20261125]
+    paths: [.github/workflows/ops-concurrent-release-preflight.yml]
+permissions:
+  contents: read
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 4m
+          script: |
+            set -eu
+            umask 077
+            cd /opt/beonmeet
+            git fetch -q origin fix/concurrent-recording-durable-handoff-20261125
+            release=7e9dca11406790f928f4c4d9b5cc2c0f4d2584a1
+            git merge-base --is-ancestor "$release" FETCH_HEAD
+            stage=$(mktemp -d /opt/beonmeet/.concurrent-release-check.XXXXXXXX)
+            trap 'rm -rf "$stage"' EXIT
+            git show "$release:patches/patch_recording_finalization.py" > "$stage/patch.py"
+            docker exec beonmeet-worker-five sed -n '1,3000p' /usr/src/app/dist/bots/GoogleMeetBot.js > "$stage/original.js"
+            python3 "$stage/patch.py" "$stage/original.js" "$stage/fixed.js"
+            docker exec -i beonmeet-worker-five node --check < "$stage/fixed.js"
+            echo WORKER_FINALIZATION_OVERLAY_COMPILATION_PASS
+            for path in app/main.py app/i18n.py app/state_store.py app/recording_handoff.py; do
+              git diff 20c5de26360ab083082fe41767a13ec3e4626501 "$release" -- "$path" > "$stage/file.patch"
+              if git apply --check "$stage/file.patch" 2>/dev/null; then echo CONTROLLER_PATCH_APPLIES "$path"; else echo CONTROLLER_PATCH_CONTEXT_MISMATCH "$path"; fi
+            done
+            python3 - <<'PY'
+            import json,subprocess,pathlib,urllib.request,hashlib
+            codes=('obi-fudd-kmu','dva-wbnh-qik')
+            s=json.loads(pathlib.Path('data/state.json').read_text())
+            active=[v for v in s.get('launched_events',{}).values() if v.get('status') in ('joining','waiting_for_admission','recording','delivering','remote_claimed')]
+            print('ACTIVE_KNOWN_TEST_JOBS',sum(any(c in str(v.get('meet_url','')) for c in codes) for v in active),'ACTIVE_OTHER_JOBS',sum(not any(c in str(v.get('meet_url','')) for c in codes) for v in active))
+            for p in (9124,9126,9132,9133,9134,9135):
+                with urllib.request.urlopen(f'http://127.0.0.1:{p}/capacity',timeout=5) as r:d=json.load(r)
+                print('CAPACITY',p,d.get('data',d))
+            names=['beonmeet-worker-five']+[f'beonmeet-isolated-worker-{i}' for i in range(2,6)]
+            for n in names:
+                ins=json.loads(subprocess.check_output(['docker','inspect',n],text=True))[0]
+                m=next((x for x in ins['Mounts'] if x['Destination']=='/usr/src/app/dist/bots/GoogleMeetBot.js'),None)
+                print('OVERLAY',n,hashlib.sha256(str(m['Source']).encode()).hexdigest()[:12] if m else None)
+            PY
+            docker exec beonmeet-worker-five sh -c 'grep -n -E "recordingDuration|durationMinutes|maxRecordingDuration|google/join" /usr/src/app/dist/app/index.js | head -35'
+            docker exec beonmeet-worker-five sed -n '1,220p' /usr/src/app/dist/middleware/disk-uploader.js
+            echo READ_ONLY_PREFLIGHT_COMPLETE
