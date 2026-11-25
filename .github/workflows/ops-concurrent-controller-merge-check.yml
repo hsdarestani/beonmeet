@@ -1,0 +1,51 @@
+name: Reconcile live controller source with tested release (read-only)
+on:
+  push:
+    branches: [ops/concurrent-worker-trace-retry-20261125]
+    paths: [.github/workflows/ops-concurrent-controller-merge-check.yml]
+permissions:
+  contents: read
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 3m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            umask 077
+            temp=$(mktemp -d /opt/beonmeet/.concurrent-merge-preflight.XXXXXXXX)
+            trap 'rm -rf "$temp"' EXIT
+            git show 20c5de26360ab083082fe41767a13ec3e4626501:app/main.py > "$temp/base.py"
+            git show 7e9dca11406790f928f4c4d9b5cc2c0f4d2584a1:app/main.py > "$temp/release.py"
+            cp app/main.py "$temp/live.py"
+            status=0
+            git merge-file -p --diff3 "$temp/live.py" "$temp/base.py" "$temp/release.py" > "$temp/merged.py" || status=$?
+            echo MERGE_STATUS "$status"
+            python3 - "$temp" <<'PY'
+            import sys,ast,pathlib
+            root=pathlib.Path(sys.argv[1])
+            def functions(p):
+                t=ast.parse(p.read_text())
+                return {x.name:ast.dump(x,include_attributes=False) for x in t.body if isinstance(x,(ast.FunctionDef,ast.AsyncFunctionDef))}
+            b=functions(root/'base.py');l=functions(root/'live.py');r=functions(root/'release.py')
+            print('LIVE_RUNTIME_ONLY_FUNCTIONS',[n for n in l if l.get(n)!=b.get(n)])
+            print('OVERLAP_FUNCTIONS',[n for n in r if n in l and r.get(n)!=b.get(n) and l.get(n)!=b.get(n) and r.get(n)!=l.get(n)])
+            lines=(root/'merged.py').read_text().splitlines()
+            for i,line in enumerate(lines):
+                if line.startswith('<<<<<<<'):
+                    fn=next((z.strip() for z in reversed(lines[:i]) if z.startswith(('def ','async def '))),'<module>')
+                    print('MERGE_CONFLICT_AT',i+1,fn)
+            if not any(x.startswith('<<<<<<<') for x in lines):
+                ast.parse('\n'.join(lines))
+                print('MERGED_CONTROLLER_SYNTAX_PASS')
+            PY
+            docker exec beonmeet-worker-five sh -c 'grep -R -n --include="*.js" "/google/join" /usr/src/app/dist | head -12'
+            echo LIVE_SOURCE_RECONCILIATION_COMPLETE
