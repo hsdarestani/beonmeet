@@ -20,14 +20,16 @@ def billing(receipt):
     filename=receipt.get('filename','')
     chat=receipt.get('chat_id','')
     with sqlite3.connect('file:'+str(db)+'?mode=ro',uri=True) as conn:
-        row=conn.execute('SELECT COUNT(*), COALESCE(SUM(duration_seconds),0) FROM recordings WHERE telegram_id=? AND filename=?',(chat,filename)).fetchone()
-        debit=conn.execute('SELECT COUNT(*),COALESCE(SUM(-seconds_delta),0) FROM credit_entries WHERE reference=?',('recording:'+chat+':'+filename,)).fetchone()
+        mp4=str(pathlib.Path(filename).with_suffix('.mp4')) if filename else ''
+        row=conn.execute('SELECT COUNT(*), COALESCE(SUM(duration_seconds),0) FROM recordings WHERE telegram_id=? AND filename IN (?,?)',(chat,filename,mp4)).fetchone()
+        debit=conn.execute('SELECT COUNT(*),COALESCE(SUM(-seconds_delta),0) FROM credit_entries WHERE reference IN (?,?)',('recording:'+chat+':'+filename,'recording:'+chat+':'+mp4)).fetchone()
     return {'recording_rows':row[0],'duration_seconds':row[1],'debit_rows':debit[0],'debited_seconds':debit[1]}
 def main(seconds):
     initial=state()
     old=set().union(*(set(initial.get(k,{})) for k in ('launched_events','pending_deliveries','completed_deliveries','failed_recordings')))
     known={}; cpu_prev=cpu(); started=time.monotonic(); last=started
     peak_cpu=0;peak_ram=0;peak_slots=0;five_seconds=0;lowest_disk=None
+    time.sleep(10)
     while time.monotonic()-started<seconds:
         now=time.monotonic(); cur=cpu()
         pct=round(100*(1-(cur[1]-cpu_prev[1])/max(1,cur[0]-cpu_prev[0])),1)
