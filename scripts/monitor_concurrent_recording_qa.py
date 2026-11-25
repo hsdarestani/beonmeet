@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Read-only metrics during owner-run production QA. No user IDs or links printed."""
-import argparse, hashlib, json, pathlib, shutil, sqlite3, time, urllib.request
+import argparse, hashlib, json, pathlib, shutil, sqlite3, subprocess, time, urllib.request
 ROOT=pathlib.Path('/opt/beonmeet')
 PORTS=(9126,9132,9133,9134,9135)
 def get(port,path):
@@ -10,6 +10,14 @@ def state():
 def cpu():
     n=[int(x) for x in pathlib.Path('/proc/stat').read_text().splitlines()[0].split()[1:]]
     return sum(n[:8]),n[3]+n[4]
+def disk_io():
+    rows=[x.split() for x in pathlib.Path('/proc/diskstats').read_text().splitlines()]
+    physical=[r for r in rows if r[2] in ('vda','sda','nvme0n1')]
+    return sum(int(r[5]) for r in physical),sum(int(r[9]) for r in physical)
+def oom():
+    names=['beonmeet-worker-five','beonmeet-chrome-single']+[f'beonmeet-isolated-{kind}-{i}' for kind in ('worker','chrome') for i in range(2,6)]
+    p=subprocess.run(['docker','inspect','-f','{{.State.OOMKilled}} {{.RestartCount}}',*names],capture_output=True,text=True,timeout=8)
+    return {'oom_killed_current':sum(x.startswith('true ') for x in p.stdout.splitlines()),'restart_count_total':sum(int(x.split()[-1]) for x in p.stdout.splitlines() if len(x.split())==2 and x.split()[-1].isdigit())}
 def memory():
     d={x.split(':')[0]:int(x.split()[1]) for x in pathlib.Path('/proc/meminfo').read_text().splitlines() if x.startswith(('MemTotal:','MemAvailable:'))}
     return (d['MemTotal']-d['MemAvailable'])//1024
@@ -27,13 +35,18 @@ def billing(receipt):
 def main(seconds):
     initial=state()
     old=set().union(*(set(initial.get(k,{})) for k in ('launched_events','pending_deliveries','completed_deliveries','failed_recordings')))
-    known={}; cpu_prev=cpu(); started=time.monotonic(); last=started
+    known={}; cpu_prev=cpu(); io_prev=disk_io(); started=time.monotonic(); last=started
+    oom_before=oom(); peak_read=0; peak_write=0
     peak_cpu=0;peak_ram=0;peak_slots=0;five_seconds=0;lowest_disk=None
     time.sleep(10)
     while time.monotonic()-started<seconds:
         now=time.monotonic(); cur=cpu()
         pct=round(100*(1-(cur[1]-cpu_prev[1])/max(1,cur[0]-cpu_prev[0])),1)
         cpu_prev=cur
+        io=disk_io(); interval=max(1,now-last)
+        read_mib=max(0,io[0]-io_prev[0])*512/1048576/interval
+        write_mib=max(0,io[1]-io_prev[1])*512/1048576/interval
+        io_prev=io;peak_read=max(peak_read,read_mib);peak_write=max(peak_write,write_mib)
         ram=memory();free=shutil.disk_usage(ROOT).free//1048576
         peak_cpu=max(peak_cpu,pct);peak_ram=max(peak_ram,ram)
         lowest_disk=free if lowest_disk is None else min(lowest_disk,free)
@@ -57,7 +70,7 @@ def main(seconds):
         except Exception as e:print(json.dumps({'sample_error':type(e).__name__}),flush=True)
         last=now
         time.sleep(10)
-    print(json.dumps({'summary':{'peak_host_cpu_percent':peak_cpu,'peak_host_ram_mib':peak_ram,'peak_worker_slots':peak_slots,'approx_five_concurrent_seconds':round(five_seconds),'minimum_free_disk_mib':lowest_disk}}),flush=True)
+    print(json.dumps({'summary':{'peak_host_cpu_percent':peak_cpu,'peak_host_ram_mib':peak_ram,'peak_worker_slots':peak_slots,'approx_five_concurrent_seconds':round(five_seconds),'minimum_free_disk_mib':lowest_disk,'peak_disk_read_mib_s':round(peak_read,2),'peak_disk_write_mib_s':round(peak_write,2),'oom_before':oom_before,'oom_after':oom()}}),flush=True)
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--seconds',type=int,default=2400)
     a=p.parse_args();assert 10<=a.seconds<=7200
