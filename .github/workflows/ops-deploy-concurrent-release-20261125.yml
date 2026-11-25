@@ -1,0 +1,71 @@
+name: Guarded BeOnMeet concurrent recording production release
+on:
+  push:
+    branches: [ops/concurrent-worker-trace-retry-20261125]
+    paths: [.github/workflows/ops-deploy-concurrent-release-20261125.yml]
+permissions:
+  contents: read
+concurrency:
+  group: beonmeet-shared-controller
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 275389bc8642b1e53073bb84e71a59c3ffe11d6d
+      - name: Validate pinned release and genuine local A/V handoff regressions
+        run: |
+          set -eu
+          python3 -m py_compile app/*.py patches/patch_recording_finalization.py patches/patch_compiled_uploader_handoff.py scripts/deploy_concurrent_recording_release.py
+          command -v ffmpeg
+          command -v ffprobe
+          python3 tests/concurrent_handoff_test.py
+          python3 tests/concurrent_credit_reservation_test.py
+          python3 tests/recording_finalization_overlay_test.py
+          python3 tests/compiled_uploader_handoff_test.py
+          python3 tests/prepaid_hour_wallet_behavior_test.py
+          python3 tests/five_isolated_workers_dispatch_test.py
+          python3 tests/premium_delivery_test.py
+          python3 tests/worker_auth_guard_test.py
+      - name: Stage, validate, drain only identified obsolete test jobs and deploy
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 12m
+          script: |
+            set -eu
+            umask 077
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 120 9
+            cd /opt/beonmeet
+            release=275389bc8642b1e53073bb84e71a59c3ffe11d6d
+            git fetch -q origin fix/concurrent-recording-durable-handoff-20261125
+            git merge-base --is-ancestor "$release" FETCH_HEAD
+            stage=$(mktemp -d /opt/beonmeet/.release-runner.XXXXXXXX)
+            trap 'rm -rf "$stage"' EXIT
+            git show "$release:scripts/deploy_concurrent_recording_release.py" > "$stage/deploy.py"
+            python3 "$stage/deploy.py" "$release"
+            flock -u 9
+            echo AUTH_WATCHDOG_RECHECK
+            systemctl start beonmeet-auth-watch.service || true
+            python3 - <<'PY'
+            import json,urllib.request,pathlib
+            def read(port,path):
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/{path}',timeout=8) as r:return json.load(r)
+            h=read(8109,'health')
+            assert h.get('ok') and 'pending_transcription_jobs' in h
+            print('PROD_RELEASE_HEALTH',{k:h.get(k) for k in ('ok','authenticated_free_workers','healthy_free_workers','active_recording_jobs','failed_recording_jobs','pending_delivery_jobs','pending_transcription_jobs','recording_spool_free_bytes','load_average_1m')})
+            for p in (9126,9132,9133,9134,9135):
+                c=read(p,'capacity')
+                print('PROD_RELEASE_CAPACITY',p,c.get('data',c))
+            mem={x.split(':')[0]:int(x.split()[1])//1024 for x in pathlib.Path('/proc/meminfo').read_text().splitlines() if x.startswith(('MemTotal:','MemAvailable:'))}
+            print('PROD_RELEASE_MEMORY_MIB',mem)
+            print('AUTHENTICATED_FIVE_GATE',int(h.get('authenticated_free_workers') or 0)==5)
+            PY
+            curl -fsS --max-time 10 https://beonmeet.smarbiz.sbs/health >/dev/null
