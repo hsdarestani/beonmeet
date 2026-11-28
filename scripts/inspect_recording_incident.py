@@ -52,6 +52,42 @@ def error_summary(log):
     return {"http": dict(codes), "errors": {key: n for key, n in errors.items() if n}}
 
 
+def tracebacks(log):
+    frames = re.findall(r'File "[^"\n]*/(?:app/)?(main|recording_handoff|state_store)\.py", line (\d+), in (\w+)', log)
+    report("CONTROLLER_FRAMES", dict(Counter(f"{file}:{name}:{line}" for file, line, name in frames)))
+    errors = re.findall(r"(?:^|\s)([A-Z][A-Za-z]*(?:Error|Exception)):", log)
+    report("ERROR_CLASSES", dict(Counter(errors)))
+    codes = re.findall(r"\[Errno (\d+)\]", log)
+    report("OS_ERROR_NUMBERS", dict(Counter(codes)))
+    names = re.findall(r"NameError: name '(persist_source|recording_key|verified_duration|RECORDING_SPOOL)' is not defined", log)
+    report("MISSING_RECORDING_SYMBOLS", dict(Counter(names)))
+
+
+def inspect_capture_files(state):
+    settings = dict(line.split("=", 1) for line in (ROOT / ".env").read_text().splitlines()
+                    if "=" in line and not line.startswith("#"))
+    recording_root = Path(settings.get("RECORDING_TMP_DIR", "/recordings")).resolve()
+    spool = ROOT / "data/recording-spool"
+    owner = (ROOT / "app/main.py").stat()
+    report("STORAGE_LAYOUT", {"recording_root_exists": recording_root.is_dir(),
+                              "spool_exists": spool.is_dir(),
+                              "spool_owner": spool.stat().st_uid if spool.is_dir() else None,
+                              "source_owner": owner.st_uid})
+    component = lambda value: re.sub(r"[^a-zA-Z0-9_-]", "_", value)
+    for index, (eid, job) in enumerate(sorted(state.get("launched_events", {}).items(),
+                                                   key=lambda row: row[1].get("launched_at", "")), 1):
+        if job.get("launched_at", "") < SINCE or job.get("launched_at", "") > UNTIL:
+            continue
+        folder = recording_root / component(str(job.get("chat_id") or "")) / component(eid)
+        files = [f for f in folder.iterdir() if f.is_file() and not f.is_symlink()] if folder.is_dir() else []
+        spooled = list(spool.glob(hashlib.sha256(eid.encode()).hexdigest() + ".*"))
+        report("INCIDENT_JOB", {"number": index, "pool": job.get("pool"), "status": job.get("status"),
+                                "exact_worker_files": len(files), "file_sizes": [f.stat().st_size for f in files],
+                                "exact_spool_files": len(spooled), "has_capture_callback": bool(job.get("recording_started_at")),
+                                "source_recovery_attempts": job.get("source_recovery_attempts", 0),
+                                "idle_observed": bool(job.get("idle_observed_at"))})
+
+
 def main():
     state = json.loads((ROOT / "data/state.json").read_text())
     readiness = json.loads((ROOT / "data/worker-auth-readiness.json").read_text())
@@ -79,6 +115,8 @@ def main():
     log = command("journalctl", "-u", "beonmeet-controller", "--since", "2026-11-28 13:00 UTC",
                   "--until", "2026-11-28 13:35 UTC", "--no-pager")
     report("CONTROLLER_ERRORS", error_summary(log))
+    tracebacks(log)
+    inspect_capture_files(state)
     for group in ("launched_events", "failed_recordings", "pending_deliveries", "completed_deliveries"):
         entries = state.get(group, {})
         report("STATE", {"group": group, "count": len(entries),
