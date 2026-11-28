@@ -1,0 +1,85 @@
+name: Auth watchdog timing and safe production installation
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/ops-auth-watchdog-capacity-20261128.yml]
+permissions:
+  contents: read
+jobs:
+  verify-and-install:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Test real timestamps and fail-closed routing
+        run: |
+          python3 -m py_compile scripts/worker_auth_monitor.py
+          node --check scripts/probe_recorder_auth.js
+          python3 tests/worker_auth_monitor_timing_test.py
+          python3 tests/worker_auth_guard_test.py
+          python3 tests/five_isolated_workers_dispatch_test.py
+      - name: Install only the watchdog, no controller or recorder restarts
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 25s
+          command_timeout: 8m
+          script: |
+            set -eu
+            umask 077
+            cd /opt/beonmeet
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 180 9
+            git fetch -q origin fix/auth-watchdog-capacity-20261128
+            SHA=${{ github.event.pull_request.head.sha }}
+            backup="/opt/beonmeet/.auth-watchdog-timing-backup-$(date -u +%Y%m%dT%H%M%SZ)"
+            mkdir -m 700 "$backup"
+            cp -p scripts/worker_auth_monitor.py scripts/probe_recorder_auth.js "$backup/"
+            cp -p /etc/systemd/system/beonmeet-auth-watch.timer "$backup/"
+            systemctl stop beonmeet-auth-watch.timer
+            rollback() {
+              cp -p "$backup/worker_auth_monitor.py" scripts/worker_auth_monitor.py
+              cp -p "$backup/probe_recorder_auth.js" scripts/probe_recorder_auth.js
+              cp -p "$backup/beonmeet-auth-watch.timer" /etc/systemd/system/beonmeet-auth-watch.timer
+              systemctl daemon-reload
+              systemctl start beonmeet-auth-watch.timer
+            }
+            trap 'rollback' EXIT
+            git show "$SHA:scripts/worker_auth_monitor.py" > scripts/worker_auth_monitor.py
+            git show "$SHA:scripts/probe_recorder_auth.js" > scripts/probe_recorder_auth.js
+            chmod 600 scripts/worker_auth_monitor.py
+            chmod 644 scripts/probe_recorder_auth.js
+            python3 -m py_compile scripts/worker_auth_monitor.py
+            sed -i 's/^OnUnitInactiveSec=.*/OnUnitInactiveSec=40s/;s/^AccuracySec=.*/AccuracySec=5s/' /etc/systemd/system/beonmeet-auth-watch.timer
+            systemctl daemon-reload
+            systemctl start beonmeet-auth-watch.timer
+            systemctl is-active --quiet beonmeet-auth-watch.timer
+            trap - EXIT
+            flock -u 9
+            echo WATCHDOG_ONLY_DEPLOYED_WITH_BACKUP
+            systemctl start beonmeet-auth-watch.service
+            python3 - <<'PY'
+            import json,urllib.request,time,pathlib,subprocess,datetime
+            def get(url):
+                with urllib.request.urlopen(url,timeout=5) as r:return json.load(r)
+            h=get('http://127.0.0.1:8109/health')
+            assert h['ok'] and h['auth_guard_enabled']
+            assert h['free_worker_endpoints']==5 and h['premium_worker_endpoints']==5
+            print('POSTFIX_TIMESTAMP',datetime.datetime.now(datetime.timezone.utc).isoformat())
+            print('POSTFIX_HEALTH',json.dumps({k:h.get(k) for k in ('max_concurrent_meetings','healthy_free_workers','authenticated_free_workers','authenticated_premium_workers','free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs')}))
+            d=json.loads(pathlib.Path('/opt/beonmeet/data/worker-auth-readiness.json').read_text())
+            for u,v in sorted(d['workers'].items()):
+                port=int(u.rsplit(':',1)[1])
+                c=get(u+'/capacity')
+                c=c.get('data') or c
+                print('POSTFIX_LANE',port,'ready',v['ready'],'age',round(time.time()-v['checked_at']),'running',c.get('runningJobs'),'available',c.get('availableSlots'))
+            print('POSTFIX_TIMER',subprocess.check_output(['systemctl','show','beonmeet-auth-watch.timer','-p','TimersMonotonic','-p','ActiveState'],text=True).strip().replace('\n',' '))
+            for n in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                print('POSTFIX_CAMCAM',n,subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',n],text=True).strip())
+            PY
