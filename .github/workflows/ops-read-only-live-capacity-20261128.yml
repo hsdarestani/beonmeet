@@ -1,0 +1,49 @@
+name: Read-only live BeOnMeet capacity diagnostic
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/ops-read-only-live-capacity-20261128.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - name: Read current controller and worker readiness without changing services
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 2m
+          script: |
+            set -eu
+            python3 - <<'PY'
+            import json,urllib.request,urllib.parse,time,pathlib,subprocess,datetime
+            def get(url):
+                with urllib.request.urlopen(url,timeout=3) as response:
+                    return json.load(response)
+            h=get('http://127.0.0.1:8109/health')
+            keys=['ok','max_concurrent_meetings','free_meeting_slots','premium_reserved_slots','local_free_meeting_slots','local_premium_reserved_slots','free_worker_endpoints','premium_worker_endpoints','healthy_free_workers','healthy_premium_workers','authenticated_free_workers','authenticated_premium_workers','auth_guard_enabled','free_queue','premium_queue','remote_workers','remote_free_slots','remote_premium_slots','remote_free_available_slots','remote_premium_available_slots','active_delivery_jobs','pending_delivery_jobs','autoscaler_enabled']
+            print('LIVE_TIMESTAMP',datetime.datetime.now(datetime.timezone.utc).isoformat())
+            print('LIVE_CONTROLLER',json.dumps({k:h.get(k) for k in keys}))
+            p=pathlib.Path('/opt/beonmeet/data/worker-auth-readiness.json')
+            if p.is_file():
+                d=json.loads(p.read_text())
+                for i,(url,v) in enumerate(sorted(d.get('workers',{}).items()),1):
+                    result={'lane':i,'port':urllib.parse.urlsplit(url).port,'ready':bool(v.get('ready')),'age_seconds':round(time.time()-float(v.get('checked_at') or 0))}
+                    try:
+                        c=get(url.rstrip('/')+'/capacity')
+                        result['capacity']={k:v for k,v in c.items() if isinstance(v,(int,float,bool)) and any(x in k.lower() for x in ('active','slot','capacity','busy','available','record','max','count'))}
+                    except Exception as e:
+                        result['capacity_error']=type(e).__name__
+                    print('LIVE_WORKER',json.dumps(result))
+            else:
+                print('LIVE_READINESS_FILE_MISSING')
+            for unit in ('beonmeet-auth-watch.service','beonmeet-auth-watch.timer'):
+                p=subprocess.run(['systemctl','show',unit,'--property=ActiveState,SubState,Result','--no-pager'],capture_output=True,text=True,timeout=5)
+                print('LIVE_WATCHDOG',unit,p.stdout.strip().replace('\n',' '))
+            PY
