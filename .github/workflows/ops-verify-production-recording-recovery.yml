@@ -1,0 +1,27 @@
+name: Verify recovered production recordings and credit debits
+on:
+  push:
+    branches: [ops/verify-production-recording-recovery-20261128]
+    paths: [.github/workflows/ops-verify-production-recording-recovery.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify exact incident delivery and billing
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 25s
+          command_timeout: 3m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            git fetch -q origin ${{ github.sha }}
+            git show "${{ github.sha }}:scripts/verify_recording_incident_recovery.py" | python3 -
