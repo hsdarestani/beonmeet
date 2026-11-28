@@ -1,0 +1,27 @@
+name: Inspect production recording incident
+on:
+  push:
+    branches: [ops/inspect-production-reliability-20261128]
+    paths: [.github/workflows/ops-inspect-production-reliability.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read production state and callback statuses
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 25s
+          command_timeout: 3m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            git fetch -q origin ${{ github.sha }}
+            git show "${{ github.sha }}:scripts/inspect_recording_incident.py" | python3 -
