@@ -45,7 +45,8 @@ def atomic_write(path,data):
         if os.path.exists(filename):os.unlink(filename)
 
 def run_node(code,input_ports):
-    assert code.is_file() and AUTH_LINKS.is_file()
+    if not code.is_file() or not AUTH_LINKS.is_file():
+        raise FileNotFoundError("Private auth probe or fixture configuration missing")
     fd,filename=tempfile.mkstemp(prefix='.auth-input-',dir=RUNTIME)
     try:
         os.fchmod(fd,0o600)
