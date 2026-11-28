@@ -16,12 +16,12 @@ The controller returned 16 HTTP 500 responses to four workers' recording-ready c
 | 1 | Pre-join failure, failure notice sent | 0 s | 0 |
 | 2 | Video and audio delivered, pipeline complete | 451 s | 1 × 451 s |
 | 3 | Video and audio delivered, pipeline complete | 439 s | 1 × 439 s |
-| 4 | Video and audio delivered, transcript pending at this snapshot | 385 s | 1 × 385 s |
-| 5 | Video and audio delivered, transcript pending at this snapshot | 229 s | 1 × 229 s |
+| 4 | Video and audio delivered, pipeline complete | 385 s | 1 × 385 s |
+| 5 | Video and audio delivered, pipeline complete | 229 s | 1 × 229 s |
 
-The exact recovery records are in the protected production state and the metadata backup. Recovery used each original owner and event path. Files without an exact ownership record remain untouched.
+[The settled verification](https://github.com/hsdarestani/beonmeet/actions/runs/46150982590) confirmed completion for all four recovered pipelines. The exact recovery records are in the protected production state and the metadata backup. Recovery used each original owner and event path. Files without an exact ownership record remain untouched.
 
-## Changes under this branch
+## Production release
 
 - Reconcile the tested production release `e6d4089` with `main`. Reuse its persistent media handoff, independently scheduled transcripts, identity-based recovery, and atomic credit reservation. Subsequent live application changes are preserved by a three-way merge at deployment.
 - Add lane leases shared by the monitor and controller. A watchdog tab and a new recording cannot share the same lane concurrently. Idle probes distinguish a confirmed Google login challenge from ambiguous UI, transport failures, and busy workers. Keep the original verification timestamp through inconclusive checks and never reissue proof based on a cache.
@@ -29,8 +29,12 @@ The exact recovery records are in the protected production state and the metadat
 - Protect recorder monitoring behind the existing administrator login. Report transport, Google readiness, capture, delivery, and resources separately. Repeated explicit Google challenges can notify the configured owner.
 - Check inherited shared group when building the recorder uploader. Apply the host metadata repair to existing legacy parents before restarting or changing recorder containers.
 
+[Production rollout](https://github.com/hsdarestani/beonmeet/actions/runs/46150936082) deployed source revision `b3f81b16f6ae583d1c344fad754258f8d9bd973d`. The merged live controller SHA-256 was `e309d978abbe1e4f7fd6970923ec1f569742b262405342c6c85b4035806d7774`. All five recording workers were healthy and verified after the deployment. The controller was restarted after the idle checks. Chrome profiles, recorder containers, account credentials, and unrelated services were kept in place. [CI](https://github.com/hsdarestani/beonmeet/actions/runs/46150938668) passed. [The dashboard access check](https://github.com/hsdarestani/beonmeet/actions/runs/46151157951) returned HTTP 200 for the owner and 401 without authentication.
+
+The browser lanes continue to use the owner's existing Google account. Google native recording depends on eligible Workspace editions and host permissions. Its REST API exposes existing recording artifacts, while the real-time Meet Media API Developer Preview has closed to new participants. [Google Meet recording](https://support.google.com/meet/answer/9308681?hl=en) · [Google developer APIs](https://developers.google.com/workspace/meet)
+
 ## Production acceptance
 
-The incident recovery is separate from release acceptance. Fresh owner-authorized rooms with consenting participants are needed for five simultaneous real recordings for at least 60 minutes. Confirm real admissions and audio/video capture, queue a sixth request, then release a lane and confirm automatic dispatch. Inspect five event-linked delivery receipts, playback, transcription and ledger transactions. Exercise browser and delivery interruption on test jobs only. Repeat the cycle and confirm idle auth stability. Advertising remains gated on these checks.
+The owner deferred the real-meeting test until test rooms are available. Fresh owner-authorized rooms with consenting participants are needed for five simultaneous real recordings for at least 60 minutes. Confirm real admissions and audio/video capture, queue a sixth request, then release a lane and confirm automatic dispatch. Inspect five event-linked delivery receipts, playback, transcription and ledger transactions. Exercise browser and delivery interruption on test jobs only. Repeat the cycle and confirm idle auth stability. Advertising remains gated on these checks.
 
 Automatic reassignment after an ambiguous post, reliable terminal admission-denial signaling, and raw recording durability across a host reboot still need separate verification. Raw worker files currently use the existing host tmpfs mount until the controller persists them to the disk spool.
