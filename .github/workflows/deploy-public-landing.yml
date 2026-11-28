@@ -59,6 +59,11 @@ jobs:
           options.add_argument("--headless=new")
           options.add_argument("--no-sandbox")
           driver = webdriver.Chrome(options=options)
+          def click_in_view(selector):
+              element = driver.find_element(By.CSS_SELECTOR, selector)
+              driver.execute_script("arguments[0].scrollIntoView({block:'center', behavior:'instant'})", element)
+              element.click()
+
           try:
               for lang, path in (("fa", "/fa"), ("en", "/")):
                   for width in (320, 390, 768, 1440):
@@ -70,9 +75,9 @@ jobs:
                       assert content == viewport, (lang, width, viewport, content)
                       assert len(driver.find_elements(By.CSS_SELECTOR, ".plan")) == 3
                       assert driver.find_element(By.CSS_SELECTOR, ".actions a").get_attribute("href") == "https://t.me/BeOnMEETbot"
-                      driver.find_element(By.CSS_SELECTOR, "summary").click()
+                      click_in_view("summary")
                       assert driver.find_element(By.CSS_SELECTOR, "details").get_attribute("open")
-                      driver.find_element(By.CSS_SELECTOR, "nav a[href='#credits']").click()
+                      click_in_view("nav a[href='#credits']")
                       assert driver.current_url.endswith("#credits")
                       print("LANDING_BROWSER_PASS", lang, width)
           finally:
