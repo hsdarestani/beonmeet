@@ -1,0 +1,84 @@
+name: Guarded one-time existing Google account recovery
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/ops-restore-same-account-20261128.yml]
+permissions:
+  contents: read
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Recheck idle production and restore only the existing authorized account locally
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 10m
+          script: |
+            set -eu
+            umask 077
+            cd /opt/beonmeet
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 150 9
+            python3 - <<'PY'
+            import json,time,urllib.request,subprocess,sys,os
+            from pathlib import Path
+            sys.path.insert(0,'/opt/beonmeet/scripts')
+            import worker_auth_monitor as watch
+            def get(url):
+                with urllib.request.urlopen(url,timeout=5) as r:return json.load(r)
+            def idle():
+                h=get('http://127.0.0.1:8109/health')
+                assert h.get('ok') and h.get('auth_guard_enabled')
+                assert not any(int(h.get(k) or 0) for k in ('free_queue','premium_queue','active_delivery_jobs','pending_delivery_jobs')),'QUEUE_OR_DELIVERY_ACTIVE'
+                assert all(watch.capacity(p).get('runningJobs')==0 for p in watch.PORTS),'ACTIVE_RECORDING'
+                return h
+            h=idle()
+            if h.get('authenticated_free_workers') or h.get('authenticated_premium_workers'):
+                print('RECOVERY_SKIPPED_EXISTING_FRESH_CAPACITY')
+                sys.exit(0)
+            state=Path('/opt/beonmeet/data/worker-auth-readiness.json')
+            old=json.loads(state.read_text())
+            assert len(old['workers'])==5
+            # No customer dispatch can enter an unverified lane while the watchdog lock is held.
+            # Recheck after an interval exceeding the worker dispatch request timeout.
+            time.sleep(32)
+            h=idle()
+            assert not h.get('authenticated_free_workers') and not h.get('authenticated_premium_workers')
+            print('RECOVERY_GUARD_ALL_IDLE_NO_FRESH_DISPATCH',flush=True)
+            cmd=['docker','run','--rm','--user','0','--network','beonmeet-single','--memory=620m','--cpus=.6','--pids-limit=185','-e','NODE_PATH=/usr/src/app/node_modules','-v','/opt/beonmeet/scripts/recover_google_recorder_sessions_from_healthy_lane.js:/auth-script.js:ro','-v','/opt/beonmeet/.five-isolated-runtime/qa_meet_links.json:/qa-existing-links.json:ro','--entrypoint','node','beonmeet-worker-audiofix:latest','/auth-script.js']
+            try:
+                p=subprocess.run(cmd,text=True,capture_output=True,timeout=320)
+                for line in p.stdout.splitlines():
+                    if line.startswith(('RECORDER_AUTH_SCAN_LANE ','RECORDER_AUTH_SOURCE_LANE ','RECORDER_AUTH_LANE_RECOVERED ','RECORDER_AUTH_LANE_FINAL ','RECORDER_AUTH_FIVE_LANES_VERIFIED_')):
+                        print(line,flush=True)
+                print('RECOVERY_EXIT',p.returncode,flush=True)
+            except subprocess.TimeoutExpired:
+                print('RECOVERY_TIMEOUT',flush=True)
+            # Never trust the recovery return code alone. Probe all five actual
+            # rooms independently, then publish only current verified proof.
+            assert all(watch.capacity(p).get('runningJobs')==0 for p in watch.PORTS)
+            result=watch.run_node(watch.PROBE,list(watch.PORTS))
+            try: scan=json.loads(result.stdout) if result.returncode==0 else {}
+            except ValueError:scan={}
+            now=int(time.time())
+            workers={}
+            for port in watch.PORTS:
+                u='http://127.0.0.1:'+str(port)
+                row=(scan.get('workers') or {}).get(u,{})
+                checked=int(row.get('checked_at') or 0)
+                ready=row.get('ready') is True and 0<=now-checked<=165
+                workers[u]={'ready':ready,'checked_at':checked if ready else now}
+                print('RECOVERY_FRESH_PROOF',port,ready,flush=True)
+            watch.atomic_write(state,{'workers':workers,'last_repair_at':now})
+            h=get('http://127.0.0.1:8109/health')
+            print('RECOVERY_FINAL',json.dumps({k:h.get(k) for k in ('max_concurrent_meetings','healthy_free_workers','authenticated_free_workers','authenticated_premium_workers','free_queue','premium_queue')}),flush=True)
+            for n in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                print('RECOVERY_CAMCAM',n,subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',n],text=True).strip())
+            PY
