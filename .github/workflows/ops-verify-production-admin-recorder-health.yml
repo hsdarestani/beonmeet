@@ -1,0 +1,52 @@
+name: Verify private BeOnMeet recorder health dashboard
+on:
+  push:
+    branches: [ops/verify-production-admin-recorder-health-20261128]
+    paths: [.github/workflows/ops-verify-production-admin-recorder-health.yml]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - name: Check anonymous and owner view from the production host
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 25s
+          command_timeout: 75s
+          script: |
+            cd /opt/beonmeet
+            python3 - <<'PY'
+            import hashlib
+            import hmac
+            from pathlib import Path
+            import time
+            from urllib.error import HTTPError
+            from urllib.request import Request, urlopen
+
+            path = 'http://127.0.0.1:8109/admin/recorder-health'
+            try:
+                with urlopen(path, timeout=6):
+                    raise RuntimeError('Dashboard permits anonymous access')
+            except HTTPError as exc:
+                assert exc.code == 401, 'Unexpected anonymous response'
+            env = dict(line.split('=', 1) for line in Path('.env').read_text().splitlines()
+                       if '=' in line and not line.startswith('#'))
+            expires = int(time.time()) + 60
+            scope = f"admin:{env['ADMINUSER']}:{expires}"
+            signature = hmac.new(env['INTERNAL_SECRET'].encode(), scope.encode(), hashlib.sha256).hexdigest()
+            request = Request(path, headers={'Cookie': f'beonmeet_admin={expires}.{signature}'})
+            try:
+                with urlopen(request, timeout=6) as response:
+                    html = response.read().decode()
+                    assert response.status == 200
+            except HTTPError as exc:
+                raise RuntimeError('Owner dashboard returned HTTP ' + str(exc.code)) from None
+            assert all(value in html for value in ('وضعیت ضبط', 'ورکرهای آماده', 'تحویل‌های در انتظار'))
+            print('OWNER_RECORDER_DASHBOARD_VERIFIED')
+            PY
