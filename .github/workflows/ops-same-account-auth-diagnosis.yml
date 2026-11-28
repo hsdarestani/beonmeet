@@ -1,0 +1,73 @@
+name: Same Google account idle-lane authentication diagnosis
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/ops-same-account-auth-diagnosis.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Diagnose idle unready lanes without changing sign-in
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 6m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 150 9
+            ports=$(python3 - <<'PY'
+            import json,time,urllib.request
+            from pathlib import Path
+            def get(url):
+                with urllib.request.urlopen(url,timeout=4) as r:return json.load(r)
+            d=json.loads(Path('data/worker-auth-readiness.json').read_text())
+            for port in (9126,9132,9133,9134,9135):
+                u=f'http://127.0.0.1:{port}'
+                c=get(u+'/capacity');c=c.get('data') or c
+                v=d['workers'].get(u,{})
+                if c.get('runningJobs')==0 and int(c.get('availableSlots') or 0)>0 and (not v.get('ready') or time.time()-v.get('checked_at',0)>360):
+                    print(port)
+            PY
+            )
+            if [ -z "$ports" ]; then echo NO_IDLE_UNREADY_LANES; exit 0; fi
+            docker run --rm -i --user 0 --network beonmeet-single --memory=620m --cpus=.6 --pids-limit=185 -e NODE_PATH=/usr/src/app/node_modules -e "QA_PORTS=$ports" -v /opt/beonmeet/.five-isolated-runtime/qa_meet_links.json:/qa-links.json:ro --entrypoint node beonmeet-worker-audiofix:latest - <<'JS'
+            const {chromium}=require('playwright'),fs=require('fs');
+            const ports=[9126,9132,9133,9134,9135], links=JSON.parse(fs.readFileSync('/qa-links.json','utf8')).links;
+            const selected=process.env.QA_PORTS.trim().split(/\s+/).map(Number);
+            async function inspect(port){
+              const index=ports.indexOf(port);
+              let b,p;
+              const out={port};
+              try{
+                b=await chromium.connectOverCDP('http://'+(index===0?'beonmeet-chrome-single':'beonmeet-isolated-chrome-'+(index+1))+':9223',{timeout:10000});
+                const ctx=b.contexts()[0];
+                p=await ctx.newPage();
+                const a=await p.goto('https://myaccount.google.com/',{waitUntil:'domcontentloaded',timeout:18000});
+                await p.waitForTimeout(1800);
+                out.accountDomain=new URL(p.url()).hostname==='myaccount.google.com'?'dashboard':new URL(p.url()).hostname==='accounts.google.com'?'login':'other';
+                out.accountHTTP=a?.status()||0;
+                await p.close();p=await ctx.newPage();
+                const r=await p.goto(links[index],{waitUntil:'domcontentloaded',timeout:25000});
+                await p.waitForTimeout(3500);
+                out.meetHTTP=r?.status()||0;
+                const u=new URL(p.url());out.room=u.hostname==='meet.google.com'&&/^\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(u.pathname);
+                out.ui=await p.evaluate(()=>{
+                  const labels=[...document.querySelectorAll('button,[role=button]')].filter(x=>x.getClientRects().length).map(x=>String(x.getAttribute('aria-label')||x.textContent||'').trim().toLowerCase());
+                  const has=(...w)=>labels.some(x=>w.some(y=>x.includes(y)));
+                  return {joinNow:has('join now','jetzt teilnehmen'),askToJoin:has('ask to join','teilnahme erbitten'),signIn:has('sign in','anmelden'),expired:/meeting (does not exist|not found|has ended)|this meeting is no longer|invalid meeting/.test(document.body?.innerText?.toLowerCase()||'')};
+                });
+              }catch(e){out.error=e.name}
+              finally{if(p)await p.close().catch(()=>{});if(b)await b.close().catch(()=>{})}
+              console.log('SAME_ACCOUNT_DIAG',JSON.stringify(out));
+            }
+            (async()=>{for(let i=0;i<selected.length;i+=2)await Promise.all(selected.slice(i,i+2).map(inspect))})().catch(()=>process.exitCode=2);
+            JS
