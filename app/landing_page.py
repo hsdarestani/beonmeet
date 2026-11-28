@@ -62,11 +62,11 @@ def render_landing(lang):
     steps = []
     for (heading, body), icon in zip(copy["steps"], ICONS):
         steps.append(f'<article class="step"><div class="step-icon"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round">{icon}</svg></div><h3>{heading}</h3><p>{body}</p></article>')
-    qa = "".join(f"<details><summary>{q}</summary><p>{a}</p></details>" for q,a in copy["qa"])
+    qa = "".join(f'<details><summary data-metric="faq_{i}">{q}</summary><p>{a}</p></details>' for i,(q,a) in enumerate(copy["qa"],1))
     wave = "".join(f'<i style="--h:{n}px;--d:-{i % 7 / 10}s"></i>' for i,n in enumerate([6,10,5,13,9,16,7,12,4,8,14,10,6,12,8,4,9,14,6,3]))
     return Template((ASSETS / "page.html").read_text()).substitute({
-        **copy, "lang":lang, "dir":"rtl" if fa else "ltr", "home":"/fa" if fa else "/",
-        "alternate":"/" if fa else "/fa", "otherlang":"en" if fa else "fa",
+        **copy, "lang":lang, "dir":"rtl" if fa else "ltr", "home":"/" if fa else "/en", "legalprefix":"" if fa else "/en",
+        "alternate":"/en" if fa else "/", "otherlang":"en" if fa else "fa",
         "language":"English" if fa else "فارسی", "bot":escape(bot), "start":start, "steps":"".join(steps),
         "plans":"".join(cards), "questions":qa, "wave":wave, "css":(ASSETS / "style.css").read_text(),
     })

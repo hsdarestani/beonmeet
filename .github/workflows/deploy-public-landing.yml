@@ -1,8 +1,8 @@
-name: Publish BeOnMeet public landing
+name: Publish BeOnMeet site and landing metrics
 on:
   push:
-    branches: [design/public-landing-20261128]
-    paths: ['app/landing_assets/**', 'app/landing_page.py', '.github/workflows/deploy-public-landing.yml', 'scripts/deploy_public_landing.py']
+    branches: [design/site-wide-fa]
+    paths: ['app/landing_assets/**', 'app/landing_page.py', 'app/main.py', 'app/site_pages.py', 'app/admin_panel.py', 'app/landing_metrics.py', 'tests/site_metrics_test.py', '.github/workflows/deploy-public-landing.yml', 'scripts/deploy_public_landing.py']
 permissions:
   contents: read
 concurrency:
@@ -28,6 +28,8 @@ jobs:
           fi
       - run: |
           python3 -m py_compile app/main.py app/landing_page.py scripts/deploy_public_landing.py
+          python3 -m pip install -q -r <(sed -n '/^fastapi==/p;/^httpx==/p;/^google-/p;/^python-dateutil/p;/^redis==/p' app/requirements.txt)
+          python3 tests/site_metrics_test.py
           python3 tests/public_oauth_pages_test.py
           PYTHONPATH=app python3 -c 'from landing_page import render_landing; assert all(len(render_landing(l)) > 6000 for l in ("en","fa"))'
       - name: Install public pages with idle and rollback checks
@@ -58,6 +60,7 @@ jobs:
           options = Options()
           options.add_argument("--headless=new")
           options.add_argument("--no-sandbox")
+          options.add_experimental_option("prefs", {"enable_do_not_track":True})
           driver = webdriver.Chrome(options=options)
           def click_in_view(selector):
               element = driver.find_element(By.CSS_SELECTOR, selector)
@@ -65,7 +68,7 @@ jobs:
               element.click()
 
           try:
-              for lang, path in (("fa", "/fa"), ("en", "/")):
+              for lang, path in (("fa", "/"), ("en", "/en")):
                   for width in (320, 390, 768, 1440):
                       driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {"width":width,"height":900,"deviceScaleFactor":1,"mobile":False})
                       driver.get("https://beonmeet.smarbiz.sbs" + path)

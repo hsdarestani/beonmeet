@@ -1,5 +1,7 @@
 """Install the reviewed public pages while preserving production controller differences."""
 import json
+import sqlite3
+import uuid
 import os
 from pathlib import Path
 import shutil
@@ -7,14 +9,14 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 root = Path("/opt/beonmeet")
 os.chdir(root)
 release = sys.argv[1]
-base = "a1fbaef5016d8e545255d739eefb37a276a98cfc"
-paths = ["app/main.py", "app/landing_page.py", *["app/landing_assets/" + n for n in
-         ("page.html", "style.css", "vazir.woff2", "OFL.txt")]]
+base = "b28428532f0d8d78caeaf800f2d116c7642eeb97"
+paths = ["app/main.py", "app/admin_panel.py", "app/site_pages.py", "app/landing_metrics.py", "app/landing_page.py", *["app/landing_assets/" + n for n in
+         ("page.html", "site.css", "metrics.js")]]
 backup = Path(tempfile.mkdtemp(prefix=".landing-backup-", dir=root))
 
 def blob(rev, path):
@@ -35,8 +37,8 @@ for name in paths:
         shutil.copy2(original, backup / (original.name + ".before"))
     target = backup / original.name
     target.write_bytes(blob(release, name))
-    if name == "app/main.py":
-        parent = backup / "main.base"
+    if name in ("app/main.py", "app/admin_panel.py"):
+        parent = backup / (original.name + ".base")
         parent.write_bytes(blob(base, name))
         merged = subprocess.check_output(["git", "merge-file", "-p", str(original), str(parent), str(target)])
         target.write_bytes(merged)
@@ -49,6 +51,33 @@ def replace(source, target):
         f.write(source.read_bytes())
     os.chmod(f.name, 0o644)
     os.replace(f.name, target)
+
+def smoke_test():
+    base_url = "http://127.0.0.1:8109"
+    for path, marker in (("/", 'lang="fa"'), ("/en", 'lang="en"'), ("/privacy", 'class="reader"'),
+                         ("/terms", 'class="reader"'), ("/landing/metrics.js", "sendBeacon"),
+                         ("/landing/site.css", "material-enter")):
+        with urlopen(base_url + path, timeout=5) as response:
+            assert marker.encode() in response.read(), path
+    # Confirm the deployed route writes and deduplicates. Remove just the probe's random view.
+    view_id = uuid.uuid4().hex
+    db_path = root / "data/landing-metrics.sqlite3"
+    payload = dict(id=view_id, lang="fa", seconds=7, depth=76, clicks={"hero_start":1})
+    try:
+        req = Request(base_url + "/api/landing/metrics", data=json.dumps(payload).encode(),
+                      headers={"Content-Type":"application/json","Origin":base_url})
+        for _ in range(2):
+            with urlopen(req, timeout=8) as response:
+                assert response.status == 204
+        with sqlite3.connect(f"file:{db_path}?mode=rw", uri=True) as db:
+            assert db.execute("SELECT seconds,depth FROM views WHERE id=?", (view_id,)).fetchone() == (7,76)
+            assert db.execute("SELECT count FROM clicks WHERE view_id=?", (view_id,)).fetchall() == [(1,)]
+    finally:
+        if db_path.is_file():
+            with sqlite3.connect(f"file:{db_path}?mode=rw", uri=True) as db:
+                db.execute("PRAGMA foreign_keys=ON")
+                db.execute("DELETE FROM views WHERE id=?", (view_id,))
+
 
 idle()
 changed = []
@@ -69,6 +98,7 @@ try:
             if attempt == 29:
                 raise
             time.sleep(1)
+    smoke_test()
 except Exception:
     for name in changed:
         old=backup / (Path(name).name + ".before")

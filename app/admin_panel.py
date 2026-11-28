@@ -18,6 +18,8 @@ from google.oauth2.credentials import Credentials
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from site_pages import STYLESHEET, BRAND
+import landing_metrics
 from db_compat import connect_db, is_postgres
 from state_store import DurableStateStore
 from billing_policy import PLANS, PUBLIC_PLANS, PUBLIC_PLAN_CODES, plan_quota_seconds, remaining_seconds
@@ -968,6 +970,7 @@ def _esc(value) -> str:
 def _layout(title: str, body: str, active: str = "dashboard") -> str:
     nav = [
         ("dashboard", "/admin", "داشبورد", "⌂"),
+        ("analytics", "/admin/analytics", "آمار لندینگ", "▥"),
         ("users", "/admin/users", "کاربران", "◉"),
         ("recordings", "/admin/recordings", "ضبط ها", "◍"),
         ("auto", "/admin/auto-meetings", "همه جلسات", "◎"),
@@ -985,7 +988,7 @@ def _layout(title: str, body: str, active: str = "dashboard") -> str:
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{_esc(title)} · BeOnMeet</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Nunito:wght@700;800;900&family=Vazirmatn:wght@400;500;600;700;800;900&display=swap');
+
 
 :root{{
   --canvas:#f6f8fc;
@@ -1028,7 +1031,7 @@ body{{
     radial-gradient(circle at 88% 82%,rgba(52,168,83,.10),transparent 28rem),
     radial-gradient(circle at 8% 88%,rgba(251,188,5,.12),transparent 25rem),
     linear-gradient(145deg,#f8fbff 0%,#f5f7fb 52%,#f9fbff 100%);
-  font-family:"Vazirmatn","DM Sans",Tahoma,Arial,sans-serif;
+  font-family:Vazir,Tahoma,Arial,sans-serif;
 }}
 body:before{{
   content:"";
@@ -1071,7 +1074,7 @@ aside:before{{
   background:rgba(66,133,244,.12);filter:blur(18px);
   top:-72px;left:-62px;pointer-events:none;
 }}
-.brand{{position:relative;display:flex;align-items:center;gap:13px;font-family:"Nunito","Vazirmatn",sans-serif;font-weight:900;font-size:21px;margin:3px 8px 30px;color:#18233c}}
+.brand{{position:relative;display:flex;align-items:center;gap:13px;font-family:Vazir,Arial,sans-serif;font-weight:900;font-size:21px;margin:3px 8px 30px;color:#18233c}}
 .logo{{
   width:48px;height:48px;border-radius:18px;display:grid;place-items:center;
   color:#fff;
@@ -1111,7 +1114,7 @@ aside:before{{
 
 main{{direction:rtl;padding:38px 42px 70px;max-width:1650px;width:100%;margin:0 auto}}
 .top{{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin-bottom:30px}}
-h1,h2,.num,.price{{font-family:"Nunito","Vazirmatn",sans-serif}}
+h1,h2,.num,.price{{font-family:Vazir,Arial,sans-serif}}
 h1{{margin:0;font-size:30px;line-height:1.15;font-weight:900;letter-spacing:-.025em;color:#18233c}}
 .sub{{color:var(--muted);font-size:13px;margin-top:8px}}
 .grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px}}
@@ -1249,11 +1252,11 @@ a:focus-visible,.btn:focus-visible,input:focus-visible,select:focus-visible{{out
   h1{{font-size:25px}} .grid{{grid-template-columns:1fr}} .metric{{min-height:130px}} .card{{border-radius:24px}} .top form{{width:100%}} .top .search{{width:100%}} .btn{{min-height:46px}} .section-head{{align-items:flex-start;flex-direction:column}}
 }}
 @media(prefers-reduced-motion:reduce){{*,*:before,*:after{{animation:none!important;transition:none!important;scroll-behavior:auto!important}}}}
-</style>
+</style>{STYLESHEET}
 </head>
-<body>
+<body class="admin-ui">
 <div class="clay-ambient" aria-hidden="true"><i class="blob-blue"></i><i class="blob-red"></i><i class="blob-yellow"></i><i class="blob-green"></i></div>
-<div class="shell"><aside><div class="brand"><div class="logo"></div><div>BeOnMeet<br><small>ADMIN CONSOLE</small></div></div>{nav_html}<div class="side-foot">ضبط هوشمند جلسه<br>پنل مدیریت داخلی</div></aside><main>{body}</main></div>
+<div class="shell"><aside><div class="brand"><a class="site-brand" dir="ltr" href="/admin">{BRAND}</a></div>{nav_html}<div class="side-foot">ضبط هوشمند جلسه<br>پنل مدیریت داخلی</div></aside><main>{body}</main></div>
 </body></html>"""
 
 
@@ -1312,6 +1315,15 @@ async def admin_logout():
     return response
 
 
+@router.get("/admin/analytics", response_class=HTMLResponse)
+async def landing_analytics(request: Request, days: int = 7):
+    _require_admin(request)
+    if days not in landing_metrics.PERIODS:
+        raise HTTPException(400, "بازهٔ زمانی نامعتبر است")
+    body = await asyncio.to_thread(landing_metrics.report_body, days)
+    return _layout("آمار لندینگ", body, "analytics")
+
+
 @router.get("/admin", response_class=HTMLResponse)
 async def dashboard(request: Request):
     _require_admin(request)
@@ -1330,8 +1342,9 @@ async def dashboard(request: Request):
       <div class="card metric"><div class="label">درخواست ضبط</div><div class="num">{requests}</div><div class="hint">از ابتدای فعالیت</div></div>
       <div class="card metric"><div class="label">ضبط تکمیل شده</div><div class="num good">{recordings}</div><div class="hint">فایل تحویل شده</div></div>
     </div>
+    <a class="btn section" href="/admin/analytics">مشاهدهٔ آمار بازدید و کلیک لندینگ</a>
     <div class="two section">
-      <div class="card"><div class="section-head"><h2>درخواست های ۷ روز اخیر</h2><span class="pill">Activity</span></div><div class="chart">{bars}</div></div>
+      <div class="card"><div class="section-head"><h2>درخواست های ۷ روز اخیر</h2><span class="pill">۷ روز اخیر</span></div><div class="chart">{bars}</div></div>
       <div class="card"><div class="section-head"><h2>قیمت شارژ ساعت ضبط</h2><a class="pill" href="/admin/plans" style="text-decoration:none">تنظیمات قیمت</a></div>
         <div style="display:grid;gap:10px;margin-top:12px">
           <div><span class="muted">خرید ۲ ساعت</span><b style="float:left">{_money(PLANS["basic"]["price"])} تومان</b></div>
