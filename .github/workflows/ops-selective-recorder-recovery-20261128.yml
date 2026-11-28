@@ -1,0 +1,63 @@
+name: Selective same-account recorder recovery
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/ops-selective-recorder-recovery-20261128.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: beonmeet-selective-auth-repair
+  cancel-in-progress: false
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Test selective recovery and existing auth safeguards
+        run: |
+          python3 -m py_compile scripts/recover_selected_recorder_sessions.py
+          node --check scripts/recover_selected_recorder_sessions.js
+          python3 tests/selective_recorder_auth_recovery_test.py
+          python3 tests/worker_auth_monitor_timing_test.py
+          python3 tests/worker_auth_guard_test.py
+          python3 tests/five_isolated_workers_dispatch_test.py
+      - name: Install bounded idle-only recovery and execute on production
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 20s
+          command_timeout: 12m
+          script: |
+            set -eu
+            umask 077
+            cd /opt/beonmeet
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 150 9
+            SHA=${{ github.event.pull_request.head.sha || github.sha }}
+            git fetch -q origin fix/same-account-selective-recovery-20261128 main
+            for f in recover_selected_recorder_sessions.py recover_selected_recorder_sessions.js; do
+              git show "$SHA:scripts/$f" > "scripts/.$f.new"
+              chmod 600 "scripts/.$f.new"
+              mv "scripts/.$f.new" "scripts/$f"
+            done
+            python3 -m py_compile scripts/recover_selected_recorder_sessions.py
+            python3 scripts/recover_selected_recorder_sessions.py
+            flock -u 9
+            systemctl is-active --quiet beonmeet-auth-watch.timer
+            python3 - <<'PY'
+            import subprocess,json,urllib.request
+            for n in ('camcam-shared-api-1','camcam-shared-pet-1','camcam-shared-archive-1','camcam-shared-petarchive-1'):
+                print('SELECTIVE_CAMCAM',n,subprocess.check_output(['docker','inspect','-f','{{.State.Health.Status}}',n],text=True).strip())
+            with urllib.request.urlopen('http://127.0.0.1:8109/health',timeout=5) as r:
+                h=json.load(r)
+            assert h['ok'] and h['auth_guard_enabled']
+            print('SELECTIVE_POSTCHECK',json.dumps({k:h.get(k) for k in ('max_concurrent_meetings','healthy_free_workers','authenticated_free_workers','authenticated_premium_workers','free_queue','premium_queue')}))
+            PY
