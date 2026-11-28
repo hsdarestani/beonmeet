@@ -1,8 +1,6 @@
 name: Auth watchdog timing and safe production installation
 on:
-  pull_request:
-    branches: [main]
-    paths: [.github/workflows/ops-auth-watchdog-capacity-20261128.yml]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -12,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.sha }}
       - name: Test real timestamps and fail-closed routing
         run: |
           python3 -m py_compile scripts/worker_auth_monitor.py
@@ -36,8 +34,8 @@ jobs:
             case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
             exec 9>/var/lock/pars-vds-bot-deploy.lock
             flock -w 180 9
-            git fetch -q origin fix/auth-watchdog-capacity-20261128
-            SHA=${{ github.event.pull_request.head.sha }}
+            git fetch -q origin main
+            SHA=${{ github.sha }}
             backup="/opt/beonmeet/.auth-watchdog-timing-backup-$(date -u +%Y%m%dT%H%M%SZ)"
             mkdir -m 700 "$backup"
             cp -p scripts/worker_auth_monitor.py scripts/probe_recorder_auth.js "$backup/"
