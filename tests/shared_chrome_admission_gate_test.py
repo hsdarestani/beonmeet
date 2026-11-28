@@ -2,6 +2,7 @@
 """Verify shared Chrome joining is serial even for two concurrent /now calls."""
 import ast
 import asyncio
+from contextlib import nullcontext
 import datetime
 import types
 import typing
@@ -47,6 +48,7 @@ class FakeClient:
 async def check():
     state={"launched_events":{}}
     async def save_state():pass
+    async def reserve_recording_seconds(*args):return 3600
     env={
         "Any":typing.Any,
         "uuid":uuid,
@@ -57,11 +59,13 @@ async def check():
         "FREE_WORKER_URLS":["http://chrome"],
         "SHARED_CHROME_MAX_ACTIVE":1,
         "WORKER_AUTH_GUARD_ENABLED":False,
+        "_worker_auth_dispatch_lease": lambda url: nullcontext(True),
         "_recorder_auth_ready":lambda url: True,
         "shared_chrome_dispatch_lock":asyncio.Lock(),
         "httpx":types.SimpleNamespace(AsyncClient=FakeClient),
         "state":state,
-        "save_state":save_state
+        "save_state":save_state,
+        "reserve_recording_seconds":reserve_recording_seconds,
     }
     exec(code,env)
     dispatch=env["_dispatch_meeting"]

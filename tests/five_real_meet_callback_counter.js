@@ -44,7 +44,7 @@ http.createServer((req,res)=>{
       if(isStart)started.add(id);
       else if(isWait)waiting.add(id);
       else uploaded.add(id);
-      reply(res,200);
+      reply(res,200,isStart?{ok:true,recording_limit_seconds:null}:{ok:true});
     }catch(e){reply(res,400);}
   });
 }).listen(3031,'0.0.0.0',()=>console.log('FIVE_REAL_MEET_QA_SINK_READY'));
