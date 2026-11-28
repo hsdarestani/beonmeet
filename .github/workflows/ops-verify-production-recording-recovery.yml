@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Verify exact incident delivery and billing
+      - name: Verify the settled transcript and credit receipts
         uses: appleboy/ssh-action@v1
         with:
           host: 143.20.60.195
