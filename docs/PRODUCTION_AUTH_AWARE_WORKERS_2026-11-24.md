@@ -25,3 +25,11 @@ Five HTTP-healthy workers were routed to production, but only one Chrome retaine
 - Cloning a single Google session into five independent browser profiles has already shown revocations; for guaranteed long-term five-lane availability, independent authorized Google accounts or an explicitly supported authorization model may be needed.
 - A production five-real-meeting **60-minute** video+audio-and-delivery endurance run remains necessary; prior proof was one minute of overlapping real recording starts plus synthetic AV capture.
 - Never claim a user recording succeeded until its file is delivered and media validated.
+
+## 28 November production follow-up
+
+The live SSH diagnostic found five reachable worker endpoints, two active recordings (9132 and 9135), and three idle lanes with negative authentication checks. Both active lanes had expired cached proof, so the controller correctly refused new dispatch without fresh verification. This is not a two-slot configuration.
+
+The watchdog now uses actual per-lane completion timestamps, refreshes positive checks after 120 seconds and negative checks after 90 seconds when idle, scans at most two browsers at once, and runs 40 seconds after each completion. It fails closed on missing capacity or authentication evidence; it never extends cached proof. The deployment backs up the previous watchdog and timer, and does not restart the recorder, controller or CamCam. The original automatic cross-profile cookie replication is no longer run by the watchdog because repeated shared-session revocation makes it unsuitable for reliable production operation. Use distinct, owner-authorized persistent Google profiles with supported sign-in; never transfer credentials into repository files or logs. If a profile loses authorization, reauthenticate it using its private browser access while idle.
+
+Deployment evidence: https://github.com/hsdarestani/beonmeet/actions/runs/46141731365 . Three regression checks passed, including five simulated independent dispatches and the sixth queuing; the live result still had zero fresh authenticated lanes while two existing recordings were running. Do not advertise five-way capacity until all five profiles have fresh proof and a real five-way 60-minute recording, verified audio/video delivery and correct billing pass. The installer is manual-only after the initial deployment.

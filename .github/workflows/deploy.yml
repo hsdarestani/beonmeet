@@ -29,6 +29,7 @@ jobs:
           python3 tests/premium_delivery_test.py
           python3 tests/recorder_end_guard_test.py
           python3 tests/worker_auth_guard_test.py
+          python3 tests/worker_auth_monitor_timing_test.py
           python3 tests/five_isolated_workers_dispatch_test.py
           python3 tests/admin_google_email_test.py
           python3 tests/admin_google_clay_test.py

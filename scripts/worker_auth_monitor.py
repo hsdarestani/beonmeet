@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
-"""Safe one-shot Google Meet auth audit and conditional on-host recovery.
-
-Used by systemd timer, never called during active recording on a lane.
-Controller reads its atomic, timestamped per-worker verdict and refuses Guest
-browsers. Remediation copies only the owner's own authenticated Google session
-on the SAME VPS, and only when all recorder lanes are idle.
+"""Bounded, idle-only per-lane authentication checks.
+Do not copy sessions between profiles: use independently authorized accounts.
+The controller continues to fail closed on missing, stale or negative proof.
 """
 import fcntl,json,os,pathlib,subprocess,tempfile,time,urllib.request,datetime,sys
 ROOT=pathlib.Path('/opt/beonmeet')
@@ -12,7 +9,8 @@ PORTS=(9126,9132,9133,9134,9135)
 RUNTIME=ROOT/'.five-isolated-runtime'
 AUTH_LINKS=RUNTIME/'qa_meet_links.json'
 PROBE=ROOT/'scripts/probe_recorder_auth.js'
-REPAIR=ROOT/'scripts/recover_google_recorder_sessions_from_healthy_lane.js'
+REFRESH_AFTER=120
+NEGATIVE_RETRY_AFTER=90
 
 def config():
     data={}
@@ -50,16 +48,11 @@ def run_node(code,input_ports):
             '-v',f'{AUTH_LINKS}:/qa-links.json:ro',
             '-v',f'{filename}:/qa-input.json:ro'
         ]
-        if code==REPAIR:
-            mounts=[
-                '-v',f'{code}:/auth-script.js:ro',
-                '-v',f'{AUTH_LINKS}:/qa-existing-links.json:ro'
-            ]
         cmd=['docker','run','--rm','--user','0','--network','beonmeet-single',
              '--memory=620m','--cpus=.6','--pids-limit=185','-e',
              'NODE_PATH=/usr/src/app/node_modules',*mounts,
              '--entrypoint','node','beonmeet-worker-audiofix:latest','/auth-script.js']
-        return subprocess.run(cmd,text=True,capture_output=True,timeout=225)
+        return subprocess.run(cmd,text=True,capture_output=True,timeout=165)
     finally:
         if os.path.exists(filename):os.unlink(filename)
 
@@ -80,59 +73,48 @@ def main():
             'checked_at':int(existing.get('checked_at') or 0)
         }
     idle=[]
+    due=[]
     for port in PORTS:
         key='http://127.0.0.1:'+str(port)
         try:
             cap=capacity(port)
-            if int(cap.get('runningJobs') or 0)==0 and int(cap.get('availableSlots') or 0)>0:
+            if 'runningJobs' not in cap or 'availableSlots' not in cap:
+                raise ValueError('missing capacity fields')
+            if int(cap['runningJobs'])==0 and int(cap['availableSlots'])>0:
                 idle.append(port)
+                age=now-workers[key]['checked_at']
+                threshold=REFRESH_AFTER if workers[key]['ready'] else NEGATIVE_RETRY_AFTER
+                if age<0 or age>=threshold:
+                    due.append(port)
         except Exception:
-            workers[key]={'ready':False,'checked_at':now}
-    if idle:
-        result=run_node(PROBE,idle)
-        if result.returncode==0:
-            try:scan=json.loads(result.stdout)
-            except ValueError:scan={}
-            for port in idle:
-                key='http://127.0.0.1:'+str(port)
-                row=(scan.get('workers') or {}).get(key)
-                if isinstance(row,dict):
-                    workers[key]={'ready':row.get('ready') is True,'checked_at':now}
-                else:workers[key]={'ready':False,'checked_at':now}
-        else:
-            for port in idle:
-                workers['http://127.0.0.1:'+str(port)]={'ready':False,'checked_at':now}
-            print('AUTH_WATCH_PROBE_ERROR','failure',flush=True)
+            workers[key]={'ready':False,'checked_at':int(time.time())}
     last_repair=int(old.get('last_repair_at') or 0)
-    valid=sum(1 for v in workers.values() if v['ready'] and now-int(v['checked_at'])<360)
-    invalid=len(workers)-valid
-    # Conservative, bounded self-recovery: only with one verified source and no
-    # active jobs, and no more than one attempt per 30 minutes. Shared Google
-    # sessions may be rotated; do not hammer login endpoints.
-    if len(idle)==5 and valid>0 and invalid>0 and now-last_repair>=1800:
-        last_repair=now  # persist cooldown even if recovery fails
-        atomic_write(status_path,{'workers':workers,'last_repair_at':last_repair})
-        try:
-            # Recheck before mutating any browser credentials.
-            if all(int(capacity(p).get('runningJobs') or 0)==0 for p in PORTS):
-                fix=run_node(REPAIR,[])
-                if fix.returncode==0:
-                    test=run_node(PROBE,list(PORTS))
-                    if test.returncode==0:
-                        scan=json.loads(test.stdout)
-                        for port in PORTS:
-                            key='http://127.0.0.1:'+str(port)
-                            row=(scan.get('workers') or {}).get(key) or {}
-                            workers[key]={'ready':row.get('ready') is True,'checked_at':int(time.time())}
-                        print('AUTH_WATCH_ON_HOST_RECOVERY_VERIFIED',sum(v['ready'] for v in workers.values()),flush=True)
-                    else:print('AUTH_WATCH_AFTER_RECOVERY_CHECK_FAILED',flush=True)
-                else:print('AUTH_WATCH_RECOVERY_NOT_SUCCEEDED',flush=True)
-        except (Exception,) as e:
-            print('AUTH_WATCH_RECOVERY_ERROR',type(e).__name__,flush=True)
+    # Publish transport failures immediately. Never renew a cached positive
+    # verdict without a successful real Google Meet probe.
     atomic_write(status_path,{'workers':workers,'last_repair_at':last_repair})
-    ready=sum(bool(v['ready']) and int(time.time())-v['checked_at']<=360 for v in workers.values())
+    if due:
+        try:
+            result=run_node(PROBE,due)
+            scan=json.loads(result.stdout) if result.returncode==0 else {}
+        except (ValueError,OSError,subprocess.TimeoutExpired):
+            scan={}
+        for port in due:
+            key='http://127.0.0.1:'+str(port)
+            row=(scan.get('workers') or {}).get(key)
+            finished=int(time.time())
+            checked=int(row.get('checked_at') or 0) if isinstance(row,dict) else 0
+            # Use the actual completion timestamp for each independent lane,
+            # not the start of a multi-lane scan.
+            if isinstance(row,dict) and 0<=finished-checked<=165:
+                workers[key]={'ready':row.get('ready') is True,'checked_at':checked}
+            else:
+                workers[key]={'ready':False,'checked_at':finished}
+        atomic_write(status_path,{'workers':workers,'last_repair_at':last_repair})
+    ready=sum(bool(v['ready']) and 0<=int(time.time())-v['checked_at']<=360 for v in workers.values())
     print('AUTH_WATCH_STATUS','verified_ready',ready,'worker_endpoints',len(workers),
-          'busy_not_probed',len(PORTS)-len(idle),flush=True)
+          'busy_not_probed',len(PORTS)-len(idle),'probed',len(due),flush=True)
+    if ready<5:
+        print('AUTH_WATCH_DEGRADED','independent_owner_login_may_be_required',flush=True)
 
 if __name__=='__main__':
     try:
