@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -39,23 +40,33 @@ class DurableStateStore:
     def _write_file(self, state: dict[str, Any]) -> None:
         self.fallback_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.fallback_file.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(state, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
+        with tmp.open("w", encoding="utf-8") as fp:
+            json.dump(state, fp, ensure_ascii=False, separators=(",", ":"))
+            fp.flush()
+            os.fsync(fp.fileno())
         tmp.replace(self.fallback_file)
+        directory = os.open(self.fallback_file.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
     def load(self) -> tuple[dict[str, Any] | None, str]:
+        file_state = self._read_file()
         try:
             raw = self.redis.get(STATE_KEY)
             if raw:
                 data = json.loads(raw)
                 if isinstance(data, dict):
+                    # Redis may recover with an older value after a temporary
+                    # outage during which the fsynced mirror accepted jobs.
+                    if file_state and int(file_state.get("_saved_at_ns") or 0) > int(data.get("_saved_at_ns") or 0):
+                        self.redis.set(STATE_KEY, json.dumps(file_state, ensure_ascii=False))
+                        return file_state, "file"
                     return data, "redis"
         except Exception as exc:
             print("redis state load failed:", repr(exc), flush=True)
 
-        file_state = self._read_file()
         if file_state is not None:
             # Best-effort migration back into Redis.
             try:
@@ -67,6 +78,7 @@ class DurableStateStore:
         return None, "empty"
 
     def save(self, state: dict[str, Any]) -> None:
+        state = {**state, "_saved_at_ns": time.time_ns()}
         payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
         redis_ok = False
         try:
@@ -77,15 +89,15 @@ class DurableStateStore:
 
         # Always keep the old file as a safety mirror. It is tiny metadata only;
         # recordings are never stored here.
+        mirror_ok = False
         try:
             self._write_file(state)
+            mirror_ok = True
         except Exception as exc:
             print("state mirror save failed:", repr(exc), flush=True)
 
-        if not redis_ok:
-            # File mirror already preserved the mutation, so controller behavior
-            # remains backward compatible during a Redis outage.
-            return
+        if not redis_ok and not mirror_ok:
+            raise OSError("Could not persist controller state in Redis or local mirror")
 
     def ping(self) -> bool:
         try:

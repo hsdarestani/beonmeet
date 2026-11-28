@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import copy
+import fcntl
 import json
 import os
 import re
@@ -7,11 +9,12 @@ import secrets
 import shutil
 import subprocess
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 from dateutil.parser import isoparse
@@ -23,6 +26,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
 from state_store import DurableStateStore
+from recording_handoff import persist_source, recording_key, verified_duration
 from db_compat import is_postgres
 from hetzner_autoscaler import router as autoscaler_router, autoscale_loop, enabled as autoscaler_enabled, profile_status
 from scaling_policy import order_queue
@@ -40,6 +44,9 @@ from i18n import (
 
 from admin_panel import (
     PLANS,
+    _esc,
+    _layout,
+    _require_admin,
     activate_subscription,
     credit_purchase,
     recording_credit_info,
@@ -125,8 +132,39 @@ def _recorder_auth_ready(base_url: str) -> bool:
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
 
+@contextmanager
+def _worker_auth_dispatch_lease(base_url: str):
+    """Prevent an idle-browser probe from overlapping a new recording."""
+    url = urlparse(base_url)
+    if not WORKER_AUTH_GUARD_ENABLED or url.hostname != "127.0.0.1" or not url.port:
+        yield True
+        return
+    lock = WORKER_AUTH_STATE_FILE.with_name(f"worker-auth-{url.port}.lock")
+    try:
+        descriptor = lock.open("rb")
+    except FileNotFoundError:
+        # The previous monitor version has no coordination files. During rollout
+        # install those files before starting the new monitor.
+        yield True
+        return
+    except OSError:
+        yield False
+        return
+    with descriptor:
+        try:
+            fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+        else:
+            yield True
+
+
 INTERNAL_SECRET = os.environ["INTERNAL_SECRET"]
 RECORDING_ROOT = Path(os.environ.get("RECORDING_TMP_DIR", "/recordings")).resolve()
+RECORDING_SPOOL = (DATA_DIR / "recording-spool").resolve()
+RECORDING_SPOOL.mkdir(parents=True, exist_ok=True)
+DELIVERY_CONCURRENCY = max(1, min(5, int(os.environ.get("DELIVERY_CONCURRENCY", "5"))))
+MEDIA_SEMAPHORE = asyncio.Semaphore(1)
 DOWNLOAD_ROOT = DATA_DIR / "recording-downloads"
 DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 PENDING_DELIVERY_MAX_ATTEMPTS = max(8, min(32, int(os.environ.get("PENDING_DELIVERY_MAX_ATTEMPTS", "16"))))
@@ -168,6 +206,8 @@ _whisper_model = None
 _whisper_recovery_model = None
 active_delivery_jobs = 0
 delivery_locks: dict[str, asyncio.Lock] = {}
+delivery_tasks: dict[str, asyncio.Task[Any]] = {}
+delivery_task_stages: dict[str, str] = {}
 premium_recovery_tasks: dict[str, asyncio.Task[Any]] = {}
 state: dict[str, Any] = {
     "telegram_offset": 0,
@@ -182,6 +222,7 @@ state: dict[str, Any] = {
     "user_languages": {},
     "pending_deliveries": {},
     "completed_deliveries": {},
+    "failed_recordings": {},
     "recording_downloads": {},
     "premium_recoveries": {},
     "free_limit_notified": {},
@@ -204,6 +245,7 @@ def load_state() -> None:
     state.setdefault("auto_registered_events", {})
     state.setdefault("user_languages", {})
     state.setdefault("pending_deliveries", {})
+    state.setdefault("failed_recordings", {})
     state.setdefault("completed_deliveries", {})
     state.setdefault("recording_downloads", {})
     state.setdefault("premium_recoveries", {})
@@ -224,7 +266,10 @@ def save_state_sync() -> None:
 
 async def save_state() -> None:
     async with state_lock:
-        await asyncio.to_thread(save_state_sync)
+        # Snapshot in the event loop; other jobs can mutate their own state
+        # while the disk/Redis write runs in a background thread.
+        snapshot = copy.deepcopy(state)
+        await asyncio.to_thread(STATE_STORE.save, snapshot)
 
 
 def normalize_meet_url(url: str) -> str:
@@ -736,7 +781,7 @@ def _pending_free_recordings(chat_id: str, exclude_event_id: str = "") -> int:
         if event_id and event_id != exclude_event_id:
             event_ids.add(event_id)
 
-    active_statuses = {"remote_claimed", "joining", "waiting_for_admission", "recording", "delivering"}
+    active_statuses = {"remote_claimed", "reserved", "joining", "waiting_for_admission", "capturing", "recording", "delivering"}
     for event_id, launched in state.get("launched_events", {}).items():
         if bool((launched or {}).get("premium")):
             continue
@@ -791,10 +836,8 @@ async def _paid_recording_allowed(
 ) -> bool:
     """Enforce paid recording-hour quotas before dispatch or queue activation.
 
-    Completed recordings are persisted in the DB. For jobs already accepted or
-    queued, conservatively reserve an hour each to reduce concurrent overspend.
-    The upstream recorder still has its own max-duration safety limit; existing
-    in-flight recordings are never silently stopped by this check.
+    Dispatch rechecks the available reservation under the allocation lock.
+    This preliminary check does not deduct credit or reserve a queued request.
     """
     quota = await asyncio.to_thread(paid_recording_entitlement, str(chat_id))
     if not quota.get("premium"):
@@ -805,18 +848,7 @@ async def _paid_recording_allowed(
     remaining = quota.get("remaining_seconds")
     if remaining is None:
         return True  # protect grandfathered unlimited legacy subscriptions
-    busy_ids = set()
-    for item in state.get("join_queue", []):
-        req = item.get("req") or {}
-        eid = str(item.get("event_id") or "")
-        if eid and eid != event_id and str(req.get("chat_id") or "") == str(chat_id):
-            busy_ids.add(eid)
-    for eid, item in state.get("launched_events", {}).items():
-        if str(eid) != event_id and str((item or {}).get("chat_id") or "") == str(chat_id):
-            if str((item or {}).get("status") or "") in {"remote_claimed", "joining", "waiting_for_admission", "recording", "delivering"}:
-                busy_ids.add(str(eid))
-    reserved = len(busy_ids) * 3600
-    if remaining > reserved:
+    if await reserve_recording_seconds(chat_id, True):
         return True
     if notify:
         used = int(quota.get("used_seconds") or 0)
@@ -867,7 +899,32 @@ async def _dispatch_meeting(
     # All entrypoints use this per-process lock. It prevents competing /now
     # and queue dispatches from both observing a free shared Chrome slot.
     async with shared_chrome_dispatch_lock:
-        return await _dispatch_meeting_serialized(event, req, meet_url, premium)
+        event_id = str(event.get("id") or "")
+        current = state.get("launched_events", {}).get(event_id)
+        if current and current.get("status") not in {"failed", "failed_delivery"}:
+            return True, False, str(current.get("pool") or "")
+        credit = await reserve_recording_seconds(str(req["chat_id"]), premium)
+        if credit == 0:
+            return False, True, "wallet-reserved"
+        return await _dispatch_meeting_serialized(event, req, meet_url, premium, credit)
+
+
+async def reserve_recording_seconds(chat_id: str, premium: bool) -> int | None:
+    """Called only under shared_chrome_dispatch_lock, including extensions."""
+    quota = await asyncio.to_thread(paid_recording_entitlement if premium else free_recording_entitlement, chat_id)
+    remaining = quota.get("remaining_seconds")
+    if remaining is None and premium:
+        return None  # grandfathered unlimited legacy plan
+    reserved = 0
+    active = {"remote_claimed", "reserved", "joining", "waiting_for_admission", "capturing", "recording", "delivering"}
+    for eid, job in state.get("launched_events", {}).items():
+        if str(job.get("chat_id")) != chat_id or job.get("status") not in active:
+            continue
+        if state.get("pending_deliveries", {}).get(eid, {}).get("billing_committed"):
+            continue
+        amount = job.get("reserved_seconds", 3600)
+        reserved += max(0, int(amount or 0))
+    return max(0, min(3600, int(remaining or 0) - reserved))
 
 
 async def _dispatch_meeting_serialized(
@@ -875,6 +932,7 @@ async def _dispatch_meeting_serialized(
     req: dict[str, Any],
     meet_url: str,
     premium: bool,
+    reserved_seconds: int | None = None,
 ) -> tuple[bool, bool, str]:
     event_id = event.get("id") or str(uuid.uuid4())
     chat_id = str(req["chat_id"])
@@ -906,60 +964,87 @@ async def _dispatch_meeting_serialized(
     saw_busy = False
     async with httpx.AsyncClient(timeout=30.0) as client:
         for pool_name, base_url in targets:
-            if WORKER_AUTH_GUARD_ENABLED and not _recorder_auth_ready(base_url):
-                # Authentication may expire while the worker's HTTP health remains 200.
-                # Keep the request in the durable queue, rather than Guest / Ask to join.
-                saw_busy = True
-                continue
-            # An HTTP 202 only means the worker accepted the job. The shared
-            # Chrome session crashed in a real Trusted test while an Open
-            # recording attempt was running. Until browser isolation is
-            # verified, put the next job in the normal durable queue.
-            if SHARED_CHROME_MAX_ACTIVE:
-                try:
-                    capacity_response = await client.get(f"{base_url}/capacity", timeout=6.0)
-                    capacity_response.raise_for_status()
-                    capacity_payload = capacity_response.json()
-                    capacity = capacity_payload.get("data") or capacity_payload
-                    currently_running = int(capacity.get("runningJobs") or 0)
-                    if currently_running >= SHARED_CHROME_MAX_ACTIVE:
-                        saw_busy = True
-                        continue
-                except Exception as exc:
-                    # Unknown capacity is not an invitation to overload
-                    # Chrome; preserve the request in the retryable queue.
-                    print(f"meeting capacity check error ({pool_name}):", type(exc).__name__, flush=True)
+            with _worker_auth_dispatch_lease(base_url) as leased:
+                if not leased:
                     saw_busy = True
                     continue
-            try:
-                response = await client.post(f"{base_url}/google/join", json=payload)
-            except Exception as exc:
-                print(f"meeting dispatch error ({pool_name}):", repr(exc), flush=True)
-                continue
-
-            if response.status_code == 202:
+                if WORKER_AUTH_GUARD_ENABLED and not _recorder_auth_ready(base_url):
+                    # Authentication may expire while the worker's HTTP health remains 200.
+                    # Keep the request in the durable queue, rather than Guest / Ask to join.
+                    saw_busy = True
+                    continue
+                # An HTTP 202 only means the worker accepted the job. The shared
+                # Chrome session crashed in a real Trusted test while an Open
+                # recording attempt was running. Until browser isolation is
+                # verified, put the next job in the normal durable queue.
+                if SHARED_CHROME_MAX_ACTIVE:
+                    try:
+                        capacity_response = await client.get(f"{base_url}/capacity", timeout=6.0)
+                        capacity_response.raise_for_status()
+                        capacity_payload = capacity_response.json()
+                        capacity = capacity_payload.get("data") or capacity_payload
+                        currently_running = int(capacity.get("runningJobs") or 0)
+                        if currently_running >= SHARED_CHROME_MAX_ACTIVE:
+                            saw_busy = True
+                            continue
+                    except Exception as exc:
+                        # Unknown capacity is not an invitation to overload
+                        # Chrome; preserve the request in the retryable queue.
+                        print(f"meeting capacity check error ({pool_name}):", type(exc).__name__, flush=True)
+                        saw_busy = True
+                        continue
+                # Persist ownership before the worker can send a fast callback.
+                # An ambiguous network failure is not permission to dispatch the
+                # same job to another lane; the original worker may have accepted.
                 state["launched_events"][event_id] = {
-                    "meet_url": meet_url,
-                    "chat_id": chat_id,
+                    "meet_url": meet_url, "chat_id": chat_id,
                     "launched_at": datetime.now(timezone.utc).isoformat(),
-                    "status": "joining",
-                    "premium": bool(premium),
-                    "pool": pool_name,
+                    "status": "reserved", "premium": bool(premium),
+                    "pool": pool_name, "worker_url": base_url,
+                    "reserved_seconds": reserved_seconds,
                 }
                 await save_state()
-                return True, False, pool_name
+                try:
+                    response = await client.post(f"{base_url}/google/join", json=payload)
+                except Exception as exc:
+                    print(f"meeting dispatch error ({pool_name}):", type(exc).__name__, flush=True)
+                    current = state["launched_events"].get(event_id)
+                    # A socket connection that never opened cannot have accepted
+                    # the job. A read/write failure is ambiguous and keeps ownership.
+                    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)) and current and current.get("status") == "reserved":
+                        state["launched_events"].pop(event_id, None)
+                        await save_state()
+                        saw_busy = True
+                        continue
+                    if current and current.get("status") == "reserved":
+                        current["status"] = "joining"
+                        current["dispatch_uncertain"] = True
+                        await save_state()
+                    return True, False, pool_name
 
-            if response.status_code == 409:
-                saw_busy = True
-                continue
+                if response.status_code == 202:
+                    current = state["launched_events"].get(event_id)
+                    if current and current.get("status") == "reserved":
+                        current["status"] = "joining"
+                    await save_state()
+                    return True, False, pool_name
 
-            print(
-                "meeting dispatch rejected:",
-                pool_name,
-                response.status_code,
-                response.text[:500],
-                flush=True,
-            )
+                # Definitive rejection is safe to release; never overwrite a
+                # callback which already advanced this job.
+                if state["launched_events"].get(event_id, {}).get("status") != "reserved":
+                    return True, False, pool_name
+                state["launched_events"].pop(event_id, None)
+                await save_state()
+                if response.status_code == 409:
+                    saw_busy = True
+                    continue
+
+                print(
+                    "meeting dispatch rejected:",
+                    pool_name,
+                    response.status_code,
+                    flush=True,
+                )
 
     return False, saw_busy, ""
 
@@ -1060,7 +1145,7 @@ async def join_progress_loop() -> None:
                     "join_slow_notified_at": "join_still_unconfirmed",
                     "join_access_notice_at": "join_guest_access_possible",
                 }[key]
-                await tg_text(chat_id, t(chat_id, message_key))
+                await tg_text(chat_id, recording_message(t(chat_id, message_key), launched.get("meet_url"), event_id))
                 # The event may be removed by a successful callback while we
                 # awaited Telegram: do not resurrect it.
                 current = state.setdefault("launched_events", {}).get(event_id)
@@ -1193,6 +1278,124 @@ async def queue_loop() -> None:
         await asyncio.sleep(3)
 
 
+async def reconcile_recordings_loop() -> None:
+    """Detect a vanished worker job without interrupting any live browser."""
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                for eid, job in list(state["launched_events"].items()):
+                    if job.get("status") not in {"reserved", "joining", "waiting_for_admission", "capturing", "recording"}:
+                        continue
+                    if eid in state["pending_deliveries"] or eid in state["completed_deliveries"]:
+                        continue
+                    url = str(job.get("worker_url") or "")
+                    if not url:
+                        # Pre-upgrade local jobs carry the exact named lane.
+                        # Resolve only an unambiguous index in the configured
+                        # local pool; never infer remote or shared ownership.
+                        pool = str(job.get("pool") or "")
+                        match = re.fullmatch(r"(premium|free)-(\d+)", pool)
+                        if match:
+                            endpoints = PREMIUM_WORKER_URLS if match[1] == "premium" else FREE_WORKER_URLS
+                            index = int(match[2]) - 1
+                            if 0 <= index < len(endpoints):
+                                url = endpoints[index]
+                    if url not in {*FREE_WORKER_URLS, *PREMIUM_WORKER_URLS}:
+                        continue  # do not guess the identity of a legacy/remote worker
+                    try:
+                        age = (now - isoparse(str(job.get("launched_at") or ""))).total_seconds()
+                    except (TypeError, ValueError):
+                        continue
+                    if age < 90:
+                        continue
+                    try:
+                        response = await client.get(f"{url}/capacity")
+                        response.raise_for_status()
+                        capacity = response.json()
+                        capacity = capacity.get("data") or capacity
+                        if int(capacity["runningJobs"]) != 0:
+                            job.pop("idle_observed_at", None)
+                            continue
+                    except Exception:
+                        continue  # unknown/offline is not proof that capture ended
+                    if eid in state["pending_deliveries"] or state["launched_events"].get(eid) is not job:
+                        continue
+                    if not job.get("idle_observed_at"):
+                        job["idle_observed_at"] = now.isoformat()
+                        await save_state()
+                        continue
+                    if (now - isoparse(job["idle_observed_at"])).total_seconds() < 60:
+                        continue
+                    if job.get("worker_url"):
+                        recovered = await recover_exact_worker_source(eid, job)
+                        if recovered is not False:
+                            continue
+                    job["status"] = "failed"
+                    failure = {"chat_id": job["chat_id"], "meeting_link": job["meet_url"],
+                               "failed_at": now.isoformat(), "reason": "worker_idle_without_handoff"}
+                    state["failed_recordings"][eid] = failure
+                    await save_state()
+                    print(f"recording terminal failure job={eid} reason=worker_idle_without_handoff", flush=True)
+            for eid, failure in list(state["failed_recordings"].items()):
+                if failure.get("notified") or eid in state["pending_deliveries"] or eid in state["completed_deliveries"]:
+                    continue
+                if int(failure.get("notify_attempts") or 0) >= PENDING_DELIVERY_MAX_ATTEMPTS:
+                    continue
+                failure["notify_attempts"] = int(failure.get("notify_attempts") or 0) + 1
+                try:
+                    chat_id = failure["chat_id"]
+                    await tg_text(chat_id, recording_message(t(chat_id, "recording_failed"), failure.get("meeting_link"), eid))
+                    failure["notified"] = True
+                except Exception as exc:
+                    print(f"recording failure notice job={eid} error={type(exc).__name__}", flush=True)
+                await save_state()
+        except Exception as exc:
+            print("recording reconciliation error:", type(exc).__name__, flush=True)
+        await asyncio.sleep(30)
+
+
+async def recover_exact_worker_source(event_id: str, job: dict[str, Any]) -> bool | None:
+    """Recover only the new per-job folder, never an arbitrary legacy file."""
+    chat_id = str(job.get("chat_id") or "")
+    if not chat_id or not event_id or not job.get("worker_url"):
+        return False
+    def component(value: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_-]", "_", value)
+    expected = RECORDING_ROOT / component(chat_id) / component(event_id)
+    try:
+        folder = expected.resolve()
+        if folder != expected or not folder.is_relative_to(RECORDING_ROOT) or not folder.is_dir():
+            return False
+        files = [p for p in folder.iterdir() if not p.is_symlink() and p.is_file()
+                 and p.suffix.lower() in {".webm", ".mp4", ".mkv"} and p.stat().st_size > 0]
+        if len(files) != 1:
+            return False  # no cross-session guesses; report the failed job instead
+        source = files[0].resolve()
+        source_size = source.stat().st_size
+        result = await accept_recording({"botId": event_id, "userId": chat_id,
+                                         "meetingLink": job.get("meet_url"), "size": source_size}, source)
+        if result.get("ok"):
+            pending = state.get("pending_deliveries", {}).get(event_id)
+            if pending is not None:
+                pending["recovered_source_path"] = str(source)
+                pending["recovered_source_size"] = source_size
+                await save_state()
+            print(f"recovered exact worker source job={event_id}", flush=True)
+            return True
+    except Exception as exc:
+        attempts = int(job.get("source_recovery_attempts") or 0) + 1
+        job["source_recovery_attempts"] = attempts
+        job["source_recovery_error"] = type(exc).__name__
+        await save_state()
+        if attempts in (1, PENDING_DELIVERY_MAX_ATTEMPTS):
+            print(f"worker source recovery delayed job={event_id}: {type(exc).__name__}", flush=True)
+        # An inaccessible source can exist. Leave it recoverable and continue
+        # scanning other jobs instead of reporting an irreversible failure.
+        return None
+    return False
+
+
 async def state_cleanup_loop() -> None:
     while True:
         try:
@@ -1239,7 +1442,7 @@ async def state_cleanup_loop() -> None:
                     finished = isoparse(str((receipt or {}).get("completed_at") or ""))
                 except Exception:
                     finished = now - timedelta(days=3)
-                if now - finished > timedelta(days=2):
+                if now - finished > timedelta(days=7):
                     completed.pop(key, None)
                     changed = True
 
@@ -1266,12 +1469,23 @@ async def state_cleanup_loop() -> None:
                 # joining timeout. Completed deliveries clean themselves up.
                 max_age = {
                     "joining": timedelta(minutes=20),
+                    "reserved": timedelta(minutes=20),
                     "remote_claimed": timedelta(minutes=20),
                     "waiting_for_admission": timedelta(minutes=40),
                     "recording": timedelta(hours=6),
+                    "capturing": timedelta(hours=6),
                     "delivering": timedelta(hours=6),
                 }.get(status, timedelta(days=2))
                 if now - created > max_age:
+                    if status in {"recording", "capturing", "reserved"}:
+                        if event_id not in state.get("pending_deliveries", {}):
+                            state["failed_recordings"].setdefault(event_id, {
+                                "chat_id": launched.get("chat_id"), "meeting_link": launched.get("meet_url"),
+                                "failed_at": now.isoformat(), "reason": "recording_lifecycle_expired",
+                            })
+                            launched["status"] = "failed"
+                            changed = True
+                        continue
                     launched_events.pop(event_id, None)
                     changed = True
                     # Only unconfirmed, never-recorded joins need a terminal
@@ -1359,7 +1573,7 @@ def recent_manual_join_inflight(
         if str(launched.get("chat_id") or "") != target or str(launched.get("meet_url") or "") != meet_url:
             continue
         status = str(launched.get("status") or "joining")
-        if status not in {"joining", "waiting_for_admission", "remote_claimed", "recording"}:
+        if status not in {"reserved", "joining", "waiting_for_admission", "remote_claimed", "capturing", "recording"}:
             continue
         raw = str(launched.get("launched_at") or "")
         try:
@@ -1884,17 +2098,29 @@ async def create_recording_download(
     path: Path,
     filename: str,
     owner_chat_id: str = "",
+    premium_at_recording: bool | None = None,
 ) -> tuple[str, int]:
+    for existing_token, existing in state.get("recording_downloads", {}).items():
+        if (existing.get("filename") == filename and existing.get("owner_chat_id") == str(owner_chat_id or "")
+            and existing.get("source_path") == str(path) and existing.get("size_bytes") == path.stat().st_size
+            and Path(existing.get("file_path") or "").is_file()):
+            try:
+                if isoparse(existing["expires_at"]) > datetime.now(timezone.utc):
+                    return f"https://{DOMAIN}/download/{existing_token}", int(existing["ttl_hours"])
+            except (KeyError, TypeError, ValueError):
+                pass
     token = secrets.token_urlsafe(32)
     suffix = path.suffix.lower() if path.suffix else ".webm"
     stored_path = (DOWNLOAD_ROOT / f"{token}{suffix}").resolve()
     stored_path.relative_to(DOWNLOAD_ROOT)
-    await asyncio.to_thread(shutil.copy2, path, stored_path)
-    ttl_hours = await recording_download_ttl_hours(owner_chat_id)
+    await asyncio.to_thread(persist_source, path, stored_path)
+    ttl_hours = await recording_download_ttl_hours(owner_chat_id) if premium_at_recording is None else (PREMIUM_DOWNLOAD_TTL_HOURS if premium_at_recording else FREE_DOWNLOAD_TTL_HOURS)
     created_at = datetime.now(timezone.utc)
     expires_at = created_at + timedelta(hours=ttl_hours)
     state.setdefault("recording_downloads", {})[token] = {
         "file_path": str(stored_path),
+        "source_path": str(path),
+        "size_bytes": path.stat().st_size,
         "filename": filename,
         "owner_chat_id": str(owner_chat_id or ""),
         "created_at": created_at.isoformat(),
@@ -1909,6 +2135,7 @@ async def send_recording_to_recipients(
     recipients: list[dict[str, str]],
     path: Path,
     filename: str,
+    premium_at_recording: bool | None = None,
 ) -> None:
     max_cloud = 49 * 1024 * 1024
     size = path.stat().st_size
@@ -1933,6 +2160,7 @@ async def send_recording_to_recipients(
         path,
         filename,
         owner_chat_id=str(recipients[0]["chat_id"]) if recipients else "",
+        premium_at_recording=premium_at_recording,
     )
     for target in recipients:
         await tg_text(
@@ -1950,6 +2178,7 @@ async def send_audio_to_recipients(
     recipients: list[dict[str, str]],
     path: Path,
     filename: str,
+    premium_at_recording: bool | None = None,
 ) -> None:
     """Deliver meeting audio without blocking downstream transcription.
 
@@ -1987,6 +2216,7 @@ async def send_audio_to_recipients(
                 path,
                 filename,
                 owner_chat_id=str(recipients[0]["chat_id"]) if recipients else "",
+                premium_at_recording=premium_at_recording,
             )
         await tg_text(
             target["chat_id"],
@@ -2287,9 +2517,11 @@ async def startup() -> None:
     asyncio.create_task(calendar_loop())
     asyncio.create_task(queue_loop())
     asyncio.create_task(worker_health_loop())
+    asyncio.create_task(recorder_owner_alert_loop())
     asyncio.create_task(join_progress_loop())
     asyncio.create_task(state_cleanup_loop())
     asyncio.create_task(delivery_recovery_loop())
+    asyncio.create_task(reconcile_recordings_loop())
     asyncio.create_task(premium_upgrade_backfill_loop())
     asyncio.create_task(autoscale_loop())
 
@@ -2897,6 +3129,113 @@ async def recover_premium_download_status(token: str) -> dict[str, Any]:
     }
 
 
+def recorder_auth_snapshot() -> list[dict[str, Any]]:
+    now = datetime.now(timezone.utc).timestamp()
+    try:
+        proof = json.loads(WORKER_AUTH_STATE_FILE.read_text(encoding="utf-8")).get("workers") or {}
+    except (OSError, ValueError, AttributeError):
+        proof = {}
+    rows = []
+    for lane, url in enumerate(dict.fromkeys(FREE_WORKER_URLS + PREMIUM_WORKER_URLS), 1):
+        entry = proof.get(url) or {}
+        authenticated = _recorder_auth_ready(url)
+        status = entry.get("status") or ("verified" if authenticated else "inconclusive")
+        if status == "verified" and not authenticated:
+            status = "inconclusive"
+        verified_at = int(entry.get("last_verified_at") or (entry.get("checked_at") if entry.get("ready") else 0) or 0)
+        rows.append({
+            "lane": lane, "status": status, "reason": entry.get("reason") or "",
+            "transport_healthy": worker_health_cache.get(url),
+            "available": authenticated and entry.get("running_jobs") == 0 and worker_health_cache.get(url) is True,
+            "running_jobs": entry.get("running_jobs"),
+            "verified_age": max(0, int(now - verified_at)) if verified_at else None,
+            "verdict_since": int(entry.get("verdict_since") or 0),
+            "checked_at": int(entry.get("checked_at") or 0),
+        })
+    return rows
+
+
+async def recorder_owner_alert_loop() -> None:
+    while True:
+        try:
+            if ADMINUSER and WORKER_AUTH_GUARD_ENABLED:
+                alerts = state.setdefault("recorder_owner_alerts", {})
+                now = datetime.now(timezone.utc).timestamp()
+                for row in recorder_auth_snapshot():
+                    if row["status"] != "reauthentication_required":
+                        continue
+                    # Require two successful checks of the same explicit Google
+                    # challenge. Stale proof and transient errors never request login.
+                    if not 0 <= now - row["checked_at"] <= WORKER_AUTH_MAX_AGE_SECONDS:
+                        continue
+                    if row["checked_at"] - row["verdict_since"] < 60:
+                        continue
+                    lane = str(row["lane"])
+                    if alerts.get(lane) == row["verdict_since"]:
+                        continue
+                    await asyncio.wait_for(tg_text(
+                        ADMINUSER,
+                        f"ورکر {lane} ضبط گوگل‌میت به ورود دوباره نیاز دارد. این وضعیت در دو بررسی مستقل گوگل تأیید شد.",
+                    ), timeout=20)
+                    alerts[lane] = row["verdict_since"]
+                    await save_state()
+        except Exception as exc:
+            print("private recorder health alert failed:", type(exc).__name__, flush=True)
+        await asyncio.sleep(60)
+
+
+@app.get("/admin/recorder-health", response_class=HTMLResponse)
+async def admin_recorder_health(request: Request):
+    _require_admin(request)
+    health_info = await health()
+    lanes = recorder_auth_snapshot()
+    stages = [job.get("status") for job in state["launched_events"].values()]
+    running_captures = [
+        int((datetime.now(timezone.utc) - isoparse(job["recording_started_at"])).total_seconds())
+        for job in state["launched_events"].values()
+        if job.get("status") == "recording" and job.get("recording_started_at")
+        and not job.get("idle_observed_at")
+    ]
+    memory = {
+        parts[0].rstrip(":"): int(parts[1])
+        for line in Path("/proc/meminfo").read_text().splitlines()
+        if (parts := line.split()) and parts[0] in {"MemTotal:", "MemAvailable:"}
+    }
+    disk = shutil.disk_usage(RECORDING_SPOOL)
+    metrics = [
+        ("ظرفیت ورکرها", len(lanes)),
+        ("احراز هویت تأییدشده", health_info["authenticated_free_workers"]),
+        ("ورکرهای آماده", sum(row["available"] for row in lanes)),
+        ("ورکرهای مشغول", sum(bool(row["running_jobs"]) for row in lanes)),
+        ("در حال اتصال", stages.count("joining") + stages.count("reserved")),
+        ("منتظر پذیرش", stages.count("waiting_for_admission")),
+        ("در انتظار تأیید داده ضبط", stages.count("capturing")),
+        ("ضبط فعال", len(running_captures)),
+        ("طول ضبط‌های فعال به ثانیه", "، ".join(str(seconds) for seconds in running_captures) or "—"),
+        ("در حال پردازش یا ارسال", health_info["active_delivery_jobs"]),
+        ("تحویل‌های در انتظار", health_info["pending_delivery_jobs"]),
+        ("تحویل‌های تکمیل‌شده اخیر", len(state["completed_deliveries"])),
+        ("ضبط‌های ناموفق", health_info["failed_recording_jobs"]),
+        ("تحویل‌های ناموفق", health_info["failed_delivery_jobs"]),
+        ("تلاش‌های بازیابی فایل", sum(int(job.get("source_recovery_attempts") or 0)
+                                      for job in state["launched_events"].values())),
+        ("میانگین بار پردازنده در یک دقیقه", f"{health_info['load_average_1m']:.2f}"),
+        ("رم در دسترس", f"{memory.get('MemAvailable', 0) // 1024} MB"),
+        ("فضای آزاد فایل‌های ضبط", f"{disk.free / (1024 ** 3):.1f} GB"),
+    ]
+    cards = "".join(f'<div class="card metric"><div class="label">{_esc(label)}</div>'
+                    f'<div class="num">{_esc(value)}</div></div>' for label, value in metrics)
+    rows = "".join(f"<tr><td>{row['lane']}</td><td>{_esc(row['transport_healthy'])}</td>"
+                   f"<td>{_esc(row['status'])}</td><td>{_esc(row['verified_age'])}</td>"
+                   f"<td>{_esc(row['reason'])}</td></tr>" for row in lanes)
+    return _layout("وضعیت ضبط", f"""
+        <div class="top"><h1>وضعیت ضبط</h1></div><div class="grid">{cards}</div>
+        <div class="card section"><table><thead><tr><th>ورکر</th><th>ارتباط</th>
+        <th>وضعیت گوگل‌میت</th><th>ثانیه از آخرین تأیید</th><th>دلیل</th></tr></thead>
+        <tbody>{rows}</tbody></table></div>
+    """, "system")
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     remote_free_slots = sum(
@@ -2952,8 +3291,15 @@ async def health() -> dict[str, Any]:
         "premium_queue": sum(1 for item in state.get("join_queue", []) if bool(item.get("premium"))),
         "transcription_concurrency": int(os.environ.get("TRANSCRIPTION_CONCURRENCY", "1")),
         "active_delivery_jobs": int(active_delivery_jobs),
-        "pending_delivery_jobs": len(state.get("pending_deliveries", {})),
-        "delivery_pipeline_busy": bool(active_delivery_jobs or state.get("pending_deliveries")),
+        "pending_delivery_jobs": sum(not job.get("terminal_failure") for job in state.get("pending_deliveries", {}).values()),
+        "active_recording_jobs": sum(job.get("status") == "recording" and not job.get("idle_observed_at")
+                                     for job in state.get("launched_events", {}).values()),
+        "failed_recording_jobs": len(state.get("failed_recordings", {})),
+        "failed_delivery_jobs": sum(bool(job.get("terminal_failure")) for job in state.get("pending_deliveries", {}).values()),
+        "pending_transcription_jobs": sum(bool(job.get("media_complete") and not job.get("terminal_failure")) for job in state.get("pending_deliveries", {}).values()),
+        "recording_spool_free_bytes": shutil.disk_usage(RECORDING_SPOOL).free,
+        "load_average_1m": os.getloadavg()[0],
+        "delivery_pipeline_busy": bool(active_delivery_jobs or any(not job.get("terminal_failure") for job in state.get("pending_deliveries", {}).values())),
         "remote_workers": sum(1 for entry in remote_worker_cache.values() if _remote_worker_alive(entry)),
         "remote_free_slots": remote_free_slots,
         "remote_premium_slots": remote_premium_slots,
@@ -3014,7 +3360,7 @@ async def home() -> str:
 </div></section>
 <section id="credits" class="section"><div class="wrap">
 <h2>Buy recording hours, not subscriptions</h2>
-<p>Choose 2, 6 or 15 hours of recording credit. Each purchase instantly adds hours to your existing balance, even if you already have credit. Hours never expire, there are no monthly subscriptions, and no automatic renewal. Completed recordings consume the corresponding time. If a recording runs beyond your balance, the excess is deducted from your next purchase.</p>
+<p>Choose 2, 6 or 15 hours of recording credit. Each purchase instantly adds hours to your existing balance, even if you already have credit. Hours never expire, there are no monthly subscriptions, and no automatic renewal. Delivered recordings consume verified recording time up to your available balance; the balance never becomes negative.</p>
 <div class="grid prices">__PRICE_CARDS__</div>
 <div class="cta">__BOT_CTA__<a class="button secondary" href="/terms">Credit terms</a></div>
 </div></section>
@@ -3071,7 +3417,7 @@ async def home_fa() -> str:
 </div></section>
 <section id="credits" class="section"><div class="wrap">
 <h2>فقط خرید ساعت ضبط؛ بدون اشتراک</h2>
-<p>فقط ساعت ضبط می‌خری: ۲، ۶ یا ۱۵ ساعت. هر خرید بلافاصله به موجودی قبلی‌ات اضافه می‌شود، تاریخ انقضا ندارد و برای تمام جلسه‌ها قابل استفاده است. به‌اندازه مدت ضبط موفق از اعتبار کم می‌شود؛ اگر جلسه از موجودی بیشتر طول بکشد، مازاد از شارژ بعدی کسر می‌شود. تمدید خودکار یا هزینه اضافه خودکار نداریم.</p>
+<p>فقط ساعت ضبط می‌خری: ۲، ۶ یا ۱۵ ساعت. هر خرید بلافاصله به موجودی قبلی‌ات اضافه می‌شود، تاریخ انقضا ندارد و برای تمام جلسه‌ها قابل استفاده است. به‌اندازه مدت واقعی ضبط تحویل‌شده و حداکثر تا موجودی اعتبار کم می‌شود؛ موجودی منفی نمی‌شود. تمدید خودکار یا هزینه اضافه خودکار نداریم.</p>
 <div class="grid prices">__PRICE_CARDS__</div>
 <div class="cta">__BOT_CTA__</div>
 </div></section>
@@ -3148,7 +3494,7 @@ async def terms_of_service() -> str:
 <h2>Availability</h2>
 <p>We work to provide reliable joining of meetings explicitly requested by the user and delivery of the resulting files, but admission controls, network conditions, third party outages, capacity limits or meeting configuration can prevent or delay recording. A host may need to admit the recorder.</p>
 <h2>Recording-hour credit and temporary files</h2>
-<p>BeOnMeet sells prepaid recording hours, not monthly subscriptions. One-time purchases of 2, 6 or 15 hours immediately increase the same non-expiring credit balance. Completed recordings deduct their actual duration. When the balance is exhausted, new recordings require another top-up. An already-started recording may finish and use more than the remaining hours; the excess is deducted from later purchases. There are no automatic renewals, top-ups or overage charges.</p>
+<p>BeOnMeet sells prepaid recording hours, not monthly subscriptions. One-time purchases of 2, 6 or 15 hours immediately increase the same non-expiring credit balance. Delivered recordings deduct verified recording time up to the available credit. When the balance is exhausted, new recordings require another top-up. There are no automatic renewals, top-ups, negative wallet balances or overage charges.</p>
 <p>Remaining allowance from still-active or prepaid future plans is converted into the non-expiring wallet. Used and already-expired time is not recredited. Legacy unlimited subscribers keep previously agreed rights until the original end date. Temporary recording/download files have expiry periods separate from hour credits.</p>
 <h2>Privacy</h2>
 <p>Our handling of personal information and Google user data is described in the <a href="/privacy">Privacy Policy</a>.</p>
@@ -3247,19 +3593,23 @@ async def waiting_for_admission(
     data = await request.json()
     chat_id = str(data.get("userId") or "").strip()
     event_id = str(data.get("eventId") or data.get("botId") or "").strip()
-    if not chat_id:
-        raise HTTPException(status_code=400, detail="Missing userId")
+    if not chat_id or not event_id:
+        raise HTTPException(status_code=400, detail="Missing recording identity")
 
     already_notified = False
     if event_id:
-        launched = state["launched_events"].setdefault(event_id, {})
+        launched = state["launched_events"].get(event_id)
+        if not launched or str(launched.get("chat_id")) != chat_id:
+            raise HTTPException(status_code=409, detail="Unknown recording identity")
+        if launched.get("status") in {"recording", "capturing", "delivering", "completed", "failed"}:
+            return {"ok": True, "duplicate": True}
         already_notified = launched.get("status") == "waiting_for_admission"
         launched["status"] = "waiting_for_admission"
         launched["waiting_since"] = datetime.now(timezone.utc).isoformat()
         await save_state()
 
     if not already_notified:
-        await tg_text(chat_id, t(chat_id, "waiting_admission"))
+        await tg_text(chat_id, recording_message(t(chat_id, "waiting_admission"), launched.get("meet_url"), event_id))
     return {"ok": True}
 
 
@@ -3273,27 +3623,64 @@ async def recording_started(
     data = await request.json()
     chat_id = str(data.get("userId") or "").strip()
     event_id = str(data.get("eventId") or data.get("botId") or "").strip()
-    if not chat_id:
-        raise HTTPException(status_code=400, detail="Missing userId")
+    if not chat_id or not event_id:
+        raise HTTPException(status_code=400, detail="Missing recording identity")
 
-    already_notified = False
-    if event_id:
-        launched = state["launched_events"].setdefault(event_id, {})
-        already_notified = launched.get("status") == "recording"
-        launched["status"] = "recording"
-        launched["recording_started_at"] = datetime.now(timezone.utc).isoformat()
+    if data.get("eventId") and data.get("botId") and data["eventId"] != data["botId"]:
+        raise HTTPException(409, "Conflicting recording identity")
+    launched = state["launched_events"].get(event_id)
+    if not launched or str(launched.get("chat_id")) != chat_id:
+        raise HTTPException(status_code=409, detail="Unknown recording identity")
+    if launched.get("status") in {"delivering", "completed", "failed", "failed_delivery"}:
+        return {"ok": True, "duplicate": True, "recording_limit_seconds": 0}
+    if data.get("extendFrom") is not None:
+        # A repeated request carries the old reservation value and cannot add
+        # credit twice. All concurrent sessions share this same allocation lock.
+        async with shared_chrome_dispatch_lock:
+            if state["launched_events"].get(event_id) is not launched or launched.get("status") not in {"capturing", "recording"}:
+                return {"ok": True, "recording_limit_seconds": 0}
+            current = launched.get("reserved_seconds")
+            if current is not None and int(data["extendFrom"]) == int(current):
+                additional = await reserve_recording_seconds(chat_id, bool(launched.get("premium")))
+                if additional:
+                    launched["reserved_seconds"] = int(current) + additional
+                    await save_state()
+        return {"ok": True, "recording_limit_seconds": launched.get("reserved_seconds")}
+    verified = int(data.get("captureBytes") or 0) > 0
+    stage = "recording" if verified else "capturing"
+    if launched.get("status") != "recording" and launched.get("status") != stage:
+        launched["status"] = stage
+        launched.setdefault("recording_started_at", datetime.now(timezone.utc).isoformat())
         await save_state()
+        key = "recording_started" if verified else "capture_unconfirmed"
+        asyncio.create_task(notify_capture_progress(chat_id, key, launched.get("meet_url"), event_id))
+    return {"ok": True, "recording_limit_seconds": launched.get("reserved_seconds")}
 
-    if not already_notified:
-        await tg_text(chat_id, t(chat_id, "recording_started"))
-    return {"ok": True}
+
+async def notify_capture_progress(chat_id: str, key: str, link: str, event_id: str) -> None:
+    try:
+        await asyncio.wait_for(tg_text(chat_id, recording_message(t(chat_id, key), link, event_id)), timeout=30)
+    except Exception as exc:
+        print(f"capture progress notification failed job={event_id}: {type(exc).__name__}", flush=True)
+
+
+def recording_message(message: str, meeting_link: str | None, event_id: str = "") -> str:
+    code = normalize_meet_url(str(meeting_link or "")).rsplit("/", 1)[-1]
+    return f"{message}\n\n{code or event_id[-12:]}"
+
+
+def assert_recording_path(raw_path: Path) -> None:
+    if not (raw_path.is_relative_to(RECORDING_ROOT) or raw_path.is_relative_to(RECORDING_SPOOL)):
+        raise HTTPException(status_code=400, detail="Invalid recording path")
+
+
+async def run_media_command(args: list[str], **kwargs: Any) -> None:
+    async with MEDIA_SEMAPHORE:
+        await asyncio.to_thread(subprocess.run, args, **kwargs)
 
 
 async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict[str, Any]:
-    try:
-        raw_path.relative_to(RECORDING_ROOT)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid recording path")
+    assert_recording_path(raw_path)
     if not raw_path.exists() or not raw_path.is_file():
         raise HTTPException(status_code=404, detail="Recording not found")
 
@@ -3308,7 +3695,7 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
     recipients = [
         {
             "chat_id": chat_id,
-            "caption": t(chat_id, "recording_ready_caption"),
+            "caption": recording_message(t(chat_id, "recording_ready_caption"), meeting_link, str(data.get("eventId") or data.get("botId") or "")),
         }
     ]
     if ADMINUSER and ADMINUSER != chat_id and os.environ.get("SEND_ADMIN_RECORDING_COPIES", "false").lower() in {"1", "true", "yes"}:
@@ -3320,7 +3707,13 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
         recipients.append({"chat_id": ADMINUSER, "caption": admin_caption})
 
     try:
-        premium_active = await asyncio.to_thread(is_premium, chat_id)
+        pending_id = str(data.get("_pending_id") or "")
+        pending_state = state.setdefault("pending_deliveries", {}).get(pending_id) if pending_id else None
+        premium_active = (bool(pending_state["premium"]) if pending_state is not None and "premium" in pending_state
+                          else await asyncio.to_thread(is_premium, chat_id))
+        if pending_state is not None and "premium" not in pending_state:
+            pending_state["premium"] = premium_active
+            await save_state()
         delivery_path = raw_path
         delivery_filename = filename
         free_path: Path | None = None
@@ -3331,13 +3724,12 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
             # followed by a second segmented encode.
             if raw_path.stat().st_size <= 49 * 1024 * 1024:
                 free_path = raw_path.with_name(f"{raw_path.stem}_standard.mp4")
-                await asyncio.to_thread(
-                    subprocess.run,
+                await run_media_command(
                     [
-                        "ffmpeg", "-y", "-i", str(raw_path),
+                        "ffmpeg", "-y", "-threads", "1", "-i", str(raw_path),
                         "-vf", "scale='min(1280,iw)':-2",
                         "-c:v", "libx264", "-preset", "veryfast", "-b:v", "1200k",
-                        "-c:a", "aac", "-b:a", "96k",
+                        "-c:a", "aac", "-b:a", "96k", "-threads", "1",
                         str(free_path),
                     ],
                     check=True,
@@ -3347,19 +3739,40 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                 delivery_path = free_path
                 delivery_filename = f"{Path(filename).stem}.mp4"
 
-        pending_id = str(data.get("_pending_id") or "")
-        pending_state = state.setdefault("pending_deliveries", {}).get(pending_id) if pending_id else None
+        if pending_state is not None and not pending_state.get("media_verified"):
+            try:
+                async with MEDIA_SEMAPHORE:
+                    duration = await asyncio.to_thread(verified_duration, raw_path)
+            except (ValueError, subprocess.CalledProcessError):
+                # A finalized immutable artifact with no playable A/V cannot
+                # become valid on retry. Preserve it and report permanent failure.
+                pending_state["attempts"] = PENDING_DELIVERY_MAX_ATTEMPTS
+                pending_state["terminal_failure"] = True
+                await save_state()
+                raise
+            pending_state["duration"] = duration
+            pending_state["media_verified"] = True
+            await save_state()
         video_already_delivered = bool((pending_state or {}).get("video_delivered"))
 
         if not video_already_delivered:
-            await tg_text(chat_id, t(chat_id, "recording_finished"))
-            await send_recording_to_recipients(recipients, delivery_path, delivery_filename)
+            if not (pending_state or {}).get("finish_notified"):
+                await tg_text(chat_id, recording_message(t(chat_id, "recording_finished"), meeting_link, pending_id))
+                if pending_state is not None:
+                    pending_state["finish_notified"] = True
+                    await save_state()
+            await send_recording_to_recipients(recipients[:1], delivery_path, delivery_filename, premium_at_recording=premium_active)
             if pending_state is not None:
                 pending_state["video_delivered"] = True
                 pending_state["video_delivered_at"] = datetime.now(timezone.utc).isoformat()
                 pending_state["updated_at"] = datetime.now(timezone.utc).isoformat()
                 await save_state()
-        reported_seconds = max(0, int(data.get("duration") or 0))
+            if len(recipients) > 1:
+                try:
+                    await send_recording_to_recipients(recipients[1:], delivery_path, delivery_filename, premium_at_recording=premium_active)
+                except Exception as exc:
+                    print(f"admin video copy error job={pending_id}: {type(exc).__name__}", flush=True)
+        reported_seconds = max(0, int((pending_state or {}).get("duration") or data.get("duration") or 0))
         if reported_seconds == 0:
             # Upstream callbacks sometimes omit duration. Read the real WebM
             # metadata so a missing field cannot silently bypass paid quotas.
@@ -3371,7 +3784,11 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
             delivery_filename,
             int(delivery_path.stat().st_size),
             reported_seconds,
+            (pending_state or {}).get("reserved_seconds"),
         )
+        if pending_state is not None and not pending_state.get("billing_committed"):
+            pending_state["billing_committed"] = True
+            await save_state()
 
         if premium_active:
             audio_already_delivered = bool((pending_state or {}).get("audio_delivered"))
@@ -3385,8 +3802,7 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                     # Speech-friendly mono audio keeps most meetings under Telegram's
                     # 50 MB Bot API upload cap. Very long meetings transparently fall
                     # back to the secure expiring download link.
-                    await asyncio.to_thread(
-                        subprocess.run,
+                    await run_media_command(
                         [
                             "ffmpeg",
                             "-y",
@@ -3413,10 +3829,11 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                             await send_audio_to_recipients(
                                 [{
                                     "chat_id": chat_id,
-                                    "caption": t(chat_id, "audio_ready_caption"),
+                                    "caption": recording_message(t(chat_id, "audio_ready_caption"), meeting_link, pending_id),
                                 }],
                                 audio_path,
                                 f"{Path(filename).stem}.mp3",
+                                premium_at_recording=True,
                             )
                             if pending_state is not None:
                                 pending_state["audio_delivered"] = True
@@ -3443,13 +3860,14 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                                     }],
                                     audio_path,
                                     f"{Path(filename).stem}.mp3",
+                                    premium_at_recording=True,
                                 )
                             except Exception as exc:
                                 print("admin audio copy error:", repr(exc), flush=True)
 
-                    if not transcript_already_delivered:
+                    if not transcript_already_delivered and not data.get("_media_only") and audio_delivery_error is None:
                         try:
-                            await tg_text(chat_id, t(chat_id, "transcribing"))
+                            await tg_text(chat_id, recording_message(t(chat_id, "transcribing"), meeting_link, pending_id))
                             async with TRANSCRIPTION_SEMAPHORE:
                                 try:
                                     transcript, detected_language = await asyncio.to_thread(
@@ -3495,7 +3913,7 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                                             "sendDocument",
                                             {
                                                 "chat_id": chat_id,
-                                                "caption": t(chat_id, "transcript_ready_caption"),
+                                                "caption": recording_message(t(chat_id, "transcript_ready_caption"), meeting_link, pending_id),
                                             },
                                             {
                                                 "document": (
@@ -3539,7 +3957,7 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                                 finally:
                                     transcript_path.unlink(missing_ok=True)
                             else:
-                                await tg_text(chat_id, t(chat_id, "transcript_empty"))
+                                await tg_text(chat_id, recording_message(t(chat_id, "transcript_empty"), meeting_link, pending_id))
                                 if pending_state is not None:
                                     pending_state["transcript_delivered"] = True
                                     pending_state["transcript_empty"] = True
@@ -3551,7 +3969,7 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                             print("transcription error:", repr(exc), flush=True)
                             if not bool(data.get("_silent_retry")):
                                 try:
-                                    await tg_text(chat_id, t(chat_id, "transcript_error"))
+                                    await tg_text(chat_id, recording_message(t(chat_id, "transcript_error"), meeting_link, pending_id))
                                 except Exception as notify_exc:
                                     print("transcript error notification failed:", repr(notify_exc), flush=True)
                 finally:
@@ -3565,16 +3983,13 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
                     "premium downstream delivery incomplete: "
                     f"audio={audio_delivery_error!r} transcript={transcript_processing_error!r}"
                 )
+            if data.get("_media_only") and not transcript_already_delivered:
+                if free_path:
+                    free_path.unlink(missing_ok=True)
+                return {"ok": True, "deferred": True}
 
         if free_path:
             free_path.unlink(missing_ok=True)
-        raw_path.unlink(missing_ok=True)
-
-        completed_event_id = str(data.get("botId") or data.get("eventId") or "").strip()
-        if completed_event_id:
-            state.setdefault("launched_events", {}).pop(completed_event_id, None)
-            await save_state()
-
         return {"ok": True, "admin_copy": bool(ADMINUSER and os.environ.get("SEND_ADMIN_RECORDING_COPIES", "false").lower() in {"1", "true", "yes"}), "premium": premium_active}
     except Exception as exc:
         # Do not tell the user that Telegram delivery failed when the recording
@@ -3591,7 +4006,7 @@ async def _process_recording_inner(data: dict[str, Any], raw_path: Path) -> dict
             (pending_after_failure or {}).get("video_delivered")
         )
         if not bool(data.get("_silent_retry")) and not video_delivered_after_failure:
-            await tg_text(chat_id, t(chat_id, "delivery_error"))
+            await tg_text(chat_id, recording_message(t(chat_id, "delivery_error"), meeting_link, pending_id_after_failure))
         elif video_delivered_after_failure:
             print(
                 "recording delivered; downstream Premium output remains pending:",
@@ -3632,14 +4047,35 @@ async def _process_recording_locked(data: dict[str, Any], raw_path: Path) -> dic
     try:
         data = {**data, "_pending_id": pending_id}
         result = await _process_recording_inner(data, raw_path)
+        if result.get("deferred"):
+            current = state["pending_deliveries"][pending_id]
+            current["media_complete"] = True
+            current["attempts"] = 0
+            current["updated_at"] = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+            await save_state()
+            return result
         state.setdefault("completed_deliveries", {})[pending_id] = {
             "chat_id": chat_id,
             "source_path": str(raw_path),
             "filename": str(data.get("filename") or raw_path.name),
+            "meeting_link": str(data.get("meetingLink") or ""),
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
         state.setdefault("pending_deliveries", {}).pop(pending_id, None)
+        state.setdefault("launched_events", {}).pop(event_id, None)
         await save_state()
+        raw_path.unlink(missing_ok=True)
+        recovered_path = str(pending.get("recovered_source_path") or "")
+        if recovered_path:
+            recovered = Path(recovered_path)
+            try:
+                # Remove only the exact recovered source, after the durable
+                # completion receipt; never delete a changed/reused path.
+                if (recovered.resolve() == recovered and recovered.is_relative_to(RECORDING_ROOT)
+                    and recovered.is_file() and recovered.stat().st_size == int(pending["recovered_source_size"])):
+                    recovered.unlink()
+            except OSError:
+                print(f"recovered source cleanup deferred job={event_id}", flush=True)
         return result
     except Exception as exc:
         current = state.setdefault("pending_deliveries", {}).get(pending_id)
@@ -3676,6 +4112,94 @@ async def _process_recording(data: dict[str, Any], raw_path: Path) -> dict[str, 
         return await _process_recording_locked(data, raw_path)
 
 
+async def accept_recording(data: dict[str, Any], source: Path) -> dict[str, Any]:
+    """Acknowledge only a verified, durable recording and persisted queue entry.
+
+    Both legacy shared-path and streamed uploads use the same job identity.
+    Media and Telegram work happen independently of the recorder HTTP callback.
+    """
+    event_id = str(data.get("botId") or data.get("eventId") or "").strip()
+    chat_id = str(data.get("userId") or "").strip()
+    if not event_id or not chat_id:
+        raise HTTPException(400, "Missing recording identity")
+    if data.get("eventId") and data.get("botId") and data["eventId"] != data["botId"]:
+        raise HTTPException(409, "Conflicting recording identity")
+    link = normalize_meet_url(str(data.get("meetingLink") or ""))
+    # Completed/persisted duplicates can be acknowledged even while the same
+    # job's transcription holds the delivery lock for minutes.
+    prior = state["completed_deliveries"].get(event_id) or state["pending_deliveries"].get(event_id)
+    if prior and (prior.get("completed_at") or prior.get("persisted_at") and Path(str(prior.get("file_path") or "")).is_file()):
+        expected_link = normalize_meet_url(str(prior.get("meeting_link") or ""))
+        if str(prior.get("chat_id") or "") != chat_id or (link and expected_link and link != expected_link):
+            raise HTTPException(409, "Recording owner or meeting mismatch")
+        await save_state()
+        return {"ok": True, "duplicate": True, "pending_id": event_id}
+    lock = delivery_locks.setdefault(event_id, asyncio.Lock())
+    async with lock:
+        launched = state["launched_events"].get(event_id) or {}
+        pending = state["pending_deliveries"].get(event_id)
+        completed = state["completed_deliveries"].get(event_id)
+        prior = completed or pending or launched
+        expected_link = normalize_meet_url(str(prior.get("meeting_link") or prior.get("meet_url") or ""))
+        if str(prior.get("chat_id") or "") != chat_id or (link and expected_link and link != expected_link):
+            raise HTTPException(409, "Recording owner or meeting mismatch")
+        link = expected_link or link
+        if completed:
+            return {"ok": True, "duplicate": True, "pending_id": event_id}
+        if pending and pending.get("persisted_at") and Path(str(pending.get("file_path") or "")).is_file():
+            # A retry may arrive after the worker lost its HTTP response.
+            await save_state()
+            return {"ok": True, "duplicate": True, "pending_id": event_id}
+        assert_recording_path(source)
+        try:
+            if not source.is_file():
+                raise HTTPException(404, "Recording source missing")
+            source_size = source.stat().st_size
+        except PermissionError as exc:
+            raise HTTPException(503, "Recording source temporarily unreadable") from exc
+        expected_size = int(data.get("size") or 0)
+        if expected_size and expected_size != source_size:
+            raise HTTPException(400, "Incomplete recording source")
+        suffix = source.suffix.lower()
+        if suffix not in {".webm", ".mp4", ".mkv"}:
+            raise HTTPException(400, "Unsupported recording format")
+        destination = RECORDING_SPOOL / (recording_key(event_id) + suffix)
+        try:
+            await asyncio.to_thread(persist_source, source, destination)
+        except OSError as exc:
+            raise HTTPException(503, "Recording source could not be persisted") from exc
+        if expected_size and destination.stat().st_size != expected_size:
+            raise HTTPException(409, "Recording changed during durable handoff")
+        # A stable filename makes the existing wallet/recordings transaction
+        # idempotent even across repeated upload attempts and process restarts.
+        name = str((pending or {}).get("filename") or f"BeOnMeet-{link.rsplit('/', 1)[-1]}-{recording_key(event_id)[:16]}{suffix}")
+        state["pending_deliveries"][event_id] = {
+            **(pending or {}), "event_id": event_id, "chat_id": chat_id,
+            "file_path": str(destination), "source_name": destination.name,
+            "filename": name, "meeting_link": link, "duration": 0,
+            "premium": bool(launched.get("premium")) if launched else bool((pending or {}).get("premium")),
+            "reserved_seconds": launched.get("reserved_seconds") if launched else (pending or {}).get("reserved_seconds"),
+            "attempts": int((pending or {}).get("attempts") or 0),
+            "updated_at": (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat(),
+            "persisted_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if launched:
+            launched["status"] = "delivering"
+        state["failed_recordings"].pop(event_id, None)
+        await save_state()
+        print(f"recording persisted job={event_id} bytes={destination.stat().st_size}", flush=True)
+        return {"ok": True, "pending_id": event_id, "persisted": True}
+
+
+async def run_pending_delivery(pending_id: str, data: dict[str, Any], path: Path) -> None:
+    try:
+        await _process_recording(data, path)
+    except Exception as exc:
+        print(f"pending delivery recovery error job={pending_id}: {type(exc).__name__}", flush=True)
+    finally:
+        delivery_tasks.pop(pending_id, None)
+        delivery_task_stages.pop(pending_id, None)
+
 
 async def delivery_recovery_loop() -> None:
     await asyncio.sleep(5)
@@ -3686,35 +4210,43 @@ async def delivery_recovery_loop() -> None:
 
     while True:
         try:
-            if active_delivery_jobs:
-                await asyncio.sleep(15)
-                continue
-
             pending_items = list(state.setdefault("pending_deliveries", {}).items())
+            pending_items.sort(key=lambda item: bool((item[1] or {}).get("video_delivered")))
             if not pending_items:
                 # Never infer a meeting from arbitrary files on disk. Recovery is
                 # allowed only from an exact pending-delivery record that carries
                 # the original event id and exact recorder file path.
-                await asyncio.sleep(30)
+                await asyncio.sleep(3)
                 continue
 
             for pending_id, pending in pending_items:
-                if active_delivery_jobs:
-                    break
+                if pending_id in delivery_tasks or (pending_id in delivery_locks and delivery_locks[pending_id].locked()):
+                    continue
 
                 pending = pending or {}
+                stage = "transcript" if pending.get("media_complete") else "media"
+                limit = 1 if stage == "transcript" else DELIVERY_CONCURRENCY
+                if sum(v == stage for v in delivery_task_stages.values()) >= limit:
+                    continue
                 attempts = int(pending.get("attempts") or 0)
                 # A temporary encoding or directory-permission failure must not
                 # permanently strand a paid recording after only eight attempts.
                 # Keep the already-delivered video stage idempotent and resume
                 # just the missing audio/transcript from the preserved WebM.
                 if attempts >= PENDING_DELIVERY_MAX_ATTEMPTS:
+                    launched = state["launched_events"].get(pending_id)
+                    if not pending.get("terminal_failure") or launched and launched.get("status") != "failed_delivery":
+                        pending["terminal_failure"] = True
+                        if launched:
+                            launched["status"] = "failed_delivery"
+                        await save_state()
                     if not pending.get("recovery_exhausted_notified"):
                         chat_id = str(pending.get("chat_id") or "")
                         if chat_id:
                             try:
-                                await tg_text(chat_id, t(chat_id, "delivery_recovery_exhausted"))
+                                await tg_text(chat_id, recording_message(t(chat_id, "delivery_recovery_exhausted" if pending.get("video_delivered") else "delivery_failed_terminal"), pending.get("meeting_link"), pending_id))
                                 pending["recovery_exhausted_notified"] = True
+                                pending["terminal_failure"] = True
                                 await save_state()
                             except Exception as notify_error:
                                 print("delivery recovery exhaustion notification failed:", type(notify_error).__name__, flush=True)
@@ -3729,7 +4261,8 @@ async def delivery_recovery_loop() -> None:
                         "missing exact event/chat/file identity",
                         flush=True,
                     )
-                    state.setdefault("pending_deliveries", {}).pop(pending_id, None)
+                    pending["attempts"] = PENDING_DELIVERY_MAX_ATTEMPTS
+                    pending["terminal_failure"] = True
                     await save_state()
                     continue
 
@@ -3741,24 +4274,27 @@ async def delivery_recovery_loop() -> None:
                         f"event mismatch {event_id_for_retry}",
                         flush=True,
                     )
-                    state.setdefault("pending_deliveries", {}).pop(pending_id, None)
+                    pending["attempts"] = PENDING_DELIVERY_MAX_ATTEMPTS
+                    pending["terminal_failure"] = True
                     await save_state()
                     continue
 
                 raw_path = Path(stored_file_path).resolve()
                 try:
-                    raw_path.relative_to(RECORDING_ROOT)
-                except ValueError:
+                    assert_recording_path(raw_path)
+                except HTTPException:
                     print(
                         f"dropping unsafe pending delivery {pending_id}: "
                         "file is outside recording root",
                         flush=True,
                     )
-                    state.setdefault("pending_deliveries", {}).pop(pending_id, None)
+                    pending["terminal_failure"] = True
+                    pending["attempts"] = PENDING_DELIVERY_MAX_ATTEMPTS
                     await save_state()
                     continue
                 if not raw_path.exists() or not raw_path.is_file():
-                    state.setdefault("pending_deliveries", {}).pop(pending_id, None)
+                    pending["attempts"] = PENDING_DELIVERY_MAX_ATTEMPTS
+                    pending["terminal_failure"] = True
                     missing_event_id = str((pending or {}).get("event_id") or "")
                     if missing_event_id:
                         launched = state.setdefault("launched_events", {}).get(missing_event_id) or {}
@@ -3772,7 +4308,7 @@ async def delivery_recovery_loop() -> None:
                     updated = isoparse(updated_raw) if updated_raw else datetime.now(timezone.utc) - timedelta(minutes=10)
                 except Exception:
                     updated = datetime.now(timezone.utc) - timedelta(minutes=10)
-                if datetime.now(timezone.utc) - updated < timedelta(seconds=30):
+                if datetime.now(timezone.utc) - updated < timedelta(seconds=min(900, 15 * 2 ** min(attempts, 6))):
                     continue
 
                 recovery_data = {
@@ -3783,16 +4319,15 @@ async def delivery_recovery_loop() -> None:
                     "filename": str((pending or {}).get("filename") or raw_path.name),
                     "duration": int((pending or {}).get("duration") or 0),
                     "_silent_retry": True,
+                    "_media_only": stage == "media",
                 }
                 print(f"retrying pending delivery {pending_id} attempt={attempts + 1}", flush=True)
-                try:
-                    await _process_recording(recovery_data, raw_path)
-                except Exception as exc:
-                    print("pending delivery recovery error:", repr(exc), flush=True)
+                delivery_task_stages[pending_id] = stage
+                delivery_tasks[pending_id] = asyncio.create_task(run_pending_delivery(pending_id, recovery_data, raw_path))
         except Exception as exc:
             print("delivery recovery loop error:", repr(exc), flush=True)
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(3)
 
 
 @app.post("/internal/recording-ready")
@@ -3804,7 +4339,7 @@ async def recording_ready(
         raise HTTPException(status_code=403, detail="Forbidden")
     data = await request.json()
     raw_path = Path(str(data.get("filePath", ""))).resolve()
-    return await _process_recording(data, raw_path)
+    return await accept_recording(data, raw_path)
 
 
 @app.post("/internal/recording-upload")
@@ -3829,9 +4364,9 @@ async def recording_upload(
         raise HTTPException(status_code=400, detail="Invalid recording metadata")
 
     suffix = Path(str(meta.get("filename") or "recording.webm")).suffix or ".webm"
-    raw_path = (RECORDING_ROOT / f"remote-{uuid.uuid4().hex}{suffix}").resolve()
+    raw_path = (RECORDING_SPOOL / f"incoming-{uuid.uuid4().hex}{suffix}").resolve()
     try:
-        raw_path.relative_to(RECORDING_ROOT)
+        raw_path.relative_to(RECORDING_SPOOL)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid recording path")
 
@@ -3855,7 +4390,8 @@ async def recording_upload(
 
         meta["filePath"] = str(raw_path)
         meta["size"] = received
-        return await _process_recording(meta, raw_path)
-    except Exception:
+        return await accept_recording(meta, raw_path)
+    finally:
+        # Only the disposable ingress copy is removed. A published spool source
+        # survives any processing or Telegram failure, including HTTP retries.
         raw_path.unlink(missing_ok=True)
-        raise

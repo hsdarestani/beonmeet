@@ -18,6 +18,9 @@ class DiskUploader implements IUploader {
   private readonly root: string;
   private recordingDuration?: number;
   private writeChain: Promise<void> = Promise.resolve();
+  private captureNotified = false;
+  private handoffAccepted = false;
+  private readonly filename: string;
 
   private constructor(
     _token: string,
@@ -37,6 +40,7 @@ class DiskUploader implements IUploader {
     this.meetingLink = meetingLink;
     this.extension = process.env.UPLOADER_FILE_EXTENSION || '.webm';
     this.root = process.env.RECORDING_TMP_DIR || '/recordings';
+    this.filename = `BeOnMeet-${this.botId.replace(/[^a-zA-Z0-9_-]/g, '_')}-${this.tempFileId.replace(/[^a-zA-Z0-9_-]/g, '_')}${this.extension}`;
   }
 
   public static async initialize(
@@ -61,21 +65,25 @@ class DiskUploader implements IUploader {
       logger,
       meetingLink,
     );
-    // The controller (UID 999, shared GID 987) creates MP3, MP4 and
-    // transcript outputs next to the worker's WebM file. The default 0755
-    // mkdir permissions silently break these deliverables and free recordings.
-    // Explicit chmod also repairs preexisting 2755 per-user directories.
+    // Keep the shared mount's group through both levels of the storage path.
+    // New directories inherit it from the setgid root/parent, including with
+    // the worker's restrictive umask. Older parents are repaired on the host.
     await fs.promises.mkdir(instance.folderPath(), { recursive: true, mode: 0o2770 });
+    const mount = await fs.promises.stat(instance.root);
+    const folder = await fs.promises.stat(instance.folderPath());
+    if (folder.gid !== mount.gid) {
+      throw new Error('Recording directory did not inherit its shared group');
+    }
     await fs.promises.chmod(instance.folderPath(), 0o2770);
     return instance;
   }
 
   private folderPath(): string {
-    return path.join(this.root, this.userId.replace(/[^a-zA-Z0-9_-]/g, '_'));
+    return path.join(this.root, this.userId.replace(/[^a-zA-Z0-9_-]/g, '_'), this.botId.replace(/[^a-zA-Z0-9_-]/g, '_'));
   }
 
   private filePath(): string {
-    return path.join(this.folderPath(), `${this.tempFileId}${this.extension}`);
+    return path.join(this.folderPath(), `${this.tempFileId.replace(/[^a-zA-Z0-9_-]/g, '_')}${this.extension}`);
   }
 
   public async saveDataToTempFile(data: Buffer): Promise<boolean> {
@@ -85,6 +93,22 @@ class DiskUploader implements IUploader {
     });
     try {
       await this.writeChain;
+      if (data.length && !this.captureNotified) {
+        this.captureNotified = true;
+        const url = process.env.CONTROLLER_RECORDING_STARTED_URL;
+        const secret = process.env.INTERNAL_SECRET;
+        if (url && secret) {
+          // The first nonempty persisted chunk is stronger evidence than
+          // calling MediaRecorder.start(). Never let notification stall capture.
+          void fetch(url, {
+            method: 'POST', headers: { 'content-type': 'application/json', 'x-beonmeet-secret': secret },
+            signal: AbortSignal.timeout(10000),
+            body: JSON.stringify({ userId: this.userId, botId: this.botId, eventId: this.botId,
+              meetingLink: this.meetingLink, captureBytes: data.length }),
+          }).then(response => { if (!response.ok) this.captureNotified = false; })
+            .catch(() => { this.captureNotified = false; });
+        }
+      }
       return true;
     } catch (error) {
       this.logger.error('Unable to write recording chunk', { error, filePath });
@@ -99,6 +123,7 @@ class DiskUploader implements IUploader {
   }
 
   public async uploadRecordingToRemoteStorage(_options?: { forceUpload?: boolean }): Promise<boolean> {
+    if (this.handoffAccepted) return true;
     const filePath = this.filePath();
     try {
       await this.writeChain;
@@ -117,42 +142,46 @@ class DiskUploader implements IUploader {
         botId: this.botId,
         meetingLink: this.meetingLink,
         duration: this.recordingDuration,
-        filename: `BeOnMeet-${new Date().toISOString().replace(/[:.]/g, '-')}${this.extension}`,
+        filename: this.filename,
         size: stat.size,
       };
 
-      let response: Response;
-      if (streamControllerUrl) {
-        const encodedMeta = Buffer.from(JSON.stringify(metadata), 'utf8').toString('base64url');
-        response = await fetch(streamControllerUrl, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/octet-stream',
-            'content-length': String(stat.size),
-            'x-beonmeet-secret': secret,
-            'x-beonmeet-meta': encodedMeta,
-          },
-          body: fs.createReadStream(filePath) as any,
-          duplex: 'half',
-        } as any);
-      } else {
-        response = await fetch(legacyControllerUrl!, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'x-beonmeet-secret': secret,
-          },
-          body: JSON.stringify({
-            ...metadata,
-            filePath,
-          }),
-        });
+      // Retry the same identity and source; controller acknowledgement means
+      // durable handoff, not that transcription has finished.
+      let accepted = false;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          let response: Response;
+          if (streamControllerUrl) {
+            const encodedMeta = Buffer.from(JSON.stringify(metadata), 'utf8').toString('base64url');
+            response = await fetch(streamControllerUrl, {
+              method: 'POST',
+              headers: { 'content-type': 'application/octet-stream', 'content-length': String(stat.size),
+                'x-beonmeet-secret': secret, 'x-beonmeet-meta': encodedMeta },
+              body: fs.createReadStream(filePath) as any, signal: AbortSignal.timeout(300000), duplex: 'half',
+            } as any);
+          } else {
+            response = await fetch(legacyControllerUrl!, {
+              method: 'POST', headers: { 'content-type': 'application/json', 'x-beonmeet-secret': secret },
+              body: JSON.stringify({ ...metadata, filePath }), signal: AbortSignal.timeout(300000),
+            });
+          }
+          if (response.ok) {
+            const receipt = await response.json() as { ok?: boolean; persisted?: boolean; duplicate?: boolean };
+            if (receipt.ok && (receipt.persisted || receipt.duplicate)) {
+              accepted = true;
+              break;
+            }
+            throw new Error('Controller did not acknowledge durable handoff');
+          }
+          if (response.status >= 400 && response.status < 500 && response.status !== 429) break;
+        } catch (error) {
+          this.logger.warn('Recording handoff attempt failed', { botId: this.botId, attempt });
+        }
+        if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 1000 * 2 ** attempt));
       }
-
-      if (!response.ok) {
-        const body = await response.text();
-        throw new Error(`Controller returned ${response.status}: ${body}`);
-      }
+      if (!accepted) throw new Error('Recording durable handoff failed; source retained');
+      this.handoffAccepted = true;
 
       try {
         await fs.promises.unlink(filePath);
@@ -160,6 +189,7 @@ class DiskUploader implements IUploader {
 
       this.logger.info('Recording delivered to BeOnMeet controller', {
         userId: this.userId,
+        botId: this.botId,
         size: stat.size,
       });
       return true;

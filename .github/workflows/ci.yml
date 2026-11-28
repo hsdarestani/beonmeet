@@ -48,6 +48,10 @@ jobs:
           python3 tests/shared_chrome_admission_gate_test.py
           python3 tests/worker_auth_guard_test.py
           python3 tests/worker_auth_monitor_timing_test.py
+          python3 tests/concurrent_credit_reservation_test.py
+          python3 tests/concurrent_handoff_test.py
+          python3 tests/compiled_uploader_handoff_test.py
+          python3 tests/recording_finalization_overlay_test.py
           python3 tests/five_isolated_workers_dispatch_test.py
           python3 tests/five_local_cutover_policy_test.py
           python3 -m py_compile scripts/stage_four_isolated_local_workers.py scripts/cutover_five_isolated_local_workers.py

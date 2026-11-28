@@ -96,11 +96,11 @@ env["record_recording"]("fresh","https://meet.google.com/abc-defg-hij","one.mp4"
 assert env["recording_credit_info"]("fresh")["remaining_seconds"]==9000, "delivery retry must not debit again"
 env["record_recording"]("fresh","https://meet.google.com/abc-defg-hij","over.mp4",1000,12600)
 assert env["recording_credit_info"]("fresh")["remaining_seconds"]==0
-assert env["recording_credit_info"]("fresh")["signed_balance_seconds"]==-3600
+assert env["recording_credit_info"]("fresh")["signed_balance_seconds"]==0
 assert not env["is_premium"]("fresh")
-assert purchase("fresh","pro","receipt-103")==18000, "future purchase first settles overrun"
-assert purchase("fresh","pro","receipt-103")==18000, "retry stable"
-assert env["paid_recording_entitlement"]("fresh")["remaining_seconds"]==18000
+assert purchase("fresh","pro","receipt-103")==21600, "no negative debt reduces the next purchase"
+assert purchase("fresh","pro","receipt-103")==21600, "retry stable"
+assert env["paid_recording_entitlement"]("fresh")["remaining_seconds"]==21600
 assert env["paid_sales_capacity"]("basic","fresh")["allowed"] is True
 
 assert purchase("44","basic","receipt-104")==7200

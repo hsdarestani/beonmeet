@@ -21,7 +21,7 @@ http.createServer((req,res)=>{
  if(req.method!=='POST')return done(res,405,{ok:false});
  const url=req.url||'';
  if(url.includes('recording-started')){
-   start++;note('recording_started');req.resume();return done(res,200);
+   start++;note('recording_started');req.resume();return done(res,200,{ok:true,recording_limit_seconds:null});
  }
  if(url.includes('waiting-for-admission')){
    waiting++;note('waiting_for_admission');req.resume();return done(res,200);
@@ -39,7 +39,7 @@ http.createServer((req,res)=>{
    const fd=fs.createWriteStream(target,{flags:'wx'});
    req.on('data',buf=>{length+=buf.length;if(length>350*1024*1024)req.destroy();});
    req.pipe(fd);
-   fd.on('finish',()=>{uploaded++;note('recording_uploaded');done(res,200);});
+   fd.on('finish',()=>{uploaded++;note('recording_uploaded');done(res,200,{ok:true,persisted:true});});
    fd.on('error',()=>{if(!res.headersSent)done(res,500,{ok:false});});
    return;
  }
@@ -53,7 +53,7 @@ http.createServer((req,res)=>{
      const source=path.resolve(String(data.filePath||''));
      if(!source.startsWith('/recordings/qa_lane_2/'))return done(res,403,{ok:false});
      fs.copyFileSync(source,target,fs.constants.COPYFILE_EXCL);
-     uploaded++;note('recording_uploaded');return done(res,200);
+     uploaded++;note('recording_uploaded');return done(res,200,{ok:true,persisted:true});
    }catch(e){return done(res,500,{ok:false});}
  });
  }catch(e){

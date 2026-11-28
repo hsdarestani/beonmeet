@@ -8,6 +8,7 @@ Meet browser recordings or replace a five-room end-to-end acceptance test.
 from __future__ import annotations
 import ast
 import asyncio
+from contextlib import nullcontext
 import datetime
 import types
 import typing
@@ -60,6 +61,8 @@ class FakeClient:
 async def run():
     async def save_state():
         return None
+    async def reserve_recording_seconds(*args):
+        return 3600
     state={"launched_events":{}}
     env={
         "Any":typing.Any,
@@ -71,11 +74,13 @@ async def run():
         "FREE_WORKER_URLS":WORKERS[1:],
         "SHARED_CHROME_MAX_ACTIVE":1,
         "WORKER_AUTH_GUARD_ENABLED":False,
+        "_worker_auth_dispatch_lease": lambda url: nullcontext(True),
         "_recorder_auth_ready":lambda url: True,
         "shared_chrome_dispatch_lock":asyncio.Lock(),
         "httpx":types.SimpleNamespace(AsyncClient=FakeClient),
         "state":state,
         "save_state":save_state,
+        "reserve_recording_seconds":reserve_recording_seconds,
     }
     exec(body,env)
     dispatch=env["_dispatch_meeting"]
