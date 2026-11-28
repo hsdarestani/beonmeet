@@ -1,0 +1,34 @@
+name: Repair recording directory permissions without restart
+on:
+  push:
+    branches: [ops/recover-production-recordings-20261128]
+    paths: [.github/workflows/ops-repair-recording-directory-permissions.yml]
+permissions:
+  contents: read
+concurrency:
+  group: beonmeet-recording-permission-repair
+  cancel-in-progress: false
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Repair the BeOnMeet shared recording subtree and preserve a metadata backup
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 25s
+          command_timeout: 3m
+          script: |
+            set -eu
+            umask 077
+            case " $(hostname -I) " in *" 143.20.60.195 "*) : ;; *) exit 1 ;; esac
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 120 9
+            git fetch -q origin ${{ github.sha }}
+            git show "${{ github.sha }}:scripts/repair_recording_directory_groups.py" | python3 -
+            systemctl is-active --quiet beonmeet-controller
