@@ -1,0 +1,85 @@
+name: Publish BeOnMeet public landing
+on:
+  push:
+    branches: [design/public-landing-20261128]
+    paths: ['app/landing_assets/**', 'app/landing_page.py', '.github/workflows/deploy-public-landing.yml', 'scripts/deploy_public_landing.py']
+permissions:
+  contents: read
+concurrency:
+  group: beonmeet-shared-controller
+  cancel-in-progress: false
+jobs:
+  landing:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Detect public application changes
+        id: changes
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$BEFORE" = "$(git rev-parse HEAD^)" ] && git diff --quiet HEAD^ HEAD -- app scripts/deploy_public_landing.py; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+      - run: |
+          python3 -m py_compile app/main.py app/landing_page.py scripts/deploy_public_landing.py
+          python3 tests/public_oauth_pages_test.py
+          PYTHONPATH=app python3 -c 'from landing_page import render_landing; assert all(len(render_landing(l)) > 6000 for l in ("en","fa"))'
+      - name: Install public pages with idle and rollback checks
+        if: steps.changes.outputs.deploy == 'true'
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 4m
+          script: |
+            set -eu
+            cd /opt/beonmeet
+            exec 9>/var/lock/pars-vds-bot-deploy.lock
+            flock -w 120 9
+            release=${{ github.sha }}
+            git fetch -q origin "$release"
+            git show "$release:scripts/deploy_public_landing.py" | python3 - "$release"
+      - name: Verify live navigation, font and layouts in Chrome
+        run: |
+          python3 -m pip install --quiet selenium
+          python3 - <<'PY'
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support.ui import WebDriverWait
+          options = Options()
+          options.add_argument("--headless=new")
+          options.add_argument("--no-sandbox")
+          driver = webdriver.Chrome(options=options)
+          def click_in_view(selector):
+              element = driver.find_element(By.CSS_SELECTOR, selector)
+              driver.execute_script("arguments[0].scrollIntoView({block:'center', behavior:'instant'})", element)
+              element.click()
+
+          try:
+              for lang, path in (("fa", "/fa"), ("en", "/")):
+                  for width in (320, 390, 768, 1440):
+                      driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {"width":width,"height":900,"deviceScaleFactor":1,"mobile":False})
+                      driver.get("https://beonmeet.smarbiz.sbs" + path)
+                      WebDriverWait(driver, 12).until(lambda d: d.execute_script("return document.fonts.check('16px Vazir') && [...document.fonts].some(f=>f.family==='Vazir' && f.status==='loaded')"))
+                      assert driver.execute_script("return document.documentElement.lang") == lang
+                      viewport, content = driver.execute_script("return [document.documentElement.clientWidth, document.documentElement.scrollWidth]")
+                      assert content == viewport, (lang, width, viewport, content)
+                      assert len(driver.find_elements(By.CSS_SELECTOR, ".plan")) == 3
+                      assert driver.find_element(By.CSS_SELECTOR, ".actions a").get_attribute("href") == "https://t.me/BeOnMEETbot"
+                      click_in_view("summary")
+                      assert driver.find_element(By.CSS_SELECTOR, "details").get_attribute("open")
+                      click_in_view("nav a[href='#credits']")
+                      assert driver.current_url.endswith("#credits")
+                      print("LANDING_BROWSER_PASS", lang, width)
+          finally:
+              driver.quit()
+          PY

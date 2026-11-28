@@ -25,6 +25,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
+from landing_page import ASSETS as LANDING_ASSETS, render_landing
 from state_store import DurableStateStore
 from recording_handoff import persist_source, recording_key, verified_duration
 from db_compat import is_postgres
@@ -3333,113 +3334,17 @@ def public_shell(title: str, body: str) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def home() -> str:
-    # The bot's actual Telegram username must be configured before ads launch.
-    # Never invent a Telegram destination for paid marketing.
-    bot_url = os.environ.get("TELEGRAM_BOT_URL", "").strip()
-    verified_bot_url = bot_url if re.fullmatch(r"https://t\.me/[A-Za-z0-9_]+(?:\?start=[A-Za-z0-9_]+)?", bot_url) else ""
-    bot_cta = (
-        f'<a class="button" href="{verified_bot_url}" rel="noopener noreferrer">Start in Telegram</a>'
-        if verified_bot_url else
-        '<a class="button" href="mailto:meetrecorderbot@gmail.com?subject=BeOnMeet%20access">Request access</a>'
-    )
-    price_cards = "".join(
-        '<div class="card"><b>' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' hours credit</b>'
-        + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>toman · one-time purchase</small></div>'
-        + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' hours recording</div>'
-        + '<p>Purchased recording hours are added to your balance immediately, never expire, and can be used across all meetings.</p>'
-        + '</div>'
-        for code in PUBLIC_PLAN_CODES
-    )
-    body = """
-<main>
-<section class="hero"><div class="wrap">
-<span class="eyebrow">Google Meet recording in Telegram</span>
-<h1>Send your meeting link. Get the recording in Telegram.</h1>
-<p>Send the Google Meet link to our Telegram bot. For scheduled meetings, invite the recorder to the meeting event; for an ongoing meeting use Join now. The host may need to admit the recorder before recording begins.</p>
-<div class="cta">__BOT_CTA__<a class="button secondary" href="#credits">Buy hours</a></div>
-</div></section>
-<section id="credits" class="section"><div class="wrap">
-<h2>Buy recording hours, not subscriptions</h2>
-<p>Choose 2, 6 or 15 hours of recording credit. Each purchase instantly adds hours to your existing balance, even if you already have credit. Hours never expire, there are no monthly subscriptions, and no automatic renewal. Delivered recordings consume verified recording time up to your available balance; the balance never becomes negative.</p>
-<div class="grid prices">__PRICE_CARDS__</div>
-<div class="cta">__BOT_CTA__<a class="button secondary" href="/terms">Credit terms</a></div>
-</div></section>
-<section id="how"><div class="wrap grid">
-<div class="card"><b>1. Send the link</b><p>Send a Google Meet link directly in the bot. For a future meeting, invite the recorder email to the calendar event.</p></div>
-<div class="card"><b>2. Admit the recorder</b><p>The recorder attempts to join the requested meeting. The host may need to admit it.</p></div>
-<div class="card"><b>3. Receive the result</b><p>After recording, the bot sends the files to your Telegram chat, subject to available capacity and your available credit.</p></div>
-</div></section>
-<section class="section" id="data"><div class="wrap">
-<h2>Data access and privacy</h2>
-<p>Recording requires you to send your meeting link. Any previously granted Calendar permissions remain read-only; you can revoke them through your Google Account settings.</p>
-<div class="data">
-<div class="notice"><strong>Meeting links</strong><br>Used only to find and record the meetings you explicitly request.</div>
-<div class="notice"><strong>Read-only Google access</strong><br>Existing authorizations do not let BeOnMeet modify your Calendar events. You can revoke access from your Google Account.</div>
-</div>
-<div class="notice" style="margin-top:16px"><strong>No advertising use of Google user data.</strong><br>Google user data obtained through Google APIs is used only to provide BeOnMeet's user facing meeting automation. It is not sold and is not used for advertising or ad targeting. See the <a href="/privacy">Privacy Policy</a> for full details.</div>
-</div></section>
-<section class="section"><div class="wrap">
-<h2>Recordings delivered where you already work</h2>
-<p>Meeting recordings and available outputs such as separate audio and transcripts are delivered through Telegram. Temporary delivery files are retained only as needed to complete delivery and may remain available for up to 72 hours. Purchased recording hours never expire.</p>
-</div></section>
-</main>"""
-    return public_shell(
-        "BeOnMeet | Prepaid Google Meet recording hours",
-        body.replace("__BOT_CTA__", bot_cta).replace("__PRICE_CARDS__", price_cards),
-    )
+    return render_landing("en")
 
 
 @app.get("/fa", response_class=HTMLResponse)
 async def home_fa() -> str:
-    """Campaign landing page for Persian-speaking customers; no invented bot links."""
-    bot_url = os.environ.get("TELEGRAM_BOT_URL", "").strip()
-    verified_bot_url = bot_url if re.fullmatch(r"https://t\.me/[A-Za-z0-9_]+(?:\?start=[A-Za-z0-9_]+)?", bot_url) else ""
-    bot_cta = (
-        f'<a class="button" href="{verified_bot_url}" rel="noopener noreferrer">شروع در تلگرام</a>'
-        if verified_bot_url else
-        '<a class="button" href="mailto:meetrecorderbot@gmail.com?subject=BeOnMeet%20access">درخواست دسترسی</a>'
-    )
-    plan_cards = "".join(
-        '<div class="card" style="text-align:right"><b>شارژ ' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' ساعت ضبط</b>'
-        + '<div class="price">' + f'{PUBLIC_PLANS[code]["price"]:,}' + ' <small>تومان · خرید یک‌باره</small></div>'
-        + '<div class="limit">' + str(PUBLIC_PLANS[code]["quota_minutes"] // 60) + ' ساعت ضبط جلسه</div>'
-        + '<p>هر خرید فوراً به موجودی ساعت ضبط اضافه می‌شود؛ ساعت‌ها تاریخ انقضا ندارند.</p>'
-        + '</div>'
-        for code in PUBLIC_PLAN_CODES
-    )
-    body = """
-<main lang="fa" dir="rtl">
-<section class="hero"><div class="wrap">
-<span class="eyebrow">ضبط و دریافت جلسات Google Meet در تلگرام</span>
-<h1>جلسه‌ات را از دست نده. BeOnMeet ضبطش می‌کند.</h1>
-<p>لینک Google Meet را داخل ربات بفرست. برای جلسه آینده، ایمیل رکوردر را به رویداد تقویم دعوت کن؛ برای جلسه‌ای که شروع شده «ورود فوری» را بزن. پس از تأیید میزبان، ضبط انجام می‌شود و فایل در تلگرام ارسال می‌شود.</p>
-<div class="cta">__BOT_CTA__<a class="button secondary" href="#credits">خرید ساعت</a></div>
-</div></section>
-<section id="credits" class="section"><div class="wrap">
-<h2>فقط خرید ساعت ضبط؛ بدون اشتراک</h2>
-<p>فقط ساعت ضبط می‌خری: ۲، ۶ یا ۱۵ ساعت. هر خرید بلافاصله به موجودی قبلی‌ات اضافه می‌شود، تاریخ انقضا ندارد و برای تمام جلسه‌ها قابل استفاده است. به‌اندازه مدت واقعی ضبط تحویل‌شده و حداکثر تا موجودی اعتبار کم می‌شود؛ موجودی منفی نمی‌شود. تمدید خودکار یا هزینه اضافه خودکار نداریم.</p>
-<div class="grid prices">__PRICE_CARDS__</div>
-<div class="cta">__BOT_CTA__</div>
-</div></section>
-<section id="how" class="section"><div class="wrap">
-<h2>چطور کار می‌کند؟</h2>
-<div class="grid">
-<div class="card"><b>۱. ارسال لینک جلسه</b><p>لینک جلسه را در ربات بفرست. برای جلسه‌های آینده ایمیل رکوردر را به دعوت جلسه اضافه کن.</p></div>
-<div class="card"><b>۲. ورود ربات به جلسه</b><p>بسته به تنظیمات Google Meet ممکن است میزبان لازم باشد ربات را تأیید و وارد کند.</p></div>
-<div class="card"><b>۳. دریافت فایل</b><p>ویدیو به تلگرام ارسال می‌شود. فایل صوتی و متن خودکار در شرایط پشتیبانی‌شده ارائه می‌شوند و ممکن است خطا داشته باشند.</p></div>
-</div>
-<div class="notice">پیش از ضبط، مطمئن شو که اجازه ضبط جلسه را داری و اطلاع‌رسانی یا رضایت لازم از شرکت‌کنندگان گرفته شده است. ورود و ضبط صددرصد تضمین‌شده نیست.</div>
-</div></section>
-<section class="section"><div class="wrap">
-<h2>حریم خصوصی و شرایط استفاده</h2>
-<p>درباره داده‌های جلسه، دسترسی‌های قبلی Google، زمان نگهداری فایل‌ها و شرایط استفاده بیشتر بخوان.</p>
-<div class="cta"><a class="button secondary" href="/privacy">حریم خصوصی</a><a class="button secondary" href="/terms">شرایط استفاده</a></div>
-</div></section>
-</main>"""
-    return public_shell(
-        "BeOnMeet | ضبط جلسه گوگل میت در تلگرام",
-        body.replace("__BOT_CTA__", bot_cta).replace("__PRICE_CARDS__", plan_cards),
-    )
+    return render_landing("fa")
+
+
+@app.get("/landing/vazir.woff2")
+async def landing_font():
+    return FileResponse(LANDING_ASSETS / "vazir.woff2", media_type="font/woff2")
 
 
 @app.get("/privacy", response_class=HTMLResponse)

@@ -2,6 +2,7 @@
 """Prepaid hour sale SKU compatibility and customer-facing no-subscription guarantees."""
 import ast
 import importlib.util
+import sys
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location("policy",root/"app/billing_policy.py")
@@ -28,8 +29,10 @@ assert 'admin_credit_hours(telegram_id, plan, note)' in admin
 assert "No monthly subscriptions or plans" in i18n
 assert "اشتراک ماهانه یا پلن نداریم" in i18n
 assert "Keine monatlichen Abos oder Tarife" in i18n
-assert "Hours never expire" in main
-assert "تاریخ انقضا ندارند" in main
+sys.path.insert(0, str(root / "app"))
+from landing_page import render_landing
+assert "hours never expire" in render_landing("en").lower()
+assert "تاریخ انقضا ندارند" in render_landing("fa")
 for key in ('"wallet_payment_confirmed":','"wallet_balance":','"wallet_empty":'):
     assert i18n.count(key)==3
 print("BILLING_TIER_TEST_PASS")
