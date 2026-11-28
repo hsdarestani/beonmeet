@@ -1,0 +1,55 @@
+name: Observe five production browser lanes across watchdog cycles
+on:
+  push:
+    branches: [ops/observe-production-auth-20261128]
+    paths: [.github/workflows/ops-observe-production-auth.yml]
+permissions:
+  contents: read
+jobs:
+  observe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - name: Sample runtime proof, worker capacity and actual capture
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.20.60.195
+          port: 9011
+          username: root
+          password: ${{ secrets.PASS }}
+          timeout: 25s
+          command_timeout: 5m
+          script: |
+            python3 - <<'PY'
+            from datetime import datetime, timezone
+            from pathlib import Path
+            import json
+            import time
+            from urllib.request import urlopen
+
+            status_file = Path('/opt/beonmeet/data/worker-auth-readiness.json')
+            ports = (9126, 9132, 9133, 9134, 9135)
+            def get(port, path):
+                with urlopen(f'http://127.0.0.1:{port}/{path}', timeout=5) as response:
+                    result = json.load(response)
+                return result.get("data") or result
+
+            for sample in range(6):
+                state = json.loads(status_file.read_text())["workers"]
+                now = time.time()
+                lanes = []
+                for lane, port in enumerate(ports, 1):
+                    row = state.get(f'http://127.0.0.1:{port}', {})
+                    proof_at = row.get("last_verified_at") or 0
+                    cap = get(port, "capacity")
+                    lanes.append({"lane": lane, "status": row.get("status"), "reason": row.get("reason"),
+                                  "proof_age": round(now - proof_at) if proof_at else None,
+                                  "running": cap.get("runningJobs")})
+                health = get(8109, "health")
+                print("LANE_SAMPLE", json.dumps({"utc": datetime.now(timezone.utc).isoformat(), "lanes": lanes,
+                    "verified": health.get("authenticated_free_workers"), "real_captures": health.get("active_recording_jobs"),
+                    "queue": health.get("free_queue", 0) + health.get("premium_queue", 0),
+                    "pending_delivery": health.get("pending_delivery_jobs")}), flush=True)
+                if sample < 5:
+                    time.sleep(40)
+            PY
