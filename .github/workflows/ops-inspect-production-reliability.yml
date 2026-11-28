@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Read production tracebacks and event-linked capture files
+      - name: Read controller credentials and capture permissions
         uses: appleboy/ssh-action@v1
         with:
           host: 143.20.60.195
