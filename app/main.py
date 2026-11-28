@@ -25,6 +25,13 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import Response
+import landing_metrics
+from site_pages import api_document, document, message_page, PRIVACY_FA, TERMS_FA, ANALYTICS_EN
 from landing_page import ASSETS as LANDING_ASSETS, render_landing
 from state_store import DurableStateStore
 from recording_handoff import persist_source, recording_key, verified_duration
@@ -70,7 +77,7 @@ from admin_panel import (
     was_premium_at,
 )
 
-app = FastAPI(title="BeOnMeet Controller")
+app = FastAPI(title="BeOnMeet Controller", docs_url=None, redoc_url=None)
 app.include_router(admin_router)
 app.include_router(autoscaler_router)
 
@@ -2559,10 +2566,10 @@ async def billing_payment_intent(intent: str) -> dict[str, Any]:
 async def billing_payment_return(payment: str = "", receipt: str = "", intent: str = "") -> str:
     row = await asyncio.to_thread(get_payment_intent, intent)
     if not row:
-        return "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;padding:40px'>پرداخت پیدا نشد.</body></html>"
+        return message_page("وضعیت پرداخت", "پرداخت پیدا نشد.")
 
     if payment != "success" or not receipt:
-        return "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;padding:40px'>پرداخت انجام نشد یا لغو شد. می‌تونی برگردی تلگرام و دوباره امتحان کنی.</body></html>"
+        return message_page("وضعیت پرداخت", "پرداخت انجام نشد یا لغو شد. می‌تونی برگردی تلگرام و دوباره امتحان کنی.")
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -2570,7 +2577,7 @@ async def billing_payment_return(payment: str = "", receipt: str = "", intent: s
         response.raise_for_status()
         status = response.json()
     except Exception:
-        return "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;padding:40px'>پرداخت انجام شده ولی تأیید نهایی فعلاً در دسترس نیست. چند دقیقه دیگه دوباره وضعیت پلن رو چک کن.</body></html>"
+        return message_page("وضعیت پرداخت", "پرداخت انجام شده ولی تأیید نهایی فعلاً در دسترس نیست. چند دقیقه دیگه دوباره وضعیت پلن رو چک کن.")
 
     expected_plan = str(row.get("plan_code") or "")
     expected_amount = int(row.get("amount_toman") or 0)
@@ -2581,7 +2588,7 @@ async def billing_payment_return(payment: str = "", receipt: str = "", intent: s
         or status.get("plan") != expected_plan
         or int(status.get("amount_toman") or 0) != expected_amount
     ):
-        return "<html lang='fa' dir='rtl'><meta charset='utf-8'><body style='font-family:tahoma;padding:40px'>تأیید پرداخت کامل نشد. اگه مبلغ کم شده، رسید محفوظ می‌مونه و می‌تونیم پیگیریش کنیم.</body></html>"
+        return message_page("وضعیت پرداخت", "تأیید پرداخت کامل نشد. اگه مبلغ کم شده، رسید محفوظ می‌مونه و می‌تونیم پیگیریش کنیم.")
 
     already_paid = row.get("status") == "paid"
     paid_row = await asyncio.to_thread(mark_payment_paid, intent, receipt)
@@ -2616,14 +2623,7 @@ async def billing_payment_return(payment: str = "", receipt: str = "", intent: s
                 )
             except Exception as exc:
                 print("admin credit purchase notification failed:", type(exc).__name__, flush=True)
-    return (
-        "<html lang='fa' dir='rtl'><meta charset='utf-8'>"
-        "<body style='font-family:tahoma;background:#0b0e17;color:#fff;"
-        "display:grid;place-items:center;min-height:100vh'>"
-        "<div style='text-align:center'><h2>شارژ ساعت ضبط موفق بود ✅</h2>"
-        "<p>اعتبار خریداری‌شده به موجودی قبلی اضافه شد و تاریخ انقضا ندارد."
-        " موجودی را در تلگرام از بخش شارژ ساعت ببین.</p></div></body></html>"
-    )
+    return message_page("شارژ ساعت ضبط موفق بود", "اعتبار خریداری‌شده به موجودی قبلی اضافه شد و تاریخ انقضا ندارد. موجودی را در تلگرام از بخش شارژ ساعت ببین.")
 
 
 def _remote_worker_alive(entry: dict[str, Any]) -> bool:
@@ -3313,33 +3313,94 @@ async def health() -> dict[str, Any]:
     }
 
 
-PUBLIC_SITE_CSS = """
-:root{color-scheme:dark;--bg:#07110f;--panel:#0d1c18;--text:#f4fbf8;--muted:#a9bbb5;--line:#1e3730;--accent:#65e6b5;--accent2:#8ca8ff}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% 0,#12352b 0,transparent 34rem),var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.6}
-a{color:inherit}.wrap{width:min(1120px,calc(100% - 40px));margin:auto}.nav{display:flex;align-items:center;justify-content:space-between;padding:26px 0}.brand{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:-.02em;text-decoration:none}.mark{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(145deg,var(--accent),var(--accent2));color:#06110e;font-weight:900}.links{display:flex;gap:22px;color:var(--muted);font-size:14px}.links a{text-decoration:none}.hero{padding:88px 0 58px}.eyebrow{display:inline-flex;padding:7px 12px;border:1px solid var(--line);border-radius:999px;color:var(--accent);background:#0a1714;font-size:13px}.hero h1{max-width:820px;font-size:clamp(44px,7vw,82px);line-height:1.02;letter-spacing:-.055em;margin:24px 0}.hero p{max-width:720px;font-size:20px;color:var(--muted);margin:0}.cta{margin-top:34px;display:flex;flex-wrap:wrap;gap:12px}.button{display:inline-flex;padding:13px 18px;border-radius:12px;text-decoration:none;font-weight:750;background:var(--accent);color:#05110d}.button.secondary{background:transparent;color:var(--text);border:1px solid var(--line)}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:28px 0 80px}.prices{padding-bottom:20px}.price{font-size:clamp(27px,3vw,38px);font-weight:850;color:var(--accent);letter-spacing:-.045em;margin:8px 0}.price small{font-size:15px;font-weight:600;color:var(--muted)}.limit{font-size:19px;font-weight:750;color:var(--text);margin:14px 0}.card{padding:24px;border:1px solid var(--line);border-radius:20px;background:linear-gradient(180deg,#0d1d19,#091512)}.card b{display:block;margin-bottom:8px;font-size:17px}.card p{margin:0;color:var(--muted)}.section{padding:70px 0;border-top:1px solid var(--line)}.section h2{font-size:34px;letter-spacing:-.035em;margin:0 0 14px}.section>div>p{max-width:760px;color:var(--muted)}.data{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:28px}.notice{padding:22px;border-radius:18px;background:#0a1714;border:1px solid var(--line);color:var(--muted)}.notice strong{color:var(--text)}.legal{max-width:820px;padding:60px 0 100px}.legal h1{font-size:48px;letter-spacing:-.04em;line-height:1.1}.legal h2{margin-top:38px;font-size:24px}.legal p,.legal li{color:var(--muted)}.legal a{color:var(--accent)}footer{border-top:1px solid var(--line);padding:30px 0 42px;color:var(--muted);font-size:14px}.foot{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}.foot a{margin-left:18px;text-decoration:none}
-@media(max-width:760px){.links{display:none}.hero{padding-top:56px}.grid,.data{grid-template-columns:1fr}.hero p{font-size:18px}.legal h1{font-size:38px}}
-"""
+@app.get("/docs", include_in_schema=False)
+async def api_docs(request: Request):
+    prefix = request.scope.get("root_path", "").rstrip("/")
+    response = get_swagger_ui_html(openapi_url=prefix + app.openapi_url, title="راهنمای API | BeOnMeet",
+                                   oauth2_redirect_url=prefix + "/docs/oauth2-redirect")
+    return api_document(response, "راهنمای تعاملی API")
 
-def public_shell(title: str, body: str) -> str:
-    return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title><meta name="description" content="Send a Google Meet link for scheduled or immediate recording and Telegram delivery.">
-<style>{PUBLIC_SITE_CSS}</style></head>
-<body><div class="wrap"><nav class="nav"><a class="brand" href="/"><span class="mark">B</span>BeOnMeet</a>
-<div class="links"><a href="/fa">فارسی</a><a href="/#how">How it works</a><a href="/#credits">Buy hours</a><a href="/#data">Google data</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div></nav></div>
-{body}
-<footer><div class="wrap foot"><span>© 2026 BeOnMeet</span><span><a href="/privacy">Privacy Policy</a><a href="/terms">Terms of Service</a></span></div></footer>
-</body></html>"""
+
+@app.get("/docs/oauth2-redirect", include_in_schema=False)
+async def docs_oauth_redirect():
+    return get_swagger_ui_oauth2_redirect_html()
+
+
+@app.get("/redoc", include_in_schema=False)
+async def api_reference(request: Request):
+    prefix = request.scope.get("root_path", "").rstrip("/")
+    response = get_redoc_html(openapi_url=prefix + app.openapi_url, title="مرجع API | BeOnMeet", with_google_fonts=False)
+    return api_document(response, "مرجع API")
 
 
 @app.get("/", response_class=HTMLResponse)
+@app.get("/fa", response_class=HTMLResponse)
 async def home() -> str:
+    return render_landing("fa")
+
+
+@app.get("/en", response_class=HTMLResponse)
+async def home_en() -> str:
     return render_landing("en")
 
 
-@app.get("/fa", response_class=HTMLResponse)
-async def home_fa() -> str:
-    return render_landing("fa")
+@app.get("/landing/site.css")
+async def site_css():
+    return FileResponse(LANDING_ASSETS / "site.css", media_type="text/css")
+
+
+@app.get("/landing/metrics.js")
+async def landing_script():
+    return FileResponse(LANDING_ASSETS / "metrics.js", media_type="text/javascript")
+
+
+@app.post("/api/landing/metrics", status_code=204)
+async def collect_landing_metrics(request: Request):
+    if request.headers.get("origin") not in (f"https://{DOMAIN}", str(request.base_url).rstrip("/")):
+        raise HTTPException(403, "Invalid origin")
+    if request.headers.get("content-type", "").split(";")[0] != "application/json":
+        raise HTTPException(415, "Expected JSON")
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > 2048:
+            raise HTTPException(413, "Event too large")
+        body.extend(chunk)
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeError, RecursionError):
+        raise HTTPException(400, "Invalid event")
+    if not landing_metrics.validate(data):
+        raise HTTPException(400, "Invalid event")
+    await asyncio.to_thread(landing_metrics.record, data)
+    return Response(status_code=204)
+
+
+def browser_page(request: Request) -> bool:
+    path = request.url.path
+    return ("text/html" in request.headers.get("accept", "") and
+            (not path.startswith(("/api/", "/internal/", "/health")) or path == "/api/billing/payment-return"))
+
+
+@app.exception_handler(StarletteHTTPException)
+async def browser_error(request: Request, exc: StarletteHTTPException):
+    if not browser_page(request):
+        return await http_exception_handler(request, exc)
+    if request.url.path.startswith("/admin") and exc.status_code in (401,403):
+        title, text = "ورود به پنل مدیریت", "برای دریافت لینک ورود تازه، دستور /admin را در ربات BeOnMeet بفرستید."
+    elif request.url.path.startswith("/auth/google"):
+        title, text = "اتصال تقویم انجام نشد", "دسترسی حساب را در ربات بررسی کنید و از همان‌جا یک لینک اتصال تازه بگیرید."
+    elif request.url.path.startswith(("/download/","/recover-premium/")):
+        title, text = "فایل در دسترس نیست", "مهلت یا وضعیت دریافت فایل را در گفت‌وگوی ربات بررسی کنید."
+    else:
+        title, text = ("صفحه پیدا نشد", "لینک را بررسی کنید یا به صفحهٔ اصلی برگردید.") if exc.status_code == 404 else ("درخواست انجام نشد", "لطفاً به صفحهٔ قبلی برگردید و دوباره تلاش کنید.")
+    return HTMLResponse(message_page(title, text), status_code=exc.status_code, headers=exc.headers)
+
+
+@app.exception_handler(RequestValidationError)
+async def browser_validation(request: Request, exc: RequestValidationError):
+    if not browser_page(request):
+        return await request_validation_exception_handler(request, exc)
+    return HTMLResponse(message_page("لینک کامل نیست", "لینک را دوباره از ربات باز کنید."), status_code=422)
 
 
 @app.get("/landing/vazir.woff2")
@@ -3350,8 +3411,13 @@ async def landing_font():
 @app.get("/privacy", response_class=HTMLResponse)
 @app.get("/privacy-policy", response_class=HTMLResponse)
 async def privacy_policy() -> str:
+    return document("حریم خصوصی", PRIVACY_FA, section="privacy")
+
+
+@app.get("/en/privacy", response_class=HTMLResponse)
+async def privacy_policy_en() -> str:
     body = """
-<main><div class="wrap legal">
+
 <span class="eyebrow">Effective 6 October 2026</span>
 <h1>BeOnMeet Privacy Policy</h1>
 <p>This policy explains how BeOnMeet accesses, uses, stores and shares information when you use the BeOnMeet meeting automation service.</p>
@@ -3378,15 +3444,20 @@ async def privacy_policy() -> str:
 <p>If our use of Google user data or other material privacy practices change, this policy will be updated before the new use is introduced where required.</p>
 <h2>Contact</h2>
 <p>Privacy questions and deletion requests: <a href="mailto:meetrecorderbot@gmail.com">meetrecorderbot@gmail.com</a>.</p>
-</div></main>"""
-    return public_shell("Privacy Policy | BeOnMeet", body)
+"""
+    return document("Privacy Policy", body.replace("<h2>Sharing</h2>", ANALYTICS_EN + "<h2>Sharing</h2>"), "en", "privacy")
 
 
 @app.get("/terms", response_class=HTMLResponse)
 @app.get("/terms-of-service", response_class=HTMLResponse)
 async def terms_of_service() -> str:
+    return document("شرایط استفاده", TERMS_FA, section="terms")
+
+
+@app.get("/en/terms", response_class=HTMLResponse)
+async def terms_of_service_en() -> str:
     body = """
-<main><div class="wrap legal">
+
 <span class="eyebrow">Effective 6 October 2026</span>
 <h1>BeOnMeet Terms of Service</h1>
 <p>These Terms govern use of BeOnMeet. By connecting an account or requesting a recording, you agree to these Terms.</p>
@@ -3409,8 +3480,8 @@ async def terms_of_service() -> str:
 <p>BeOnMeet is provided on an as available basis. To the maximum extent permitted by law, we do not guarantee that every meeting will be joined, recorded, transcribed or delivered without interruption or error.</p>
 <h2>Contact</h2>
 <p>Questions about these Terms: <a href="mailto:meetrecorderbot@gmail.com">meetrecorderbot@gmail.com</a>.</p>
-</div></main>"""
-    return public_shell("Terms of Service | BeOnMeet", body)
+"""
+    return document("Terms of Service", body.replace('href="/privacy"', 'href="/en/privacy"'), "en", "terms")
 
 
 @app.get("/auth/google")
@@ -3455,7 +3526,7 @@ async def auth_google_callback(request: Request, state: str) -> str:
 
     oauth_chat_id = str((oauth_entry or {}).get("chat_id") or "")
     if oauth_chat_id and not AUTO_ALL_MEETINGS_ENABLED:
-        return "<html><body><h2>Automatic Calendar recording is temporarily unavailable</h2><p>Send the meeting link directly to BeOnMeet in Telegram.</p></body></html>"
+        return message_page("ضبط خودکار تقویم فعلاً در دسترس نیست", "لینک جلسه را در تلگرام برای BeOnMeet بفرست.")
     if oauth_chat_id and not await asyncio.to_thread(is_premium, oauth_chat_id):
         raise HTTPException(status_code=403, detail="Premium required for All meetings")
 
@@ -3476,16 +3547,12 @@ async def auth_google_callback(request: Request, state: str) -> str:
             await tg_text(chat_id, t(chat_id, "auto_enabled"), with_menu=True)
         except Exception as exc:
             print("calendar connect Telegram confirmation error:", repr(exc), flush=True)
-        return (
-            "<h2>Google Calendar connected ✅</h2>"
-            "<p>Automatic mode is on. BeOnMeet will now detect Google Meet events "
-            "across all calendars in this Google account automatically. You can close this page.</p>"
-        )
+        return message_page("تقویم گوگل متصل شد", "حالت خودکار فعال شد. BeOnMeet جلسه‌های گوگل میت را در تقویم‌های این حساب پیدا می‌کند. می‌توانی به تلگرام برگردی.")
 
     TOKEN_FILE.write_text(creds.to_json())
     globals()["state"]["oauth_state"] = None
     await save_state()
-    return "<h2>کلندر با موفقیت وصل شد ✅</h2><p>می‌تونی این صفحه رو ببندی و برگردی تلگرام.</p>"
+    return message_page("تقویم گوگل متصل شد", "می‌توانی این صفحه را ببندی و به تلگرام برگردی.")
 
 
 @app.post("/internal/waiting-for-admission")
